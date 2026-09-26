@@ -8,7 +8,6 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-
 RiskScore = Annotated[float, Field(ge=0.0, le=1.0)]
 
 
