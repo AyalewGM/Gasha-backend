@@ -46,3 +46,29 @@ Every decision is correlated, explainable, versioned and auditable. Model/rule v
 reason codes travel with the decision. Idempotency, immutable decision persistence, latency
 metrics, authentication/authorization, encryption, secrets management and data minimization
 are production requirements, not demo extensions.
+
+
+## Multi-bank configuration boundary
+
+Every canonical transaction carries a tenant identifier. Every fraud decision records the
+configuration, policy, rule and model versions that produced it so an investigator can
+reproduce the decision later. Decision thresholds are supplied by a validated `DecisionPolicy`
+rather than selected by bank-name conditionals. Bank-specific payload mappings and action
+integrations remain adapter concerns.
+
+Tenant configuration must be isolated in durable storage and loaded by authenticated tenant
+context in production. The current POC request may carry an explicit policy only as a temporary
+contract seam; clients must not be allowed to choose their own enforcement policy once the
+tenant configuration repository is introduced.
+
+## Internal and external beneficiary data boundary
+
+An internal beneficiary may be enriched with data the tenant is authorized to use from its own
+systems. An external beneficiary requires a destination institution identifier and is scored
+only from signals observable by the originating institution plus legitimately supplied
+payment-rail, consortium, central-bank or other authorized shared intelligence. Gasha does not
+infer access to the receiving bank's private ledger, balance, device history or onward movement.
+
+External-beneficiary profiles should use protected/tokenized identifiers where practical and
+retain only data required for fraud detection, investigation, audit and applicable retention
+policy.

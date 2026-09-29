@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 RiskScore = Annotated[float, Field(ge=0.0, le=1.0)]
 
@@ -29,6 +29,7 @@ class DecisionAction(StrEnum):
 
 
 class CanonicalTransaction(BaseModel):
+    tenant_id: str = Field(min_length=1)
     event_id: UUID
     occurred_at: datetime
     channel: str
@@ -43,6 +44,15 @@ class CanonicalTransaction(BaseModel):
     device_id: str | None = None
     correlation_id: str
 
+    @model_validator(mode="after")
+    def validate_external_beneficiary(self) -> CanonicalTransaction:
+        if (
+            self.beneficiary_type == BeneficiaryType.EXTERNAL
+            and not self.destination_institution_id
+        ):
+            raise ValueError("external beneficiary requires destination_institution_id")
+        return self
+
 
 class IntelligenceSnapshot(BaseModel):
     customer_risk: RiskScore = 0.0
@@ -52,11 +62,37 @@ class IntelligenceSnapshot(BaseModel):
     network_risk: RiskScore = 0.0
 
 
+class DecisionPolicy(BaseModel):
+    configuration_version: str = Field(min_length=1)
+    policy_version: str = Field(min_length=1)
+    rule_version: str = Field(min_length=1)
+    model_version: str | None = None
+    monitor_threshold: RiskScore = 0.50
+    review_threshold: RiskScore = 0.70
+    hold_threshold: RiskScore = 0.85
+    block_threshold: RiskScore = 0.95
+
+    @model_validator(mode="after")
+    def validate_threshold_order(self) -> DecisionPolicy:
+        thresholds = (
+            self.monitor_threshold,
+            self.review_threshold,
+            self.hold_threshold,
+            self.block_threshold,
+        )
+        if thresholds != tuple(sorted(thresholds)) or len(set(thresholds)) != len(thresholds):
+            raise ValueError("decision thresholds must be strictly increasing")
+        return self
+
+
 class FraudDecision(BaseModel):
+    tenant_id: str
     event_id: UUID
     action: DecisionAction
     risk_score: RiskScore
     reason_codes: list[str]
+    configuration_version: str
+    policy_version: str
     rule_version: str
     model_version: str | None = None
     decided_at: datetime
