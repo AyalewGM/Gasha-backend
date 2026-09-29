@@ -3,15 +3,17 @@ from datetime import UTC, datetime
 from gasha.domain.models import (
     CanonicalTransaction,
     DecisionAction,
+    DecisionPolicy,
     FraudDecision,
     IntelligenceSnapshot,
 )
 
 
 class DecisionService:
-    """Deterministic M1 fusion policy; replaceable without changing API contracts."""
+    """Deterministic risk fusion driven by a versioned tenant policy."""
 
-    RULE_VERSION = "m1.0"
+    def __init__(self, policy: DecisionPolicy) -> None:
+        self.policy = policy
 
     def decide(
         self, transaction: CanonicalTransaction, intelligence: IntelligenceSnapshot
@@ -24,25 +26,33 @@ class DecisionService:
             "network": intelligence.network_risk,
         }
         score = max(components.values())
-        reasons = [f"HIGH_{name.upper()}_RISK" for name, value in components.items() if value >= 0.8]
+        reasons = [
+            f"HIGH_{name.upper()}_RISK"
+            for name, value in components.items()
+            if value >= self.policy.review_threshold
+        ]
 
-        if score >= 0.95:
+        if score >= self.policy.block_threshold:
             action = DecisionAction.BLOCK
-        elif score >= 0.85:
+        elif score >= self.policy.hold_threshold:
             action = DecisionAction.HOLD
-        elif score >= 0.70:
+        elif score >= self.policy.review_threshold:
             action = DecisionAction.REVIEW
-        elif score >= 0.50:
+        elif score >= self.policy.monitor_threshold:
             action = DecisionAction.MONITOR
         else:
             action = DecisionAction.ALLOW
 
         return FraudDecision(
+            tenant_id=transaction.tenant_id,
             event_id=transaction.event_id,
             action=action,
             risk_score=score,
             reason_codes=reasons or ["NO_HIGH_RISK_SIGNAL"],
-            rule_version=self.RULE_VERSION,
+            configuration_version=self.policy.configuration_version,
+            policy_version=self.policy.policy_version,
+            rule_version=self.policy.rule_version,
+            model_version=self.policy.model_version,
             decided_at=datetime.now(UTC),
             correlation_id=transaction.correlation_id,
         )
