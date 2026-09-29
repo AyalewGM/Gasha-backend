@@ -1,10 +1,21 @@
 from fastapi import FastAPI
 
 from gasha.decision.service import DecisionService
-from gasha.domain.models import CanonicalTransaction, FraudDecision, IntelligenceSnapshot
+from gasha.domain.models import (
+    CanonicalTransaction,
+    DecisionPolicy,
+    FraudDecision,
+    IntelligenceSnapshot,
+)
 
-app = FastAPI(title="Gasha Fraud Decision API", version="0.1.0")
-decision_service = DecisionService()
+app = FastAPI(title="Gasha Fraud Decision API", version="0.2.0")
+
+
+class DecisionRequest(IntelligenceSnapshot):
+    """Temporary M1 request shape until intelligence assembly is server-side."""
+
+    transaction: CanonicalTransaction
+    policy: DecisionPolicy
 
 
 @app.get("/health/live")
@@ -18,8 +29,12 @@ def readiness() -> dict[str, str]:
 
 
 @app.post("/v1/decisions", response_model=FraudDecision)
-def create_decision(
-    transaction: CanonicalTransaction,
-    intelligence: IntelligenceSnapshot,
-) -> FraudDecision:
-    return decision_service.decide(transaction, intelligence)
+def create_decision(request: DecisionRequest) -> FraudDecision:
+    intelligence = IntelligenceSnapshot(
+        customer_risk=request.customer_risk,
+        transaction_risk=request.transaction_risk,
+        beneficiary_risk=request.beneficiary_risk,
+        relationship_risk=request.relationship_risk,
+        network_risk=request.network_risk,
+    )
+    return DecisionService(request.policy).decide(request.transaction, intelligence)
