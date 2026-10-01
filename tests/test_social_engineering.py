@@ -15,7 +15,6 @@ from gasha.intelligence.social_engineering import (
 )
 
 
-
 def policy() -> DecisionPolicy:
     return DecisionPolicy(
         configuration_version="tenant-config-7",
