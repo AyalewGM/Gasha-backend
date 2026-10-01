@@ -1,10 +1,45 @@
 from gasha.decision.service import DecisionService
-from gasha.domain.models import DecisionAction
+from datetime import UTC, datetime
+from decimal import Decimal
+from uuid import uuid4
+
+from gasha.domain.models import (
+    BeneficiaryType,
+    CanonicalTransaction,
+    DecisionAction,
+    DecisionPolicy,
+)
 from gasha.intelligence.social_engineering import (
     SocialEngineeringDetector,
     SocialEngineeringSignals,
 )
-from tests.test_decision_service import policy, transaction
+
+
+
+def policy() -> DecisionPolicy:
+    return DecisionPolicy(
+        configuration_version="tenant-config-7",
+        policy_version="policy-3",
+        rule_version="rules-2",
+    )
+
+
+def transaction() -> CanonicalTransaction:
+    return CanonicalTransaction(
+        tenant_id="tenant-a",
+        event_id=uuid4(),
+        occurred_at=datetime.now(UTC),
+        channel="mobile",
+        transaction_type="transfer",
+        amount=Decimal("1250.00"),
+        currency="ETB",
+        sender_customer_id="customer-1",
+        sender_account_id="account-1",
+        beneficiary_id="beneficiary-9",
+        beneficiary_type=BeneficiaryType.EXTERNAL,
+        destination_institution_id="external-bank",
+        correlation_id="corr-social-engineering",
+    )
 
 
 def test_external_mule_aggregation_pattern_is_held_with_explainable_signals() -> None:
