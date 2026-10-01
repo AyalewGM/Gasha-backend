@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from gasha.domain.models import (\n    BeneficiaryType,\n    CanonicalTransaction,\n    IntelligenceSnapshot,\n    RiskScore,\n)
+from gasha.domain.models import (
+    BeneficiaryType,
+    CanonicalTransaction,
+    IntelligenceSnapshot,
+    RiskScore,
+)
 
 
 class SocialEngineeringSignals(BaseModel):
