@@ -1,8 +1,8 @@
-from gasha.decision.service import DecisionService
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
 
+from gasha.decision.service import DecisionService
 from gasha.domain.models import (
     BeneficiaryType,
     CanonicalTransaction,
