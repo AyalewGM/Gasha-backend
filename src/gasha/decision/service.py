@@ -1,5 +1,5 @@
-from datetime import UTC, datetime
 from collections.abc import Sequence
+from datetime import UTC, datetime
 
 from gasha.domain.models import (
     CanonicalTransaction,
