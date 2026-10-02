@@ -46,18 +46,6 @@ def transaction() -> CanonicalTransaction:
     )
 
 
-def decide(
-    tx: CanonicalTransaction,
-    assessment: object,
-):
-    typed_assessment = assessment
-    return DecisionService(policy()).decide(
-        tx,
-        typed_assessment.intelligence,
-        typed_assessment.reason_codes,
-    )
-
-
 def test_external_mule_aggregation_pattern_is_held_with_explainable_signals() -> None:
     tx = transaction()
     assessment = SocialEngineeringDetector(signal_policy()).assess(
