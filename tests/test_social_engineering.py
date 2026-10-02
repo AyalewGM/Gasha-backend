@@ -146,9 +146,7 @@ def test_new_device_is_optional_not_assumed_available() -> None:
     tx = transaction()
     detector = SocialEngineeringDetector(signal_policy())
     without_device = detector.assess(tx, signals())
-    with_new_device = detector.assess(
-        tx, signals(device_is_new_to_sender=True)
-    )
+    with_new_device = detector.assess(tx, signals(device_is_new_to_sender=True))
 
     assert without_device.intelligence.transaction_risk == 0.0
     assert with_new_device.intelligence.transaction_risk == 0.74
