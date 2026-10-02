@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from collections.abc import Sequence
 
 from gasha.domain.models import (
     CanonicalTransaction,
@@ -16,7 +17,10 @@ class DecisionService:
         self.policy = policy
 
     def decide(
-        self, transaction: CanonicalTransaction, intelligence: IntelligenceSnapshot
+        self,
+        transaction: CanonicalTransaction,
+        intelligence: IntelligenceSnapshot,
+        evidence_reason_codes: Sequence[str] = (),
     ) -> FraudDecision:
         components = {
             "customer": intelligence.customer_risk,
@@ -26,11 +30,12 @@ class DecisionService:
             "network": intelligence.network_risk,
         }
         score = max(components.values())
-        reasons = [
+        component_reasons = [
             f"HIGH_{name.upper()}_RISK"
             for name, value in components.items()
             if value >= self.policy.review_threshold
         ]
+        reasons = list(dict.fromkeys([*evidence_reason_codes, *component_reasons]))
 
         if score >= self.policy.block_threshold:
             action = DecisionAction.BLOCK
