@@ -8,6 +8,7 @@ from gasha.domain.models import (
     IntelligenceSnapshot,
     RiskScore,
 )
+from gasha.intelligence.provenance import IntelligenceEvidence, SignalProvenance
 
 
 class SocialEngineeringSignals(BaseModel):
@@ -20,6 +21,7 @@ class SocialEngineeringSignals(BaseModel):
     beneficiary_incoming_count_1h: int = Field(default=0, ge=0)
     beneficiary_confirmed_fraud_sender_count: int = Field(default=0, ge=0)
     device_is_new_to_sender: bool | None = None
+    provenance: SignalProvenance
 
 
 class SocialEngineeringPolicy(BaseModel):
@@ -45,6 +47,7 @@ class SocialEngineeringAssessment(BaseModel):
     intelligence: IntelligenceSnapshot
     reason_codes: list[str]
     signal_policy_version: str
+    evidence: list[IntelligenceEvidence]
 
 
 class SocialEngineeringDetector:
@@ -124,6 +127,12 @@ class SocialEngineeringDetector:
         if transaction.beneficiary_type == BeneficiaryType.EXTERNAL:
             reasons.append("EXTERNAL_BENEFICIARY_OBSERVABLE_SIGNALS_ONLY")
 
+        evidence = [
+            IntelligenceEvidence(reason_code=reason, provenance=signals.provenance)
+            for reason in reasons
+            if reason != "EXTERNAL_BENEFICIARY_OBSERVABLE_SIGNALS_ONLY"
+        ]
+
         return SocialEngineeringAssessment(
             intelligence=IntelligenceSnapshot(
                 transaction_risk=transaction_risk,
@@ -133,4 +142,5 @@ class SocialEngineeringDetector:
             ),
             reason_codes=reasons or ["NO_SOCIAL_ENGINEERING_SIGNAL"],
             signal_policy_version=self.policy.policy_version,
+            evidence=evidence,
         )
