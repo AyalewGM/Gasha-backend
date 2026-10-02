@@ -11,6 +11,7 @@ from gasha.domain.models import (
 )
 from gasha.intelligence.social_engineering import (
     SocialEngineeringDetector,
+    SocialEngineeringPolicy,
     SocialEngineeringSignals,
 )
 
@@ -18,9 +19,13 @@ from gasha.intelligence.social_engineering import (
 def policy() -> DecisionPolicy:
     return DecisionPolicy(
         configuration_version="tenant-config-7",
-        policy_version="policy-3",
+        policy_version="decision-policy-3",
         rule_version="rules-2",
     )
+
+
+def signal_policy(**overrides: object) -> SocialEngineeringPolicy:
+    return SocialEngineeringPolicy(policy_version="social-engineering-4", **overrides)
 
 
 def transaction() -> CanonicalTransaction:
@@ -41,9 +46,21 @@ def transaction() -> CanonicalTransaction:
     )
 
 
+def decide(
+    tx: CanonicalTransaction,
+    assessment: object,
+):
+    typed_assessment = assessment
+    return DecisionService(policy()).decide(
+        tx,
+        typed_assessment.intelligence,
+        typed_assessment.reason_codes,
+    )
+
+
 def test_external_mule_aggregation_pattern_is_held_with_explainable_signals() -> None:
     tx = transaction()
-    assessment = SocialEngineeringDetector().assess(
+    assessment = SocialEngineeringDetector(signal_policy()).assess(
         tx,
         SocialEngineeringSignals(
             beneficiary_is_new_to_sender=True,
@@ -54,33 +71,38 @@ def test_external_mule_aggregation_pattern_is_held_with_explainable_signals() ->
         ),
     )
 
-    decision = DecisionService(policy()).decide(tx, assessment.intelligence)
+    decision = DecisionService(policy()).decide(
+        tx, assessment.intelligence, assessment.reason_codes
+    )
 
     assert decision.action == DecisionAction.HOLD
     assert decision.risk_score == 0.88
-    assert "NEW_BENEFICIARY" in assessment.reason_codes
-    assert "AMOUNT_ABOVE_SENDER_BASELINE" in assessment.reason_codes
-    assert "BENEFICIARY_MANY_UNIQUE_SENDERS" in assessment.reason_codes
-    assert "BENEFICIARY_INCOMING_VELOCITY_SPIKE" in assessment.reason_codes
-    assert "EXTERNAL_BENEFICIARY_OBSERVABLE_SIGNALS_ONLY" in assessment.reason_codes
+    assert assessment.signal_policy_version == "social-engineering-4"
+    assert "NEW_BENEFICIARY" in decision.reason_codes
+    assert "AMOUNT_ABOVE_SENDER_BASELINE" in decision.reason_codes
+    assert "BENEFICIARY_MANY_UNIQUE_SENDERS" in decision.reason_codes
+    assert "BENEFICIARY_INCOMING_VELOCITY_SPIKE" in decision.reason_codes
+    assert "EXTERNAL_BENEFICIARY_OBSERVABLE_SIGNALS_ONLY" in decision.reason_codes
 
 
 def test_confirmed_fraud_link_blocks_under_default_policy() -> None:
     tx = transaction()
-    assessment = SocialEngineeringDetector().assess(
+    assessment = SocialEngineeringDetector(signal_policy()).assess(
         tx,
         SocialEngineeringSignals(beneficiary_confirmed_fraud_sender_count=2),
     )
 
-    decision = DecisionService(policy()).decide(tx, assessment.intelligence)
+    decision = DecisionService(policy()).decide(
+        tx, assessment.intelligence, assessment.reason_codes
+    )
 
     assert decision.action == DecisionAction.BLOCK
-    assert "BENEFICIARY_LINKED_TO_CONFIRMED_FRAUD" in assessment.reason_codes
+    assert "BENEFICIARY_LINKED_TO_CONFIRMED_FRAUD" in decision.reason_codes
 
 
 def test_normal_established_relationship_does_not_raise_social_engineering_risk() -> None:
     tx = transaction()
-    assessment = SocialEngineeringDetector().assess(
+    assessment = SocialEngineeringDetector(signal_policy()).assess(
         tx,
         SocialEngineeringSignals(
             beneficiary_is_new_to_sender=False,
@@ -92,7 +114,9 @@ def test_normal_established_relationship_does_not_raise_social_engineering_risk(
         ),
     )
 
-    decision = DecisionService(policy()).decide(tx, assessment.intelligence)
+    decision = DecisionService(policy()).decide(
+        tx, assessment.intelligence, assessment.reason_codes
+    )
 
     assert decision.action == DecisionAction.ALLOW
     assert assessment.intelligence.beneficiary_risk == 0.0
@@ -100,11 +124,38 @@ def test_normal_established_relationship_does_not_raise_social_engineering_risk(
 
 def test_new_device_is_optional_not_assumed_available() -> None:
     tx = transaction()
-    without_device = SocialEngineeringDetector().assess(tx, SocialEngineeringSignals())
-    with_new_device = SocialEngineeringDetector().assess(
+    detector = SocialEngineeringDetector(signal_policy())
+    without_device = detector.assess(tx, SocialEngineeringSignals())
+    with_new_device = detector.assess(
         tx, SocialEngineeringSignals(device_is_new_to_sender=True)
     )
 
     assert without_device.intelligence.transaction_risk == 0.0
     assert with_new_device.intelligence.transaction_risk == 0.74
     assert "NEW_DEVICE_FOR_SENDER" in with_new_device.reason_codes
+
+
+def test_tenant_policy_changes_signal_threshold_without_bank_specific_logic() -> None:
+    tx = transaction()
+    signals = SocialEngineeringSignals(beneficiary_unique_senders_1h=6)
+
+    conservative = SocialEngineeringDetector(
+        signal_policy(
+            policy_version="tenant-a-social-5",
+            unique_senders_1h_threshold=5,
+            unique_senders_beneficiary_risk=0.91,
+        )
+    ).assess(tx, signals)
+    tolerant = SocialEngineeringDetector(
+        signal_policy(
+            policy_version="tenant-b-social-2",
+            unique_senders_1h_threshold=10,
+        )
+    ).assess(tx, signals)
+
+    assert conservative.intelligence.beneficiary_risk == 0.91
+    assert "BENEFICIARY_MANY_UNIQUE_SENDERS" in conservative.reason_codes
+    assert conservative.signal_policy_version == "tenant-a-social-5"
+    assert tolerant.intelligence.beneficiary_risk == 0.0
+    assert "BENEFICIARY_MANY_UNIQUE_SENDERS" not in tolerant.reason_codes
+    assert tolerant.signal_policy_version == "tenant-b-social-2"
