@@ -25,7 +25,9 @@ def policy() -> DecisionPolicy:
 
 
 def signal_policy(**overrides: object) -> SocialEngineeringPolicy:
-    return SocialEngineeringPolicy(policy_version="social-engineering-4", **overrides)
+    values: dict[str, object] = {"policy_version": "social-engineering-4"}
+    values.update(overrides)
+    return SocialEngineeringPolicy(**values)
 
 
 def transaction() -> CanonicalTransaction:
