@@ -48,7 +48,7 @@ def provenance() -> SignalProvenance:
 def signals(**overrides: object) -> SocialEngineeringSignals:
     values: dict[str, object] = {"provenance": provenance()}
     values.update(overrides)
-    return signals(**values)
+    return SocialEngineeringSignals(**values)
 
 
 def transaction() -> CanonicalTransaction:
@@ -94,6 +94,15 @@ def test_external_mule_aggregation_pattern_is_held_with_explainable_signals() ->
     assert "BENEFICIARY_MANY_UNIQUE_SENDERS" in decision.reason_codes
     assert "BENEFICIARY_INCOMING_VELOCITY_SPIKE" in decision.reason_codes
     assert "EXTERNAL_BENEFICIARY_OBSERVABLE_SIGNALS_ONLY" in decision.reason_codes
+    assert assessment.evidence
+    assert all(
+        item.provenance.scope == IntelligenceScope.TENANT_OBSERVED
+        for item in assessment.evidence
+    )
+    assert all(
+        item.provenance.source == IntelligenceSource.TENANT_BENEFICIARY
+        for item in assessment.evidence
+    )
 
 
 def test_confirmed_fraud_link_blocks_under_default_policy() -> None:
@@ -148,7 +157,7 @@ def test_new_device_is_optional_not_assumed_available() -> None:
 
 def test_tenant_policy_changes_signal_threshold_without_bank_specific_logic() -> None:
     tx = transaction()
-    signals = signals(beneficiary_unique_senders_1h=6)
+    observed_signals = signals(beneficiary_unique_senders_1h=6)
 
     conservative = SocialEngineeringDetector(
         signal_policy(
@@ -156,13 +165,13 @@ def test_tenant_policy_changes_signal_threshold_without_bank_specific_logic() ->
             unique_senders_1h_threshold=5,
             unique_senders_beneficiary_risk=0.91,
         )
-    ).assess(tx, signals)
+    ).assess(tx, observed_signals)
     tolerant = SocialEngineeringDetector(
         signal_policy(
             policy_version="tenant-b-social-2",
             unique_senders_1h_threshold=10,
         )
-    ).assess(tx, signals)
+    ).assess(tx, observed_signals)
 
     assert conservative.intelligence.beneficiary_risk == 0.91
     assert "BENEFICIARY_MANY_UNIQUE_SENDERS" in conservative.reason_codes
