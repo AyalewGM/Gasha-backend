@@ -9,6 +9,11 @@ from gasha.domain.models import (
     DecisionAction,
     DecisionPolicy,
 )
+from gasha.intelligence.provenance import (
+    IntelligenceScope,
+    IntelligenceSource,
+    SignalProvenance,
+)
 from gasha.intelligence.social_engineering import (
     SocialEngineeringDetector,
     SocialEngineeringPolicy,
@@ -28,6 +33,22 @@ def signal_policy(**overrides: object) -> SocialEngineeringPolicy:
     values: dict[str, object] = {"policy_version": "social-engineering-4"}
     values.update(overrides)
     return SocialEngineeringPolicy(**values)
+
+
+def provenance() -> SignalProvenance:
+    return SignalProvenance(
+        source=IntelligenceSource.TENANT_BENEFICIARY,
+        scope=IntelligenceScope.TENANT_OBSERVED,
+        observed_at=datetime.now(UTC),
+        source_version="beneficiary-features-1",
+        confidence=0.95,
+    )
+
+
+def signals(**overrides: object) -> SocialEngineeringSignals:
+    values: dict[str, object] = {"provenance": provenance()}
+    values.update(overrides)
+    return signals(**values)
 
 
 def transaction() -> CanonicalTransaction:
@@ -52,7 +73,7 @@ def test_external_mule_aggregation_pattern_is_held_with_explainable_signals() ->
     tx = transaction()
     assessment = SocialEngineeringDetector(signal_policy()).assess(
         tx,
-        SocialEngineeringSignals(
+        signals(
             beneficiary_is_new_to_sender=True,
             amount_to_sender_baseline_ratio=4.2,
             sender_beneficiary_prior_transfer_count=0,
@@ -79,7 +100,7 @@ def test_confirmed_fraud_link_blocks_under_default_policy() -> None:
     tx = transaction()
     assessment = SocialEngineeringDetector(signal_policy()).assess(
         tx,
-        SocialEngineeringSignals(beneficiary_confirmed_fraud_sender_count=2),
+        signals(beneficiary_confirmed_fraud_sender_count=2),
     )
 
     decision = DecisionService(policy()).decide(
@@ -94,7 +115,7 @@ def test_normal_established_relationship_does_not_raise_social_engineering_risk(
     tx = transaction()
     assessment = SocialEngineeringDetector(signal_policy()).assess(
         tx,
-        SocialEngineeringSignals(
+        signals(
             beneficiary_is_new_to_sender=False,
             amount_to_sender_baseline_ratio=1.1,
             sender_beneficiary_prior_transfer_count=14,
@@ -115,9 +136,9 @@ def test_normal_established_relationship_does_not_raise_social_engineering_risk(
 def test_new_device_is_optional_not_assumed_available() -> None:
     tx = transaction()
     detector = SocialEngineeringDetector(signal_policy())
-    without_device = detector.assess(tx, SocialEngineeringSignals())
+    without_device = detector.assess(tx, signals())
     with_new_device = detector.assess(
-        tx, SocialEngineeringSignals(device_is_new_to_sender=True)
+        tx, signals(device_is_new_to_sender=True)
     )
 
     assert without_device.intelligence.transaction_risk == 0.0
@@ -127,7 +148,7 @@ def test_new_device_is_optional_not_assumed_available() -> None:
 
 def test_tenant_policy_changes_signal_threshold_without_bank_specific_logic() -> None:
     tx = transaction()
-    signals = SocialEngineeringSignals(beneficiary_unique_senders_1h=6)
+    signals = signals(beneficiary_unique_senders_1h=6)
 
     conservative = SocialEngineeringDetector(
         signal_policy(
