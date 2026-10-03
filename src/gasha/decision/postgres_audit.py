@@ -76,8 +76,12 @@ class PostgresDecisionAuditRepository:
         decision_raw = row["decision_json"]
         versions_raw = row["signal_policy_versions_json"]
         evidence_raw = row["evidence_json"]
-        if not all(isinstance(value, str) for value in (decision_raw, versions_raw, evidence_raw)):
-            raise TypeError("decision audit JSON columns must be returned as text")
+        if not isinstance(decision_raw, str):
+            raise TypeError("decision_json must be returned as text")
+        if not isinstance(versions_raw, str):
+            raise TypeError("signal_policy_versions_json must be returned as text")
+        if not isinstance(evidence_raw, str):
+            raise TypeError("evidence_json must be returned as text")
 
         versions = json.loads(versions_raw)
         evidence_items = json.loads(evidence_raw)
