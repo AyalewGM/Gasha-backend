@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import Protocol
+from typing import Protocol, Self
 from uuid import UUID
 
 from gasha.decision.audit import DecisionAuditRecord
@@ -13,7 +13,7 @@ from gasha.intelligence.provenance import IntelligenceEvidence
 class Cursor(Protocol):
     def execute(self, query: str, params: tuple[object, ...]) -> None: ...
     def fetchone(self) -> Mapping[str, object] | None: ...
-    def __enter__(self) -> Cursor: ...
+    def __enter__(self) -> Self: ...
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None: ...
 
 
