@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from typing import Self
 from uuid import uuid4
 
 from gasha.decision.audit import DecisionAuditRecord
@@ -39,7 +40,7 @@ class FakeCursor:
     def fetchone(self) -> dict[str, object] | None:
         return self.row
 
-    def __enter__(self) -> "FakeCursor":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
