@@ -27,7 +27,7 @@ def transaction() -> CanonicalTransaction:
         occurred_at=datetime.now(UTC),
         channel="mobile",
         transaction_type="transfer",
-        amount=Decimal("2500"),
+        amount=Decimal(2500),
         currency="ETB",
         sender_customer_id="customer-1",
         sender_account_id="account-1",
