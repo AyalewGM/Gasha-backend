@@ -101,3 +101,23 @@ def test_internal_beneficiary_does_not_require_destination_institution() -> None
 def test_thresholds_must_be_strictly_increasing() -> None:
     with pytest.raises(ValidationError):
         policy(review_threshold=0.90, hold_threshold=0.80)
+
+
+def test_velocity_risk_is_first_class_decision_signal() -> None:
+    decision = DecisionService(policy()).decide(
+        transaction(),
+        IntelligenceSnapshot(velocity_risk=0.88),
+    )
+    assert decision.action == DecisionAction.HOLD
+    assert decision.risk_score == 0.88
+    assert "HIGH_VELOCITY_RISK" in decision.reason_codes
+
+
+def test_device_session_risk_is_first_class_decision_signal() -> None:
+    decision = DecisionService(policy()).decide(
+        transaction(),
+        IntelligenceSnapshot(device_session_risk=0.78),
+    )
+    assert decision.action == DecisionAction.REVIEW
+    assert decision.risk_score == 0.78
+    assert "HIGH_DEVICE_SESSION_RISK" in decision.reason_codes
