@@ -25,6 +25,8 @@ class DecisionService:
         components = {
             "customer": intelligence.customer_risk,
             "transaction": intelligence.transaction_risk,
+            "velocity": intelligence.velocity_risk,
+            "device_session": intelligence.device_session_risk,
             "beneficiary": intelligence.beneficiary_risk,
             "relationship": intelligence.relationship_risk,
             "network": intelligence.network_risk,

@@ -57,6 +57,8 @@ class CanonicalTransaction(BaseModel):
 class IntelligenceSnapshot(BaseModel):
     customer_risk: RiskScore = 0.0
     transaction_risk: RiskScore = 0.0
+    velocity_risk: RiskScore = 0.0
+    device_session_risk: RiskScore = 0.0
     beneficiary_risk: RiskScore = 0.0
     relationship_risk: RiskScore = 0.0
     network_risk: RiskScore = 0.0
