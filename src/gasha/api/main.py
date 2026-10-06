@@ -31,10 +31,6 @@ def readiness() -> dict[str, str]:
 @app.post("/v1/decisions", response_model=FraudDecision)
 def create_decision(request: DecisionRequest) -> FraudDecision:
     intelligence = IntelligenceSnapshot(
-        customer_risk=request.customer_risk,
-        transaction_risk=request.transaction_risk,
-        beneficiary_risk=request.beneficiary_risk,
-        relationship_risk=request.relationship_risk,
-        network_risk=request.network_risk,
+        **request.model_dump(include=set(IntelligenceSnapshot.model_fields))
     )
     return DecisionService(request.policy).decide(request.transaction, intelligence)
