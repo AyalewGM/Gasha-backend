@@ -13,6 +13,8 @@ class InternalGraphSignals(BaseModel):
     incoming_transfers_to_beneficiary_1h: int = Field(default=0, ge=0)
     distinct_accounts_on_device_24h: int = Field(default=0, ge=0)
     confirmed_fraud_neighbors_30d: int = Field(default=0, ge=0)
+    repeat_senders_to_beneficiary_30d: int = Field(default=0, ge=0)
+    linked_beneficiaries_via_shared_senders_30d: int = Field(default=0, ge=0)
     rapid_outbound_ratio_1h: float | None = Field(default=None, ge=0.0, le=1.0)
     provenance: SignalProvenance
 
@@ -27,6 +29,10 @@ class InternalGraphPolicy(BaseModel):
     shared_device_risk: RiskScore = 0.82
     confirmed_fraud_neighbors_threshold: int = Field(default=1, ge=1)
     confirmed_fraud_neighbor_risk: RiskScore = 0.94
+    repeat_senders_threshold: int = Field(default=2, ge=1)
+    repeat_senders_risk: RiskScore = 0.84
+    shared_sender_cluster_threshold: int = Field(default=2, ge=1)
+    shared_sender_cluster_risk: RiskScore = 0.85
     rapid_outbound_ratio_threshold: float = Field(default=0.80, gt=0.0, le=1.0)
     rapid_outbound_risk: RiskScore = 0.88
     mule_cluster_combination_risk: RiskScore = 0.96
@@ -87,6 +93,25 @@ class InternalGraphDetector:
             )
             reasons.append("INTERNAL_GRAPH_CONFIRMED_FRAUD_NEIGHBOR")
 
+        repeat_victims = (
+            signals.repeat_senders_to_beneficiary_30d
+            >= self.policy.repeat_senders_threshold
+        )
+        if repeat_victims:
+            beneficiary_risk = max(beneficiary_risk, self.policy.repeat_senders_risk)
+            network_risk = max(network_risk, self.policy.repeat_senders_risk)
+            reasons.append("INTERNAL_GRAPH_REPEAT_VICTIM_SENDERS")
+
+        shared_sender_cluster = (
+            signals.linked_beneficiaries_via_shared_senders_30d
+            >= self.policy.shared_sender_cluster_threshold
+        )
+        if shared_sender_cluster:
+            network_risk = max(
+                network_risk, self.policy.shared_sender_cluster_risk
+            )
+            reasons.append("INTERNAL_GRAPH_SHARED_SENDER_CLUSTER")
+
         rapid_outbound = (
             signals.rapid_outbound_ratio_1h is not None
             and signals.rapid_outbound_ratio_1h
@@ -99,7 +124,7 @@ class InternalGraphDetector:
             network_risk = max(network_risk, self.policy.rapid_outbound_risk)
             reasons.append("INTERNAL_GRAPH_RAPID_OUTBOUND_MOVEMENT")
 
-        if fan_in and rapid_outbound:
+        if fan_in and (rapid_outbound or repeat_victims):
             beneficiary_risk = max(
                 beneficiary_risk, self.policy.mule_cluster_combination_risk
             )
