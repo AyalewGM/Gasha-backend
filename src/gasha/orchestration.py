@@ -15,6 +15,8 @@ from gasha.decision.audit import (
 from gasha.decision.mode import DecisionEnvelope, ModeAwareDecisionService
 from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.contracts import FraudEventEnvelope
+from gasha.journey.detector import JourneyAssessment
+from gasha.journey.provider import JourneyIntelligence
 from gasha.observability.metrics import MetricsRegistry
 from gasha.poc.historical import MissingTenantPolicyError
 
@@ -24,12 +26,15 @@ class ShadowEvaluationRecord(BaseModel):
 
     ``event`` carries the canonical transaction plus adapter/schema
     versions; ``evaluation`` carries the hypothetical Gasha decision, the
-    non-enforcing effective action, versions, timestamp and latency.
+    non-enforcing effective action, versions, timestamp and latency;
+    ``journey`` preserves the journey assessment evidence when UC-03
+    enrichment ran.
     """
 
     event: FraudEventEnvelope
     evaluation: DecisionEnvelope
     persisted_at: datetime
+    journey: JourneyAssessment | None = None
 
 
 class ShadowEvaluationRepository(Protocol):
@@ -86,12 +91,14 @@ class ShadowOrchestrator:
         audit: DecisionAuditRepository | None = None,
         clock: Callable[[], datetime] | None = None,
         metrics: MetricsRegistry | None = None,
+        journey: JourneyIntelligence | None = None,
     ) -> None:
         self._policies = dict(policies)
         self._evaluations = evaluations or InMemoryShadowEvaluationRepository()
         self._audit = audit or InMemoryDecisionAuditRepository()
         self._clock = clock or (lambda: datetime.now(UTC))
         self._metrics = metrics
+        self._journey = journey
 
     @property
     def evaluations(self) -> ShadowEvaluationRepository:
@@ -105,6 +112,15 @@ class ShadowOrchestrator:
                 f"{event.tenant_id!r}"
             )
 
+        intelligence = event.intelligence
+        evidence = list(event.evidence_reason_codes)
+        assessment = self._journey_assessment(event)
+        if assessment is not None:
+            intelligence = intelligence.model_copy(
+                update={"journey_risk": assessment.journey_risk}
+            )
+            evidence.extend(assessment.reason_codes)
+
         try:
             evaluation = ModeAwareDecisionService(
                 policy,
@@ -112,8 +128,8 @@ class ShadowOrchestrator:
                 clock=self._clock,
             ).decide(
                 event.canonical_transaction,
-                event.intelligence,
-                event.evidence_reason_codes,
+                intelligence,
+                evidence,
             )
         except Exception:
             self._count("gasha_evaluation_failures", event.tenant_id)
@@ -143,12 +159,26 @@ class ShadowOrchestrator:
                     event=event,
                     evaluation=evaluation,
                     persisted_at=self._clock(),
+                    journey=assessment,
                 )
             )
         except Exception:
             self._count("gasha_persistence_failures", event.tenant_id)
             raise
         return evaluation
+
+    def _journey_assessment(
+        self, event: FraudEventEnvelope
+    ) -> JourneyAssessment | None:
+        if self._journey is None:
+            return None
+        try:
+            return self._journey.assess(event.canonical_transaction)
+        except Exception:  # noqa: BLE001 - optional intelligence degrades
+            self._count(
+                "gasha_journey_evaluation_failures", event.tenant_id
+            )
+            return None
 
     def _count(
         self, name: str, tenant_id: str, **labels: str

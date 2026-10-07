@@ -143,8 +143,8 @@ def test_poc_report_assembles_machine_readable_evidence() -> None:
     assert poc.policy_versions == ["policy-1"]
     assert poc.model_versions == ["model-1"]
     assert poc.signal_policy_versions == ["social-engineering-4"]
-    assert len(poc.signal_attribution) == 7
-    assert len(poc.ablation) == 10
+    assert len(poc.signal_attribution) == 8
+    assert len(poc.ablation) == 11
     assert poc.incumbent_comparison is not None
     assert poc.incumbent_comparison.incremental_confirmed_detection == 1
     assert poc.incumbent_comparison.both_detected == 1

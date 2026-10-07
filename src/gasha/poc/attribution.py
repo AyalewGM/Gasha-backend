@@ -26,6 +26,7 @@ class SignalFamily(StrEnum):
     VELOCITY = "velocity"
     DEVICE_SESSION = "device_session"
     NETWORK = "network"
+    JOURNEY = "journey"
 
     @property
     def snapshot_field(self) -> str:
@@ -62,6 +63,12 @@ DEFAULT_SIGNAL_COMBINATIONS: dict[str, frozenset[SignalFamily]] = {
     ),
     "relationship_behavioral_anomaly": frozenset(
         {SignalFamily.RELATIONSHIP, SignalFamily.DEVICE_SESSION}
+    ),
+    "ato_journey_new_beneficiary": frozenset(
+        {SignalFamily.JOURNEY, SignalFamily.RELATIONSHIP}
+    ),
+    "ato_journey_mule_recipient": frozenset(
+        {SignalFamily.JOURNEY, SignalFamily.NETWORK}
     ),
 }
 

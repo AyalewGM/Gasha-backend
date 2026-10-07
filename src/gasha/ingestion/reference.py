@@ -25,6 +25,11 @@ from gasha.ingestion.errors import (
     RejectionRecord,
     payload_fingerprint,
 )
+from gasha.journey.events import (
+    JourneyEvent,
+    JourneyEventEnvelope,
+    JourneyEventKind,
+)
 
 REFERENCE_SCHEMA_VERSION = "1.0"
 
@@ -261,6 +266,67 @@ class ReferenceJsonAdapter:
                 f"currency {currency!r} is not supported",
             )
         return currency
+
+    def adapt_journey(self, event: InboundBankEvent) -> JourneyEventEnvelope:
+        """Normalize a `journey` payload into a JourneyEventEnvelope.
+
+        Payload keys map to ``JourneyEvent`` fields:
+        event_id, occurred_at, kind, subtype, customer_id, account_id?,
+        session_id?, device_id?, beneficiary_id?, correlation_id?,
+        received_at?.
+        """
+        reject = self._rejector(event)
+        if event.schema_version not in self.supported_schema_versions:
+            reject(
+                RejectionReason.UNSUPPORTED_SCHEMA_VERSION,
+                f"schema {event.schema_version!r} not in "
+                f"{sorted(self.supported_schema_versions)}",
+            )
+        if not isinstance(event.payload, Mapping):
+            reject(RejectionReason.INVALID_SCHEMA, "payload must be a mapping")
+
+        payload = event.payload
+        try:
+            kind = JourneyEventKind(str(payload.get("kind") or ""))
+        except (TypeError, ValueError):
+            reject(
+                RejectionReason.INVALID_SCHEMA,
+                f"unknown journey kind {payload.get('kind')!r}",
+            )
+        try:
+            journey_event = JourneyEvent(
+                tenant_id=event.tenant_id,
+                event_id=self._event_id(payload.get("event_id"), reject),
+                kind=kind,
+                subtype=str(payload.get("subtype") or ""),
+                occurred_at=self._timestamp(
+                    payload.get("occurred_at"), reject
+                ),
+                received_at=event.received_at,
+                correlation_id=payload.get("correlation_id"),
+                customer_id=str(payload.get("customer_id") or ""),
+                account_id=payload.get("account_id"),
+                session_id=payload.get("session_id"),
+                device_id=payload.get("device_id"),
+                beneficiary_id=payload.get("beneficiary_id"),
+            )
+        except (ValidationError, ValueError) as exc:
+            reject(RejectionReason.NORMALIZATION_FAILURE, str(exc))
+
+        return JourneyEventEnvelope(
+            tenant_id=event.tenant_id,
+            event_id=journey_event.event_id,
+            received_at=event.received_at,
+            correlation_id=journey_event.correlation_id,
+            adapter=AdapterMetadata(
+                source_system=event.source_system,
+                adapter_type=self.adapter_type,
+                adapter_version=self.adapter_version,
+                schema_version=event.schema_version,
+                normalized_at=datetime.now(UTC),
+            ),
+            event=journey_event,
+        )
 
     def _intelligence(self, value: Any) -> IntelligenceSnapshot:
         """Malformed optional intelligence degrades to unavailable."""

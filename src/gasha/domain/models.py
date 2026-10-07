@@ -70,6 +70,7 @@ class IntelligenceSnapshot(BaseModel):
     beneficiary_risk: RiskScore = 0.0
     relationship_risk: RiskScore = 0.0
     network_risk: RiskScore = 0.0
+    journey_risk: RiskScore = 0.0
 
 
 class DecisionPolicy(BaseModel):
