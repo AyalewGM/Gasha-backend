@@ -173,12 +173,15 @@ class ShadowOrchestrator:
         if self._journey is None:
             return None
         try:
-            return self._journey.assess(event.canonical_transaction)
+            assessment = self._journey.assess(event.canonical_transaction)
         except Exception:  # noqa: BLE001 - optional intelligence degrades
             self._count(
                 "gasha_journey_evaluation_failures", event.tenant_id
             )
             return None
+        if assessment is not None:
+            self._count("gasha_journey_evaluations", event.tenant_id)
+        return assessment
 
     def _count(
         self, name: str, tenant_id: str, **labels: str
