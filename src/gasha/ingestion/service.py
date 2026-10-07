@@ -16,6 +16,7 @@ from gasha.ingestion.errors import (
     RejectionRecord,
     payload_fingerprint,
 )
+from gasha.observability.metrics import MetricsRegistry
 
 
 class IngestionOutcome(StrEnum):
@@ -102,16 +103,26 @@ class IngestionService:
         *,
         store: IngestionStore | None = None,
         dead_letters: DeadLetterSink | None = None,
+        metrics: MetricsRegistry | None = None,
     ) -> None:
         self._adapters = dict(adapters)
         self._store = store or InMemoryIngestionStore()
         self._dead_letters = dead_letters or InMemoryDeadLetterSink()
+        self._metrics = metrics
 
     @property
     def dead_letter_sink(self) -> DeadLetterSink:
         return self._dead_letters
 
     def ingest(self, event: InboundBankEvent) -> IngestionResult:
+        if self._metrics is not None:
+            self._metrics.increment(
+                "gasha_events_received",
+                labels={
+                    "tenant_id": event.tenant_id,
+                    "source_system": event.source_system,
+                },
+            )
         adapter = self._adapters.get(event.source_system)
         if adapter is None:
             return self._reject(
@@ -139,6 +150,11 @@ class IngestionService:
         existing = self._store.get(envelope.tenant_id, envelope.event_id)
         if existing is not None:
             if existing.payload_fingerprint == fingerprint:
+                if self._metrics is not None:
+                    self._metrics.increment(
+                        "gasha_events_duplicate",
+                        labels={"tenant_id": envelope.tenant_id},
+                    )
                 return IngestionResult(
                     outcome=IngestionOutcome.DUPLICATE,
                     envelope=existing.envelope,
@@ -167,6 +183,11 @@ class IngestionService:
                 accepted_at=datetime.now(UTC),
             )
         )
+        if self._metrics is not None:
+            self._metrics.increment(
+                "gasha_events_accepted",
+                labels={"tenant_id": envelope.tenant_id},
+            )
         return IngestionResult(
             outcome=IngestionOutcome.ACCEPTED,
             envelope=record.envelope,
@@ -196,6 +217,15 @@ class IngestionService:
 
     def _dead_letter(self, record: RejectionRecord) -> IngestionResult:
         self._dead_letters.put(record)
+        if self._metrics is not None:
+            labels = {"reason": record.reason.value}
+            if record.tenant_id:
+                labels["tenant_id"] = record.tenant_id
+            self._metrics.increment("gasha_events_rejected", labels=labels)
+            if record.reason == RejectionReason.ADAPTER_FAILURE:
+                self._metrics.increment(
+                    "gasha_adapter_failures", labels=labels
+                )
         return IngestionResult(
             outcome=IngestionOutcome.REJECTED, rejection=record
         )

@@ -15,6 +15,7 @@ from gasha.decision.audit import (
 from gasha.decision.mode import DecisionEnvelope, ModeAwareDecisionService
 from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.contracts import FraudEventEnvelope
+from gasha.observability.metrics import MetricsRegistry
 from gasha.poc.historical import MissingTenantPolicyError
 
 
@@ -84,11 +85,13 @@ class ShadowOrchestrator:
         evaluations: ShadowEvaluationRepository | None = None,
         audit: DecisionAuditRepository | None = None,
         clock: Callable[[], datetime] | None = None,
+        metrics: MetricsRegistry | None = None,
     ) -> None:
         self._policies = dict(policies)
         self._evaluations = evaluations or InMemoryShadowEvaluationRepository()
         self._audit = audit or InMemoryDecisionAuditRepository()
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._metrics = metrics
 
     @property
     def evaluations(self) -> ShadowEvaluationRepository:
@@ -102,27 +105,56 @@ class ShadowOrchestrator:
                 f"{event.tenant_id!r}"
             )
 
-        evaluation = ModeAwareDecisionService(
-            policy,
-            operating_mode=event.operating_mode,
-            clock=self._clock,
-        ).decide(
-            event.canonical_transaction,
-            event.intelligence,
-            event.evidence_reason_codes,
+        try:
+            evaluation = ModeAwareDecisionService(
+                policy,
+                operating_mode=event.operating_mode,
+                clock=self._clock,
+            ).decide(
+                event.canonical_transaction,
+                event.intelligence,
+                event.evidence_reason_codes,
+            )
+        except Exception:
+            self._count("gasha_evaluation_failures", event.tenant_id)
+            raise
+        self._count("gasha_evaluations_completed", event.tenant_id)
+        self._count(
+            "gasha_shadow_hypothetical_decisions",
+            event.tenant_id,
+            action=evaluation.decision.action.value,
         )
+        if self._metrics is not None:
+            self._metrics.observe(
+                "gasha_evaluation_latency_ms",
+                evaluation.evaluation_latency_ms,
+                labels={"tenant_id": event.tenant_id},
+            )
 
-        self._audit.save(
-            audit_record(
-                evaluation.decision,
-                signal_policy_versions=event.signal_policy_versions,
+        try:
+            self._audit.save(
+                audit_record(
+                    evaluation.decision,
+                    signal_policy_versions=event.signal_policy_versions,
+                )
             )
-        )
-        self._evaluations.save(
-            ShadowEvaluationRecord(
-                event=event,
-                evaluation=evaluation,
-                persisted_at=self._clock(),
+            self._evaluations.save(
+                ShadowEvaluationRecord(
+                    event=event,
+                    evaluation=evaluation,
+                    persisted_at=self._clock(),
+                )
             )
-        )
+        except Exception:
+            self._count("gasha_persistence_failures", event.tenant_id)
+            raise
         return evaluation
+
+    def _count(
+        self, name: str, tenant_id: str, **labels: str
+    ) -> None:
+        if self._metrics is None:
+            return
+        self._metrics.increment(
+            name, labels={"tenant_id": tenant_id} | labels
+        )
