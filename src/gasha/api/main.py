@@ -40,8 +40,21 @@ def liveness() -> dict[str, str]:
 
 
 @app.get("/health/ready")
-def readiness() -> dict[str, str]:
-    return {"status": "ready"}
+def readiness(request: Request) -> dict[str, object]:
+    """Ready only when the dependencies required to serve traffic exist.
+
+    Checks are dependency-presence checks, not deep probes — no secrets
+    or connection details are ever reported.
+    """
+
+    checks = {
+        "outcome_ingestion": isinstance(
+            getattr(request.app.state, "outcome_ingestion", None),
+            OutcomeIngestionService,
+        ),
+    }
+    ready = all(checks.values())
+    return {"status": "ready" if ready else "not_ready", "checks": checks}
 
 
 @app.post("/v1/decisions", response_model=FraudDecision)
