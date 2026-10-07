@@ -1,0 +1,251 @@
+from __future__ import annotations
+
+import hashlib
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import StrEnum
+from statistics import fmean
+
+from pydantic import BaseModel, Field
+
+from gasha.decision.service import DecisionService
+from gasha.domain.models import (
+    CanonicalTransaction,
+    DecisionAction,
+    DecisionPolicy,
+    FraudDecision,
+    IntelligenceSnapshot,
+)
+
+_ALERT_ACTIONS = frozenset(
+    {
+        DecisionAction.CHALLENGE,
+        DecisionAction.REVIEW,
+        DecisionAction.HOLD,
+        DecisionAction.BLOCK,
+    }
+)
+
+
+class ConfirmedOutcomeLabel(BaseModel):
+    """A confirmed fraud/non-fraud outcome attached to a historical event."""
+
+    is_fraud: bool
+    label_source: str = Field(min_length=1)
+    confirmed_at: datetime | None = None
+
+
+class HistoricalTransactionEvent(BaseModel):
+    """Sanitized, pseudonymized historical transaction for decision replay.
+
+    ``transaction.occurred_at`` is the preserved historical event time and
+    ``intelligence`` carries the point-in-time features assembled upstream by
+    the same intelligence layer that feeds the production decision path.
+    """
+
+    transaction: CanonicalTransaction
+    intelligence: IntelligenceSnapshot
+    evidence_reason_codes: tuple[str, ...] = ()
+    signal_policy_versions: tuple[str, ...] = ()
+    label: ConfirmedOutcomeLabel | None = None
+
+
+class ReplayClassification(StrEnum):
+    TRUE_POSITIVE = "true_positive"
+    FALSE_POSITIVE = "false_positive"
+    TRUE_NEGATIVE = "true_negative"
+    FALSE_NEGATIVE = "false_negative"
+    UNLABELED = "unlabeled"
+
+
+class MissingTenantPolicyError(ValueError):
+    """Raised when a replay event has no policy for its tenant."""
+
+
+@dataclass(frozen=True)
+class ReplayedEventResult:
+    """Full decision capture for one replayed historical event."""
+
+    event: HistoricalTransactionEvent
+    decision: FraudDecision
+    classification: ReplayClassification
+    decision_latency: timedelta
+    detection_lead_time: timedelta | None
+
+
+@dataclass(frozen=True)
+class HistoricalReplayMetrics:
+    cases: int
+    labeled_cases: int
+    unlabeled_cases: int
+    true_positives: int
+    false_positives: int
+    true_negatives: int
+    false_negatives: int
+    explained_alerts: int
+    mean_decision_latency_seconds: float | None
+    max_decision_latency_seconds: float | None
+    mean_detection_lead_time_seconds: float | None
+
+    @property
+    def recall(self) -> float:
+        denominator = self.true_positives + self.false_negatives
+        return self.true_positives / denominator if denominator else 0.0
+
+    @property
+    def precision(self) -> float:
+        denominator = self.true_positives + self.false_positives
+        return self.true_positives / denominator if denominator else 0.0
+
+    @property
+    def false_positive_rate(self) -> float:
+        denominator = self.false_positives + self.true_negatives
+        return self.false_positives / denominator if denominator else 0.0
+
+    @property
+    def explainability_coverage(self) -> float:
+        alerts = self.true_positives + self.false_positives
+        return self.explained_alerts / alerts if alerts else 1.0
+
+
+@dataclass(frozen=True)
+class HistoricalReplayReport:
+    results: tuple[ReplayedEventResult, ...]
+    metrics: HistoricalReplayMetrics
+
+
+def replay_historical(
+    events: Sequence[HistoricalTransactionEvent],
+    policies: Mapping[str, DecisionPolicy],
+) -> HistoricalReplayReport:
+    """Replays historical events through the production decision path.
+
+    Events are replayed chronologically by ``occurred_at`` and each is decided
+    by a ``DecisionService`` configured with the policy registered for the
+    event's own tenant. An event whose tenant has no policy raises
+    ``MissingTenantPolicyError``; there is no cross-tenant fallback.
+    """
+
+    services: dict[str, DecisionService] = {}
+    results: list[ReplayedEventResult] = []
+
+    for event in sorted(events, key=lambda item: item.transaction.occurred_at):
+        tenant_id = event.transaction.tenant_id
+        policy = policies.get(tenant_id)
+        if policy is None:
+            raise MissingTenantPolicyError(
+                f"no decision policy registered for tenant {tenant_id!r}"
+            )
+        service = services.get(tenant_id)
+        if service is None:
+            service = services[tenant_id] = DecisionService(policy)
+
+        decision = service.decide(
+            event.transaction,
+            event.intelligence,
+            event.evidence_reason_codes,
+        )
+        results.append(_result(event, decision))
+
+    return HistoricalReplayReport(
+        results=tuple(results),
+        metrics=_metrics(results),
+    )
+
+
+def pseudonymize_transaction(
+    transaction: CanonicalTransaction, *, salt: str
+) -> CanonicalTransaction:
+    """Returns a copy with stable keyed pseudonyms for identifier fields.
+
+    The same salt and identifier always produce the same pseudonym, preserving
+    sender/beneficiary linkage inside a sanitized dataset while remaining
+    unlinkable across salts (for example, across tenants). ``tenant_id``,
+    timestamps and amounts are preserved so tenant isolation and event-time
+    semantics stay intact.
+    """
+
+    def pseudonym(value: str) -> str:
+        return hashlib.sha256(f"{salt}:{value}".encode()).hexdigest()[:24]
+
+    updates: dict[str, object] = {
+        "sender_customer_id": pseudonym(transaction.sender_customer_id),
+        "sender_account_id": pseudonym(transaction.sender_account_id),
+        "beneficiary_id": pseudonym(transaction.beneficiary_id),
+        "correlation_id": pseudonym(transaction.correlation_id),
+    }
+    if transaction.device_id is not None:
+        updates["device_id"] = pseudonym(transaction.device_id)
+    if transaction.destination_institution_id is not None:
+        updates["destination_institution_id"] = pseudonym(
+            transaction.destination_institution_id
+        )
+    return transaction.model_copy(update=updates)
+
+
+def _result(
+    event: HistoricalTransactionEvent, decision: FraudDecision
+) -> ReplayedEventResult:
+    alerted = decision.action in _ALERT_ACTIONS
+    label = event.label
+
+    if label is None:
+        classification = ReplayClassification.UNLABELED
+    elif alerted and label.is_fraud:
+        classification = ReplayClassification.TRUE_POSITIVE
+    elif alerted:
+        classification = ReplayClassification.FALSE_POSITIVE
+    elif label.is_fraud:
+        classification = ReplayClassification.FALSE_NEGATIVE
+    else:
+        classification = ReplayClassification.TRUE_NEGATIVE
+
+    lead_time = None
+    if alerted and label is not None and label.is_fraud and label.confirmed_at:
+        lead_time = label.confirmed_at - decision.decided_at
+
+    return ReplayedEventResult(
+        event=event,
+        decision=decision,
+        classification=classification,
+        decision_latency=decision.decided_at - event.transaction.occurred_at,
+        detection_lead_time=lead_time,
+    )
+
+
+def _metrics(results: list[ReplayedEventResult]) -> HistoricalReplayMetrics:
+    counts = {
+        classification: 0 for classification in ReplayClassification
+    }
+    explained = 0
+    latencies: list[float] = []
+    lead_times: list[float] = []
+    for item in results:
+        counts[item.classification] += 1
+        if (
+            item.decision.action in _ALERT_ACTIONS
+            and item.decision.reason_codes
+            and item.decision.reason_codes != ["NO_HIGH_RISK_SIGNAL"]
+        ):
+            explained += 1
+        latencies.append(item.decision_latency.total_seconds())
+        if item.detection_lead_time is not None:
+            lead_times.append(item.detection_lead_time.total_seconds())
+
+    return HistoricalReplayMetrics(
+        cases=len(results),
+        labeled_cases=counts[ReplayClassification.TRUE_POSITIVE]
+        + counts[ReplayClassification.FALSE_POSITIVE]
+        + counts[ReplayClassification.TRUE_NEGATIVE]
+        + counts[ReplayClassification.FALSE_NEGATIVE],
+        unlabeled_cases=counts[ReplayClassification.UNLABELED],
+        true_positives=counts[ReplayClassification.TRUE_POSITIVE],
+        false_positives=counts[ReplayClassification.FALSE_POSITIVE],
+        true_negatives=counts[ReplayClassification.TRUE_NEGATIVE],
+        false_negatives=counts[ReplayClassification.FALSE_NEGATIVE],
+        explained_alerts=explained,
+        mean_decision_latency_seconds=fmean(latencies) if latencies else None,
+        max_decision_latency_seconds=max(latencies) if latencies else None,
+        mean_detection_lead_time_seconds=fmean(lead_times) if lead_times else None,
+    )
