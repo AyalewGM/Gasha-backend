@@ -20,6 +20,7 @@ class RejectionReason(StrEnum):
     INVALID_TIMESTAMP = "invalid_timestamp"
     UNSUPPORTED_CURRENCY = "unsupported_currency"
     TENANT_CONFIGURATION_UNAVAILABLE = "tenant_configuration_unavailable"
+    DUPLICATE_CONFLICT = "duplicate_conflict"
     ADAPTER_FAILURE = "adapter_failure"
     NORMALIZATION_FAILURE = "normalization_failure"
 
