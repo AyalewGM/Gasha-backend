@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from uuid import UUID
 
+from pydantic import BaseModel, ConfigDict
+
 from gasha.journey.events import (
     AccountSecuritySubtype,
     AuthenticationSubtype,
@@ -21,12 +23,13 @@ from gasha.journey.policy import JourneyRiskPolicy
 from gasha.journey.repository import JourneyEventRepository
 
 
-@dataclass(frozen=True)
-class ContributingEvent:
+class ContributingEvent(BaseModel):
     """Minimized evidence pointer for a contributing journey event.
 
     Carries identifiers and timestamps only — never raw payloads or PII.
     """
+
+    model_config = ConfigDict(frozen=True)
 
     event_id: UUID
     kind: str
@@ -34,9 +37,10 @@ class ContributingEvent:
     occurred_at: datetime
 
 
-@dataclass(frozen=True)
-class JourneyAssessment:
+class JourneyAssessment(BaseModel):
     """Deterministic journey risk with explainable evidence."""
+
+    model_config = ConfigDict(frozen=True)
 
     tenant_id: str
     customer_id: str

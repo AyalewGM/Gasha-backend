@@ -6,6 +6,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
+from gasha.ingestion.contracts import AdapterMetadata
+
 
 class JourneyEventKind(StrEnum):
     """Canonical non-transaction event categories for UC-03 journeys.
@@ -110,3 +112,14 @@ class JourneyEvent(BaseModel):
                     f"{self.kind.value} events require {field}"
                 )
         return self
+
+
+class JourneyEventEnvelope(BaseModel):
+    """Transport envelope for a normalized journey event."""
+
+    tenant_id: str = Field(min_length=1)
+    event_id: UUID
+    received_at: datetime | None = None
+    correlation_id: str | None = None
+    adapter: AdapterMetadata
+    event: JourneyEvent
