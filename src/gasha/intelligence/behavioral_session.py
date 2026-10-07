@@ -25,6 +25,8 @@ class BehavioralSessionPolicy(BaseModel):
     behavioral_anomaly_threshold: RiskScore = 0.75
     behavioral_anomaly_risk: RiskScore = 0.78
     coached_payment_combination_risk: RiskScore = 0.92
+    coached_payment_min_signals: int = Field(default=3, ge=2)
+    coached_payment_requires_active_call: bool = True
 
 
 class BehavioralSessionAssessment(BaseModel):
@@ -42,43 +44,55 @@ class BehavioralSessionDetector:
 
     def assess(self, signals: BehavioralSessionSignals) -> BehavioralSessionAssessment:
         reasons: list[str] = []
-        transaction_risk: RiskScore = 0.0
+        device_session_risk: RiskScore = 0.0
 
         high_hesitation = (
             signals.hesitation_seconds is not None
             and signals.hesitation_seconds >= self.policy.hesitation_threshold_seconds
         )
         if high_hesitation:
-            transaction_risk = max(transaction_risk, self.policy.hesitation_risk)
+            device_session_risk = max(
+                device_session_risk, self.policy.hesitation_risk
+            )
             reasons.append("UNUSUAL_PAYMENT_HESITATION")
 
         if signals.active_call_indicator is True:
-            transaction_risk = max(transaction_risk, self.policy.active_call_risk)
+            device_session_risk = max(
+                device_session_risk, self.policy.active_call_risk
+            )
             reasons.append("ACTIVE_CALL_DURING_PAYMENT")
 
         if signals.remote_access_indicator is True:
-            transaction_risk = max(transaction_risk, self.policy.remote_access_risk)
+            device_session_risk = max(
+                device_session_risk, self.policy.remote_access_risk
+            )
             reasons.append("REMOTE_ACCESS_INDICATOR")
 
-        if (
+        behavioral_anomaly = (
             signals.behavioral_anomaly_score is not None
             and signals.behavioral_anomaly_score
             >= self.policy.behavioral_anomaly_threshold
-        ):
-            transaction_risk = max(
-                transaction_risk, self.policy.behavioral_anomaly_risk
+        )
+        if behavioral_anomaly:
+            device_session_risk = max(
+                device_session_risk, self.policy.behavioral_anomaly_risk
             )
             reasons.append("BEHAVIORAL_BIOMETRIC_ANOMALY")
 
-        if (
-            high_hesitation
-            and signals.active_call_indicator is True
-            and signals.behavioral_anomaly_score is not None
-            and signals.behavioral_anomaly_score
-            >= self.policy.behavioral_anomaly_threshold
+        coaching_indicators = sum(
+            (
+                high_hesitation,
+                signals.active_call_indicator is True,
+                signals.remote_access_indicator is True,
+                behavioral_anomaly,
+            )
+        )
+        if coaching_indicators >= self.policy.coached_payment_min_signals and (
+            not self.policy.coached_payment_requires_active_call
+            or signals.active_call_indicator is True
         ):
-            transaction_risk = max(
-                transaction_risk, self.policy.coached_payment_combination_risk
+            device_session_risk = max(
+                device_session_risk, self.policy.coached_payment_combination_risk
             )
             reasons.append("POSSIBLE_LIVE_COACHING_PATTERN")
 
@@ -88,7 +102,9 @@ class BehavioralSessionDetector:
         ]
 
         return BehavioralSessionAssessment(
-            intelligence=IntelligenceSnapshot(transaction_risk=transaction_risk),
+            intelligence=IntelligenceSnapshot(
+                device_session_risk=device_session_risk
+            ),
             reason_codes=reasons or ["NO_BEHAVIORAL_SESSION_SIGNAL"],
             signal_policy_version=self.policy.policy_version,
             evidence=evidence,
