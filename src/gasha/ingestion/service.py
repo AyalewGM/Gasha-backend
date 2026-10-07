@@ -160,6 +160,11 @@ class IngestionService:
                     envelope=existing.envelope,
                     original_accepted_at=existing.accepted_at,
                 )
+            if self._metrics is not None:
+                self._metrics.increment(
+                    "gasha_events_conflicting_duplicates",
+                    labels={"tenant_id": envelope.tenant_id},
+                )
             return self._dead_letter(
                 RejectionRecord(
                     reason=RejectionReason.DUPLICATE_CONFLICT,
