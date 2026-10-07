@@ -43,6 +43,7 @@ class IncrementalDetectionReason(StrEnum):
         "device_session_incremental_detection"
     )
     NETWORK_INCREMENTAL_DETECTION = "network_incremental_detection"
+    JOURNEY_INCREMENTAL_DETECTION = "journey_incremental_detection"
 
 
 _FAMILY_INCREMENTAL_REASON = {

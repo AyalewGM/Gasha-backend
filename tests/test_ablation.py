@@ -87,10 +87,10 @@ def test_default_plan_is_bounded_single_family_plus_strategic_pairs() -> None:
 
     assert names[0] == "full"
     singles = [c for c in plan if len(c.removed_families) == 1]
-    assert len(singles) == 7
+    assert len(singles) == 8
     combos = [c for c in plan if len(c.removed_families) > 1]
     assert len(combos) == 3
-    assert len(plan) == 11
+    assert len(plan) == 12
 
 
 def test_ablation_measures_incremental_recall_contribution() -> None:

@@ -30,6 +30,7 @@ class DecisionService:
             "beneficiary": intelligence.beneficiary_risk,
             "relationship": intelligence.relationship_risk,
             "network": intelligence.network_risk,
+            "journey": intelligence.journey_risk,
         }
         score = max(components.values())
         component_reasons = [
