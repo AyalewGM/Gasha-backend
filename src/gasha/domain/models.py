@@ -26,6 +26,14 @@ class DecisionAction(StrEnum):
     REVIEW = "review"
     HOLD = "hold"
     BLOCK = "block"
+    NO_ACTION_SHADOW = "no_action_shadow"
+
+
+class OperatingMode(StrEnum):
+    """How a decided evaluation is exposed to the bank-facing channel."""
+
+    ENFORCING = "enforcing"
+    SHADOW = "shadow"
 
 
 class CanonicalTransaction(BaseModel):
