@@ -71,6 +71,65 @@ def test_shared_device_and_fraud_neighbor_raise_network_risk() -> None:
     assert "INTERNAL_GRAPH_CONFIRMED_FRAUD_NEIGHBOR" in assessment.reason_codes
 
 
+def test_repeat_victims_and_shared_senders_raise_graph_risk() -> None:
+    assessment = InternalGraphDetector(
+        InternalGraphPolicy(policy_version="graph-policy-4")
+    ).assess(
+        InternalGraphSignals(
+            repeat_senders_to_beneficiary_30d=3,
+            linked_beneficiaries_via_shared_senders_30d=2,
+            provenance=provenance(),
+        )
+    )
+
+    assert assessment.intelligence.beneficiary_risk == 0.84
+    assert assessment.intelligence.network_risk == 0.85
+    assert "INTERNAL_GRAPH_REPEAT_VICTIM_SENDERS" in assessment.reason_codes
+    assert "INTERNAL_GRAPH_SHARED_SENDER_CLUSTER" in assessment.reason_codes
+
+
+def test_fan_in_with_repeat_victims_identifies_possible_mule_cluster() -> None:
+    assessment = InternalGraphDetector(
+        InternalGraphPolicy(policy_version="graph-policy-5")
+    ).assess(
+        InternalGraphSignals(
+            unique_senders_to_beneficiary_1h=8,
+            repeat_senders_to_beneficiary_30d=4,
+            provenance=provenance(),
+        )
+    )
+
+    assert assessment.intelligence.beneficiary_risk == 0.96
+    assert "INTERNAL_GRAPH_BENEFICIARY_FAN_IN" in assessment.reason_codes
+    assert "INTERNAL_GRAPH_REPEAT_VICTIM_SENDERS" in assessment.reason_codes
+    assert "INTERNAL_GRAPH_POSSIBLE_MULE_CLUSTER" in assessment.reason_codes
+
+
+def test_repeat_victim_threshold_is_tenant_configurable() -> None:
+    observed = InternalGraphSignals(
+        repeat_senders_to_beneficiary_30d=3,
+        provenance=provenance(),
+    )
+
+    sensitive = InternalGraphDetector(
+        InternalGraphPolicy(
+            policy_version="tenant-a-graph-5",
+            repeat_senders_threshold=2,
+        )
+    ).assess(observed)
+    tolerant = InternalGraphDetector(
+        InternalGraphPolicy(
+            policy_version="tenant-b-graph-6",
+            repeat_senders_threshold=5,
+        )
+    ).assess(observed)
+
+    assert "INTERNAL_GRAPH_REPEAT_VICTIM_SENDERS" in sensitive.reason_codes
+    assert sensitive.intelligence.beneficiary_risk == 0.84
+    assert "INTERNAL_GRAPH_REPEAT_VICTIM_SENDERS" not in tolerant.reason_codes
+    assert tolerant.intelligence.beneficiary_risk == 0.0
+
+
 def test_tenant_policy_changes_fan_in_threshold_without_bank_logic() -> None:
     observed = InternalGraphSignals(
         unique_senders_to_beneficiary_1h=6,
