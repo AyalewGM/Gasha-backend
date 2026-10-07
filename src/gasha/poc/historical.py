@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from math import ceil, floor
 from statistics import fmean
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -17,7 +19,7 @@ from gasha.domain.models import (
     FraudDecision,
     IntelligenceSnapshot,
 )
-from gasha.poc.outcomes import IncumbentControlOutcome
+from gasha.poc.outcomes import IncumbentControlOutcome, OutcomeRecord
 
 ALERT_ACTIONS = frozenset(
     {
@@ -45,6 +47,8 @@ class HistoricalTransactionEvent(BaseModel):
     ``transaction.occurred_at`` is the preserved historical event time and
     ``intelligence`` carries the point-in-time features assembled upstream by
     the same intelligence layer that feeds the production decision path.
+    ``received_at`` optionally records when the event reached Gasha so latency
+    measurement can separate queue delay from evaluation time.
     """
 
     transaction: CanonicalTransaction
@@ -53,6 +57,7 @@ class HistoricalTransactionEvent(BaseModel):
     signal_policy_versions: tuple[str, ...] = ()
     label: ConfirmedOutcomeLabel | None = None
     incumbent_outcome: IncumbentControlOutcome | None = None
+    received_at: datetime | None = None
 
 
 class ReplayClassification(StrEnum):
@@ -76,6 +81,10 @@ class ReplayedEventResult:
     classification: ReplayClassification
     decision_latency: timedelta
     detection_lead_time: timedelta | None
+    evaluation_started_at: datetime | None = None
+    evaluation_ended_at: datetime | None = None
+    processing_latency: timedelta | None = None
+    reconciled_outcome: OutcomeRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +100,11 @@ class HistoricalReplayMetrics:
     mean_decision_latency_seconds: float | None
     max_decision_latency_seconds: float | None
     mean_detection_lead_time_seconds: float | None
+    mean_processing_latency_ms: float | None = None
+    median_processing_latency_ms: float | None = None
+    p95_processing_latency_ms: float | None = None
+    p99_processing_latency_ms: float | None = None
+    max_processing_latency_ms: float | None = None
 
     @property
     def recall(self) -> float:
@@ -117,11 +131,14 @@ class HistoricalReplayMetrics:
 class HistoricalReplayReport:
     results: tuple[ReplayedEventResult, ...]
     metrics: HistoricalReplayMetrics
+    unmatched_outcomes: tuple[OutcomeRecord, ...] = ()
 
 
 def replay_historical(
     events: Sequence[HistoricalTransactionEvent],
     policies: Mapping[str, DecisionPolicy],
+    *,
+    clock: Callable[[], datetime] | None = None,
 ) -> HistoricalReplayReport:
     """Replays historical events through the production decision path.
 
@@ -133,6 +150,7 @@ def replay_historical(
 
     services: dict[str, DecisionService] = {}
     results: list[ReplayedEventResult] = []
+    now = clock or (lambda: datetime.now(UTC))
 
     for event in sorted(events, key=lambda item: item.transaction.occurred_at):
         tenant_id = event.transaction.tenant_id
@@ -145,12 +163,21 @@ def replay_historical(
         if service is None:
             service = services[tenant_id] = DecisionService(policy)
 
+        evaluation_started_at = now()
         decision = service.decide(
             event.transaction,
             event.intelligence,
             event.evidence_reason_codes,
         )
-        results.append(_result(event, decision))
+        evaluation_ended_at = now()
+        results.append(
+            _result(
+                event,
+                decision,
+                evaluation_started_at=evaluation_started_at,
+                evaluation_ended_at=evaluation_ended_at,
+            )
+        )
 
     return HistoricalReplayReport(
         results=tuple(results),
@@ -188,34 +215,124 @@ def pseudonymize_transaction(
     return transaction.model_copy(update=updates)
 
 
+def _classify(alerted: bool, is_fraud: bool | None) -> ReplayClassification:
+    if is_fraud is None:
+        return ReplayClassification.UNLABELED
+    if alerted and is_fraud:
+        return ReplayClassification.TRUE_POSITIVE
+    if alerted:
+        return ReplayClassification.FALSE_POSITIVE
+    if is_fraud:
+        return ReplayClassification.FALSE_NEGATIVE
+    return ReplayClassification.TRUE_NEGATIVE
+
+
 def _result(
-    event: HistoricalTransactionEvent, decision: FraudDecision
+    event: HistoricalTransactionEvent,
+    decision: FraudDecision,
+    *,
+    evaluation_started_at: datetime | None = None,
+    evaluation_ended_at: datetime | None = None,
 ) -> ReplayedEventResult:
     alerted = decision.action in _ALERT_ACTIONS
     label = event.label
-
-    if label is None:
-        classification = ReplayClassification.UNLABELED
-    elif alerted and label.is_fraud:
-        classification = ReplayClassification.TRUE_POSITIVE
-    elif alerted:
-        classification = ReplayClassification.FALSE_POSITIVE
-    elif label.is_fraud:
-        classification = ReplayClassification.FALSE_NEGATIVE
-    else:
-        classification = ReplayClassification.TRUE_NEGATIVE
+    is_fraud = label.is_fraud if label is not None else None
 
     lead_time = None
     if alerted and label is not None and label.is_fraud and label.confirmed_at:
         lead_time = label.confirmed_at - decision.decided_at
 
+    received_at = event.received_at or event.transaction.occurred_at
+    processing_latency = None
+    if evaluation_started_at is not None and evaluation_ended_at is not None:
+        processing_latency = evaluation_ended_at - evaluation_started_at
+
     return ReplayedEventResult(
         event=event,
         decision=decision,
-        classification=classification,
-        decision_latency=decision.decided_at - event.transaction.occurred_at,
+        classification=_classify(alerted, is_fraud),
+        decision_latency=decision.decided_at - received_at,
         detection_lead_time=lead_time,
+        evaluation_started_at=evaluation_started_at,
+        evaluation_ended_at=evaluation_ended_at,
+        processing_latency=processing_latency,
     )
+
+
+def reconcile_outcomes(
+    report: HistoricalReplayReport, outcomes: Sequence[OutcomeRecord]
+) -> HistoricalReplayReport:
+    """Attaches post-decision outcome records to replayed results.
+
+    Outcomes arrive after the original decision (T0 decision, T1 outcome) and
+    never mutate it. Matching is keyed strictly by ``(tenant_id, event_id)`` so
+    an outcome from one tenant can never attach to another tenant's decision.
+    Unmatched outcomes are surfaced on the report for auditability.
+    """
+
+    by_key: dict[tuple[str, UUID], OutcomeRecord] = {}
+    for outcome in outcomes:
+        key = (outcome.tenant_id, outcome.event_id)
+        existing = by_key.get(key)
+        if existing is None or (
+            outcome.confirmed_at is not None
+            and (
+                existing.confirmed_at is None
+                or outcome.confirmed_at > existing.confirmed_at
+            )
+        ):
+            by_key[key] = outcome
+
+    matched: set[tuple[str, UUID]] = set()
+    reconciled: list[ReplayedEventResult] = []
+    for result in report.results:
+        key = (result.decision.tenant_id, result.decision.event_id)
+        matched_outcome = by_key.get(key)
+        if matched_outcome is None:
+            reconciled.append(result)
+            continue
+        matched.add(key)
+        alerted = result.decision.action in _ALERT_ACTIONS
+        lead_time = result.detection_lead_time
+        if (
+            alerted
+            and matched_outcome.is_fraud
+            and matched_outcome.confirmed_at is not None
+        ):
+            lead_time = (
+                matched_outcome.confirmed_at - result.decision.decided_at
+            )
+        reconciled.append(
+            replace(
+                result,
+                classification=_classify(alerted, matched_outcome.is_fraud),
+                detection_lead_time=lead_time,
+                reconciled_outcome=matched_outcome,
+            )
+        )
+
+    unmatched = tuple(
+        outcome
+        for key, outcome in by_key.items()
+        if key not in matched
+    )
+    return HistoricalReplayReport(
+        results=tuple(reconciled),
+        metrics=_metrics(reconciled),
+        unmatched_outcomes=unmatched,
+    )
+
+
+def _percentile(values: Sequence[float], percentile: float) -> float:
+    """Linear-interpolated percentile over a non-empty sequence."""
+
+    ordered = sorted(values)
+    rank = (len(ordered) - 1) * percentile
+    lower = floor(rank)
+    upper = ceil(rank)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (rank - lower)
 
 
 def _metrics(results: list[ReplayedEventResult]) -> HistoricalReplayMetrics:
@@ -225,6 +342,7 @@ def _metrics(results: list[ReplayedEventResult]) -> HistoricalReplayMetrics:
     explained = 0
     latencies: list[float] = []
     lead_times: list[float] = []
+    processing_latencies: list[float] = []
     for item in results:
         counts[item.classification] += 1
         if (
@@ -236,6 +354,10 @@ def _metrics(results: list[ReplayedEventResult]) -> HistoricalReplayMetrics:
         latencies.append(item.decision_latency.total_seconds())
         if item.detection_lead_time is not None:
             lead_times.append(item.detection_lead_time.total_seconds())
+        if item.processing_latency is not None:
+            processing_latencies.append(
+                item.processing_latency.total_seconds() * 1000.0
+            )
 
     return HistoricalReplayMetrics(
         cases=len(results),
@@ -252,4 +374,25 @@ def _metrics(results: list[ReplayedEventResult]) -> HistoricalReplayMetrics:
         mean_decision_latency_seconds=fmean(latencies) if latencies else None,
         max_decision_latency_seconds=max(latencies) if latencies else None,
         mean_detection_lead_time_seconds=fmean(lead_times) if lead_times else None,
+        mean_processing_latency_ms=(
+            fmean(processing_latencies) if processing_latencies else None
+        ),
+        median_processing_latency_ms=(
+            _percentile(processing_latencies, 0.50)
+            if processing_latencies
+            else None
+        ),
+        p95_processing_latency_ms=(
+            _percentile(processing_latencies, 0.95)
+            if processing_latencies
+            else None
+        ),
+        p99_processing_latency_ms=(
+            _percentile(processing_latencies, 0.99)
+            if processing_latencies
+            else None
+        ),
+        max_processing_latency_ms=(
+            max(processing_latencies) if processing_latencies else None
+        ),
     )
