@@ -17,6 +17,7 @@ from gasha.domain.models import (
     FraudDecision,
     IntelligenceSnapshot,
 )
+from gasha.poc.outcomes import IncumbentControlOutcome
 
 _ALERT_ACTIONS = frozenset(
     {
@@ -49,6 +50,7 @@ class HistoricalTransactionEvent(BaseModel):
     evidence_reason_codes: tuple[str, ...] = ()
     signal_policy_versions: tuple[str, ...] = ()
     label: ConfirmedOutcomeLabel | None = None
+    incumbent_outcome: IncumbentControlOutcome | None = None
 
 
 class ReplayClassification(StrEnum):
