@@ -18,7 +18,7 @@ from gasha.domain.models import (
     IntelligenceSnapshot,
 )
 
-_ALERT_ACTIONS = frozenset(
+ALERT_ACTIONS = frozenset(
     {
         DecisionAction.CHALLENGE,
         DecisionAction.REVIEW,
@@ -26,6 +26,8 @@ _ALERT_ACTIONS = frozenset(
         DecisionAction.BLOCK,
     }
 )
+
+_ALERT_ACTIONS = ALERT_ACTIONS
 
 
 class ConfirmedOutcomeLabel(BaseModel):
