@@ -23,6 +23,7 @@ class RejectionReason(StrEnum):
     DUPLICATE_CONFLICT = "duplicate_conflict"
     ADAPTER_FAILURE = "adapter_failure"
     NORMALIZATION_FAILURE = "normalization_failure"
+    EVALUATION_FAILURE = "evaluation_failure"
 
 
 def payload_fingerprint(payload: Mapping[str, Any]) -> str:
