@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Self
 from uuid import uuid4
 
+from gasha.decision.postgres_audit import PostgresDecisionAuditRepository
 from gasha.domain.models import DecisionAction, DecisionPolicy, OperatingMode
 from gasha.ingestion.contracts import FraudEventEnvelope, InboundBankEvent
 from gasha.ingestion.postgres_store import (
@@ -19,6 +20,7 @@ from gasha.ingestion.transport import EventBatch
 from gasha.ingestion.worker import IngestionWorker
 from gasha.orchestration import ShadowOrchestrator
 from gasha.postgres_evaluations import (
+    PostgresEvaluationPersistence,
     PostgresShadowEvaluationRepository,
 )
 
@@ -39,12 +41,32 @@ class FakeCursor:
 
     def execute(self, query: str, params: tuple[object, ...]) -> None:
         normalized = " ".join(query.split())
+        prefix = self.connection.fail_on_insert_prefix
+        if prefix is not None and normalized.startswith(prefix):
+            raise RuntimeError(f"injected failure on {prefix}")
+        if normalized.startswith("INSERT INTO fraud_decision_audit"):
+            self.connection.staged_audit.setdefault(
+                (str(params[0]), str(params[1])),
+                {
+                    "decision_json": params[2],
+                    "signal_policy_versions_json": params[3],
+                    "evidence_json": params[4],
+                },
+            )
+            return
         if normalized.startswith("INSERT INTO shadow_evaluations"):
             tenant_id, event_id, record_json, persisted_at = params
-            self.connection.rows.setdefault(
+            self.connection.staged_rows.setdefault(
                 (str(tenant_id), str(event_id)),
                 {"record_json": record_json, "persisted_at": persisted_at},
             )
+            return
+        if normalized.startswith(
+            "SELECT decision_json, signal_policy_versions_json, "
+            "evidence_json FROM fraud_decision_audit WHERE"
+        ):
+            key = (str(params[0]), str(params[1]))
+            self.row = self.connection.audit_rows.get(key)
             return
         if normalized.startswith(
             "SELECT record_json FROM shadow_evaluations WHERE"
@@ -54,9 +76,9 @@ class FakeCursor:
             return
         if normalized.startswith("INSERT INTO pending_evaluations"):
             tenant_id, event_id = params[0], params[1]
-            self.connection.pending_rows.setdefault(
+            self.connection.staged_pending.setdefault(
                 (str(tenant_id), str(event_id)),
-                {"record_json": params[2]},
+                {"op": "insert", "row": {"record_json": params[2]}},
             )
             return
         if normalized.startswith(
@@ -80,11 +102,14 @@ class FakeCursor:
             return
         if normalized.startswith("UPDATE pending_evaluations"):
             key = (str(params[4]), str(params[5]))
-            self.connection.pending_rows[key] = {"record_json": params[0]}
+            self.connection.staged_pending[key] = {
+                "op": "update",
+                "row": {"record_json": params[0]},
+            }
             return
         if normalized.startswith("DELETE FROM pending_evaluations"):
             key = (str(params[0]), str(params[1]))
-            self.connection.pending_rows.pop(key, None)
+            self.connection.staged_pending[key] = {"op": "delete"}
             return
         raise AssertionError(f"unexpected query: {normalized}")
 
@@ -102,16 +127,46 @@ class FakeCursor:
 
 
 class FakeConnection:
+    """Transactional fake: execute() stages writes; commit() merges them
+    atomically; rollback() discards them — like a real Postgres tx."""
+
     def __init__(self) -> None:
         self.rows: dict[tuple[str, str], dict[str, object]] = {}
         self.pending_rows: dict[tuple[str, str], dict[str, object]] = {}
+        self.audit_rows: dict[tuple[str, str], dict[str, object]] = {}
+        self.staged_rows: dict[tuple[str, str], dict[str, object]] = {}
+        self.staged_pending: dict[tuple[str, str], dict[str, object]] = {}
+        self.staged_audit: dict[tuple[str, str], dict[str, object]] = {}
         self.commits = 0
+        self.rollbacks = 0
+        self.fail_on_insert_prefix: str | None = None
 
     def cursor(self) -> FakeCursor:
         return FakeCursor(self)
 
     def commit(self) -> None:
+        # INSERT ... ON CONFLICT DO NOTHING keeps the first row.
+        for key, value in self.staged_rows.items():
+            self.rows.setdefault(key, value)
+        for key, value in self.staged_audit.items():
+            self.audit_rows.setdefault(key, value)
+        for key, value in self.staged_pending.items():
+            if value["op"] == "delete":
+                self.pending_rows.pop(key, None)
+            elif value["op"] == "insert":
+                self.pending_rows.setdefault(key, value["row"])
+            else:
+                self.pending_rows[key] = value["row"]
+        self.staged_rows.clear()
+        self.staged_pending.clear()
+        self.staged_audit.clear()
         self.commits += 1
+
+    def rollback(self) -> None:
+        self.staged_rows.clear()
+        self.staged_pending.clear()
+        self.staged_audit.clear()
+        self.rollbacks += 1
 
 
 def envelope(tenant_id: str = "tenant-a") -> FraudEventEnvelope:
@@ -229,7 +284,7 @@ class TestWorkerRestartDurability:
         orchestrator1 = ShadowOrchestrator({"tenant-a": POLICY}, evaluations=repo)
         calls = {"n": 0}
 
-        def flaky(envelope_arg: FraudEventEnvelope) -> object:
+        def flaky(envelope_arg: FraudEventEnvelope, policy: DecisionPolicy | None = None) -> object:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("worker died mid-evaluation")
@@ -353,7 +408,7 @@ class TestPostgresPendingEvaluationStore:
             {"tenant-a": POLICY}, evaluations=repo
         )
 
-        def flaky(envelope_arg: FraudEventEnvelope) -> object:
+        def flaky(envelope_arg: FraudEventEnvelope, policy: DecisionPolicy | None = None) -> object:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("decision store down")
@@ -396,3 +451,125 @@ class TestPostgresPendingEvaluationStore:
         # Reconcile again: nothing left, still exactly one row.
         worker2.run_once(max_events=1)
         assert len(connection.rows) == 1
+
+
+class TestAtomicEvaluationConsistency:
+    """Audit-save + eval-save land in one transaction; retries re-decide
+    under the pinned attempt-1 policy, so the durable audit and the
+    durable evaluation always refer to the same immutable decision."""
+
+    POLICY_V1 = POLICY
+    POLICY_V2 = DecisionPolicy(
+        configuration_version="tenant-config-2",
+        policy_version="policy-2",
+        rule_version="rules-2",
+    )
+
+    def test_mid_save_failure_then_policy_change_retries_consistently(
+        self,
+    ) -> None:
+        connection = FakeConnection()
+        pending = PostgresPendingEvaluationStore(connection)
+        persistence = PostgresEvaluationPersistence(connection)
+        evals = PostgresShadowEvaluationRepository(connection)
+        audit = PostgresDecisionAuditRepository(connection)
+        ingestion = IngestionService(
+            {"synthetic-core-banking": ReferenceJsonAdapter()}
+        )
+        policies = {"tenant-a": self.POLICY_V1}
+        env = envelope()
+        event = inbound_for(env)
+        dead_letters = InMemoryDeadLetterSink()
+
+        orchestrator = ShadowOrchestrator(
+            policies, evaluations=evals, audit=audit, persistence=persistence
+        )
+
+        # Attempt 1: audit insert succeeds inside the tx but the
+        # shadow_evaluations insert fails -> whole tx rolls back.
+        connection.fail_on_insert_prefix = "INSERT INTO shadow_evaluations"
+        worker1 = IngestionWorker(
+            _StubConsumer([[event]]),
+            ingestion,
+            evaluate=orchestrator.evaluate,
+            evaluation_complete=lambda t, e: evals.get(t, e) is not None,
+            policy_for=lambda t: policies.get(t),
+            pending=pending,
+            retry_backoff=timedelta(seconds=0),
+            dead_letters=dead_letters,
+        )
+        worker1.run_once(max_events=1)
+        assert connection.rollbacks == 1
+        # Nothing half-persisted: no audit, no evaluation.
+        assert connection.audit_rows == {}
+        assert connection.rows == {}
+
+        # Tenant policy changes while the event sits pending.
+        policies["tenant-a"] = self.POLICY_V2
+        connection.fail_on_insert_prefix = None
+
+        # Restart, empty consumer: reconcile re-decides under the
+        # pinned V1 policy and persists both artifacts atomically.
+        worker2 = IngestionWorker(
+            _StubConsumer([]),
+            ingestion,
+            evaluate=orchestrator.evaluate,
+            evaluation_complete=lambda t, e: evals.get(t, e) is not None,
+            policy_for=lambda t: policies.get(t),
+            pending=pending,
+            retry_backoff=timedelta(seconds=0),
+            dead_letters=dead_letters,
+        )
+        worker2.run_once(max_events=1)
+
+        persisted_eval = evals.get(env.tenant_id, env.event_id)
+        persisted_audit = audit.get(env.tenant_id, env.event_id)
+        assert persisted_eval is not None
+        assert persisted_audit is not None
+        # Same immutable decision on both sides: identical FraudDecision
+        # (including decided_at) and the attempt-1 version triple — not
+        # the currently loaded V2.
+        assert (
+            persisted_audit.decision
+            == persisted_eval.evaluation.decision
+        )
+        assert persisted_audit.decision.policy_version == "policy-1"
+        assert persisted_audit.decision.rule_version == "rules-1"
+        assert persisted_audit.decision.configuration_version == (
+            "tenant-config-1"
+        )
+        assert persisted_eval.evaluation.decision.policy_version == (
+            "policy-1"
+        )
+        assert len(connection.audit_rows) == 1
+        assert len(connection.rows) == 1
+
+        # Reconcile again — still exactly one consistent pair.
+        worker2.run_once(max_events=1)
+        assert len(connection.audit_rows) == 1
+        assert len(connection.rows) == 1
+
+    def test_postgres_persistence_is_atomic_on_conflict(self) -> None:
+        # First-write-wins across the pair: a re-save keeps the original
+        # decision and evaluation rather than mixing versions.
+        connection = FakeConnection()
+        persistence = PostgresEvaluationPersistence(connection)
+        env = envelope()
+        orchestrator = ShadowOrchestrator(
+            {"tenant-a": self.POLICY_V1},
+            evaluations=PostgresShadowEvaluationRepository(connection),
+            audit=PostgresDecisionAuditRepository(connection),
+            persistence=persistence,
+        )
+        first = orchestrator.evaluate(env)
+        orchestrator.evaluate(env, self.POLICY_V2)
+        audit = PostgresDecisionAuditRepository(connection).get(
+            env.tenant_id, env.event_id
+        )
+        evals = PostgresShadowEvaluationRepository(connection).get(
+            env.tenant_id, env.event_id
+        )
+        assert audit is not None and evals is not None
+        assert audit.decision == first.decision
+        assert evals.evaluation.decision == first.decision
+        assert audit.decision.policy_version == "policy-1"

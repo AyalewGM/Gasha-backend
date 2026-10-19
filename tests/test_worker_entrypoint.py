@@ -105,9 +105,10 @@ class TestBuildAdapters:
 
 class TestBuildStores:
     def test_in_memory_when_no_dsn(self) -> None:
-        ingestion, dead_letters, _, _, pending = build_stores(
+        ingestion, dead_letters, _, _, pending, persistence = build_stores(
             WorkerSettings()
         )
+        assert persistence is None
         assert isinstance(ingestion, InMemoryIngestionStore)
         assert isinstance(dead_letters, InMemoryDeadLetterSink)
         assert isinstance(pending, InMemoryPendingEvaluationStore)

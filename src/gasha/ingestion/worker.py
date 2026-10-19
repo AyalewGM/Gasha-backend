@@ -5,9 +5,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import UUID
 
+from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.contracts import FraudEventEnvelope, InboundBankEvent
 from gasha.ingestion.errors import RejectionReason, RejectionRecord
-from gasha.ingestion.pending import PendingEvaluationStore
+from gasha.ingestion.pending import (
+    PendingEvaluationRecord,
+    PendingEvaluationStore,
+)
 from gasha.ingestion.service import (
     DeadLetterSink,
     IngestionOutcome,
@@ -60,8 +64,12 @@ class IngestionWorker:
         consumer: CommittableEventConsumer,
         ingestion: IngestionService,
         *,
-        evaluate: Callable[[FraudEventEnvelope], object] | None = None,
+        evaluate: (
+            Callable[[FraudEventEnvelope, DecisionPolicy | None], object]
+            | None
+        ) = None,
         evaluation_complete: Callable[[str, UUID], bool] | None = None,
+        policy_for: Callable[[str], DecisionPolicy | None] | None = None,
         pending: PendingEvaluationStore | None = None,
         max_evaluation_attempts: int = 3,
         retry_backoff: timedelta = timedelta(seconds=30),
@@ -73,6 +81,7 @@ class IngestionWorker:
         self._ingestion = ingestion
         self._evaluate = evaluate
         self._evaluation_complete = evaluation_complete
+        self._policy_for = policy_for
         self._pending = pending
         self._max_evaluation_attempts = max_evaluation_attempts
         self._retry_backoff = retry_backoff
@@ -105,7 +114,7 @@ class IngestionWorker:
                     envelope.tenant_id, envelope.event_id
                 )
                 continue
-            self._evaluate_pending(envelope)
+            self._evaluate_pending(envelope, record)
 
     def _process(self, event: InboundBankEvent) -> None:
         result = self._ingestion.ingest(event)
@@ -119,15 +128,30 @@ class IngestionWorker:
         ):
             return
         if self._pending is not None:
-            self._pending.enqueue(envelope, enqueued_at=self._clock())
-            self._evaluate_pending(envelope)
+            record = self._pending.enqueue(
+                envelope,
+                enqueued_at=self._clock(),
+                policy=self._pinned_policy(envelope),
+            )
+            self._evaluate_pending(envelope, record)
             return
         self._evaluate_event(self._evaluate, envelope, event)
 
-    def _evaluate_pending(self, envelope: FraudEventEnvelope) -> None:
+    def _pinned_policy(
+        self, envelope: FraudEventEnvelope
+    ) -> DecisionPolicy | None:
+        if self._policy_for is None:
+            return None
+        return self._policy_for(envelope.tenant_id)
+
+    def _evaluate_pending(
+        self,
+        envelope: FraudEventEnvelope,
+        record: PendingEvaluationRecord,
+    ) -> None:
         assert self._evaluate is not None
         try:
-            self._evaluate(envelope)
+            self._evaluate(envelope, record.policy)
         except MissingTenantPolicyError:
             self._dead_letter(
                 envelope,
@@ -183,12 +207,14 @@ class IngestionWorker:
 
     def _evaluate_event(
         self,
-        evaluate: Callable[[FraudEventEnvelope], object],
+        evaluate: Callable[
+            [FraudEventEnvelope, DecisionPolicy | None], object
+        ],
         envelope: FraudEventEnvelope,
         event: InboundBankEvent,
     ) -> None:
         try:
-            evaluate(envelope)
+            evaluate(envelope, None)
         except MissingTenantPolicyError:
             self._dead_letter(
                 envelope,

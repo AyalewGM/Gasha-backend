@@ -37,12 +37,14 @@ from gasha.ingestion.service import (
 from gasha.ingestion.worker import IngestionWorker
 from gasha.observability.metrics import InMemoryMetricsRegistry
 from gasha.orchestration import (
+    EvaluationPersistence,
     InMemoryShadowEvaluationRepository,
     ShadowEvaluationRepository,
     ShadowOrchestrator,
 )
 from gasha.postgres import Connection
 from gasha.postgres_evaluations import (
+    PostgresEvaluationPersistence,
     PostgresShadowEvaluationRepository,
 )
 
@@ -103,6 +105,7 @@ def build_stores(
     DecisionAuditRepository,
     ShadowEvaluationRepository,
     PendingEvaluationStore,
+    EvaluationPersistence | None,
 ]:
     """Durable stores when a DSN is configured, in-memory otherwise."""
     if settings.postgres_dsn is None:
@@ -116,6 +119,7 @@ def build_stores(
             InMemoryDecisionAuditRepository(),
             InMemoryShadowEvaluationRepository(),
             InMemoryPendingEvaluationStore(),
+            None,  # in-memory dev mode keeps the sequential save path
         )
 
     connection = _postgres_connection(settings.postgres_dsn)
@@ -125,6 +129,7 @@ def build_stores(
         PostgresDecisionAuditRepository(connection),
         PostgresShadowEvaluationRepository(connection),
         PostgresPendingEvaluationStore(connection),
+        PostgresEvaluationPersistence(connection),
     )
 
 
@@ -153,6 +158,7 @@ def build_worker(
         audit,
         evaluations,
         pending,
+        persistence,
     ) = build_stores(settings)
     ingestion = IngestionService(
         build_adapters(settings),
@@ -160,11 +166,13 @@ def build_worker(
         dead_letters=dead_letters,
         metrics=metrics,
     )
+    policies = load_policies(settings.policies_path)
     orchestrator = ShadowOrchestrator(
-        load_policies(settings.policies_path),
+        policies,
         evaluations=evaluations,
         audit=audit,
         metrics=metrics,
+        persistence=persistence,
     )
     consumer = ConfluentKafkaConsumer.build(
         bootstrap_servers=settings.kafka_bootstrap_servers,
@@ -180,6 +188,7 @@ def build_worker(
             evaluations.get(tenant_id, event_id) is not None
         ),
         pending=pending,
+        policy_for=lambda tenant_id: policies.get(tenant_id),
         dead_letters=dead_letters,
         metrics=metrics,
     )

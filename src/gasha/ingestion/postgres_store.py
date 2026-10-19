@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from uuid import UUID
 
+from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.contracts import FraudEventEnvelope
 from gasha.ingestion.errors import RejectionRecord
 from gasha.ingestion.outcome_ingestion import IncumbentOutcomeRecord
@@ -209,11 +210,16 @@ class PostgresPendingEvaluationStore:
         self._connection = connection
 
     def enqueue(
-        self, event: FraudEventEnvelope, *, enqueued_at: datetime
+        self,
+        event: FraudEventEnvelope,
+        *,
+        enqueued_at: datetime,
+        policy: DecisionPolicy | None = None,
     ) -> PendingEvaluationRecord:
         key = (event.tenant_id, event.event_id)
         record = PendingEvaluationRecord(
             event=event,
+            policy=policy,
             enqueued_at=enqueued_at,
             next_attempt_at=enqueued_at,
         )

@@ -6,6 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.contracts import FraudEventEnvelope
 
 
@@ -18,12 +19,18 @@ class PendingEvaluationRecord(BaseModel):
     preserves the original canonical transaction plus adapter/schema and
     policy version provenance; retries evaluate exactly this envelope.
 
+    ``policy`` pins the tenant's ``DecisionPolicy`` snapshot taken at
+    enqueue time: every retry re-decides under the same immutable
+    policy/config/rule versions, so a tenant policy change mid-retry can
+    never produce audit and evaluation records that disagree.
+
     ``attempts``/``next_attempt_at`` implement bounded retries: each
     failure reschedules the record, and the worker dead-letters it once
     ``attempts`` reaches the configured maximum.
     """
 
     event: FraudEventEnvelope
+    policy: DecisionPolicy | None = None
     attempts: int = 0
     enqueued_at: datetime
     next_attempt_at: datetime
@@ -39,7 +46,11 @@ class PendingEvaluationStore(Protocol):
     """
 
     def enqueue(
-        self, event: FraudEventEnvelope, *, enqueued_at: datetime
+        self,
+        event: FraudEventEnvelope,
+        *,
+        enqueued_at: datetime,
+        policy: DecisionPolicy | None = None,
     ) -> PendingEvaluationRecord: ...
 
     def due(
@@ -66,7 +77,11 @@ class InMemoryPendingEvaluationStore:
         self._records: dict[tuple[str, UUID], PendingEvaluationRecord] = {}
 
     def enqueue(
-        self, event: FraudEventEnvelope, *, enqueued_at: datetime
+        self,
+        event: FraudEventEnvelope,
+        *,
+        enqueued_at: datetime,
+        policy: DecisionPolicy | None = None,
     ) -> PendingEvaluationRecord:
         key = (event.tenant_id, event.event_id)
         existing = self._records.get(key)
@@ -74,6 +89,7 @@ class InMemoryPendingEvaluationStore:
             return existing
         record = PendingEvaluationRecord(
             event=event,
+            policy=policy,
             enqueued_at=enqueued_at,
             next_attempt_at=enqueued_at,
         )
