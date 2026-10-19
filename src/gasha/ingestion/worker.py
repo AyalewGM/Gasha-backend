@@ -124,6 +124,7 @@ class IngestionWorker:
                     envelope.tenant_id,
                     envelope.event_id,
                     owner=self._worker_id,
+                    claim_token=record.claim_token,
                 )
                 continue
             self._evaluate_pending(envelope, record)
@@ -183,24 +184,31 @@ class IngestionWorker:
                 f"no decision policy registered for tenant "
                 f"{envelope.tenant_id!r}",
             )
-            self._pending_complete(envelope)
+            self._pending_complete(envelope, record.claim_token)
             return
         except Exception as exc:  # noqa: BLE001 - fail closed, retry later
-            self._evaluation_failed(envelope, exc)
+            self._evaluation_failed(envelope, exc, record.claim_token)
             return
-        self._pending_complete(envelope)
+        self._pending_complete(envelope, record.claim_token)
 
     def _evaluation_failed(
-        self, envelope: FraudEventEnvelope, exc: Exception
+        self,
+        envelope: FraudEventEnvelope,
+        exc: Exception,
+        claim_token: str | None = None,
     ) -> None:
         assert self._pending is not None
-        record = self._pending.reschedule(
-            envelope.tenant_id,
-            envelope.event_id,
-            error=type(exc).__name__,
-            next_attempt_at=self._clock() + self._retry_backoff,
-            owner=self._worker_id,
-        )
+        try:
+            record = self._pending.reschedule(
+                envelope.tenant_id,
+                envelope.event_id,
+                error=type(exc).__name__,
+                next_attempt_at=self._clock() + self._retry_backoff,
+                owner=self._worker_id,
+                claim_token=claim_token,
+            )
+        except KeyError:
+            record = None
         if record is None:
             # Lease lost mid-evaluation; the owning worker manages it.
             return
@@ -217,14 +225,17 @@ class IngestionWorker:
                 f"evaluation failed after {record.attempts} attempts: "
                 f"{type(exc).__name__}",
             )
-            self._pending_complete(envelope)
+            self._pending_complete(envelope, claim_token)
 
-    def _pending_complete(self, envelope: FraudEventEnvelope) -> None:
+    def _pending_complete(
+        self, envelope: FraudEventEnvelope, claim_token: str | None
+    ) -> None:
         if self._pending is not None:
             self._pending.complete(
                 envelope.tenant_id,
                 envelope.event_id,
                 owner=self._worker_id,
+                claim_token=claim_token,
             )
 
     def _already_evaluated(self, envelope: FraudEventEnvelope) -> bool:

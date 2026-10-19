@@ -4,7 +4,7 @@ import os
 import socket
 from datetime import datetime, timedelta
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel
 
@@ -34,6 +34,12 @@ class PendingEvaluationRecord(BaseModel):
     ``leased_by``/``leased_until`` implement multi-worker work
     ownership: a due record is claimed atomically by one worker for the
     lease window; other workers skip it until the lease expires.
+
+    ``claim_token`` is the fencing token: every claim (enqueue or
+    ``due``) issues a fresh unique token, and ``reschedule``/``complete``
+    only apply when the presented token still matches — a worker whose
+    lease expired and was reclaimed cannot stale-write the new owner's
+    work.
     """
 
     event: FraudEventEnvelope
@@ -44,6 +50,7 @@ class PendingEvaluationRecord(BaseModel):
     last_error: str | None = None
     leased_by: str | None = None
     leased_until: datetime | None = None
+    claim_token: str | None = None
 
 
 class PendingEvaluationStore(Protocol):
@@ -56,9 +63,9 @@ class PendingEvaluationStore(Protocol):
     ``due`` is a claim, not a read: each returned record is atomically
     leased to the calling worker for the store's lease window, so two
     workers reconciling concurrently cannot evaluate the same event.
-    ``reschedule``/``complete`` are conditional on that ownership — a
-    worker that does not hold the lease leaves the row untouched and
-    gets ``None``/a no-op.
+    ``reschedule``/``complete`` are conditional on the fencing token
+    issued at claim time — a caller presenting a superseded token
+    leaves the row untouched and gets ``None``/a no-op.
     """
 
     def enqueue(
@@ -81,6 +88,7 @@ class PendingEvaluationStore(Protocol):
         error: str,
         next_attempt_at: datetime,
         owner: str | None = None,
+        claim_token: str | None = None,
     ) -> PendingEvaluationRecord | None: ...
 
     def complete(
@@ -89,6 +97,7 @@ class PendingEvaluationStore(Protocol):
         event_id: UUID,
         *,
         owner: str | None = None,
+        claim_token: str | None = None,
     ) -> None: ...
 
 
@@ -134,6 +143,7 @@ class InMemoryPendingEvaluationStore:
             next_attempt_at=enqueued_at,
             leased_by=self._worker_id,
             leased_until=enqueued_at + self._lease_ttl,
+            claim_token=str(uuid4()),
         )
         self._records[key] = record
         return record
@@ -163,6 +173,7 @@ class InMemoryPendingEvaluationStore:
                     update={
                         "leased_by": self._worker_id,
                         "leased_until": now + self._lease_ttl,
+                        "claim_token": str(uuid4()),
                     }
                 )
             )
@@ -178,6 +189,7 @@ class InMemoryPendingEvaluationStore:
         error: str,
         next_attempt_at: datetime,
         owner: str | None = None,
+        claim_token: str | None = None,
     ) -> PendingEvaluationRecord | None:
         require_tenant(tenant_id, self._tenant_ids)
         key = (tenant_id, event_id)
@@ -188,6 +200,11 @@ class InMemoryPendingEvaluationStore:
                 f"event {event_id}"
             )
         if record.leased_by is not None and record.leased_by != owner:
+            return None
+        if (
+            record.claim_token is not None
+            and record.claim_token != claim_token
+        ):
             return None
         updated = record.model_copy(
             update={
@@ -205,13 +222,16 @@ class InMemoryPendingEvaluationStore:
         event_id: UUID,
         *,
         owner: str | None = None,
+        claim_token: str | None = None,
     ) -> None:
         require_tenant(tenant_id, self._tenant_ids)
         record = self._records.get((tenant_id, event_id))
-        if (
-            record is not None
-            and record.leased_by is not None
-            and record.leased_by != owner
+        if record is not None and (
+            (record.leased_by is not None and record.leased_by != owner)
+            or (
+                record.claim_token is not None
+                and record.claim_token != claim_token
+            )
         ):
             return
         self._records.pop((tenant_id, event_id), None)

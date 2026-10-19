@@ -85,12 +85,14 @@ class FakeCursor:
                         "record_json": params[2],
                         "leased_by": params[6],
                         "leased_until": params[7],
+                        "lease_token": params[8],
                     },
                 },
             )
             return
         if normalized.startswith(
-            "SELECT record_json, leased_by, leased_until FROM pending_evaluations WHERE tenant_id"
+            "SELECT record_json, leased_by, leased_until, lease_token "
+            "FROM pending_evaluations WHERE tenant_id"
         ):
             key = (str(params[0]), str(params[1]))
             self.row = self.connection.pending_rows.get(key)
@@ -123,17 +125,18 @@ class FakeCursor:
                     continue
                 row["leased_by"] = worker_id
                 row["leased_until"] = leased_until
+                row["lease_token"] = str(uuid4())
                 claimed.append(dict(row))
             self.rows_out = claimed
             self.rowcount = len(claimed)
             return
         if normalized.startswith("UPDATE pending_evaluations"):
             key = (str(params[4]), str(params[5]))
-            owner = params[6]
+            owner, claim_token = params[6], params[7]
             existing = self.connection.pending_rows.get(key)
-            if existing is not None and existing.get("leased_by") in (
-                None,
-                owner,
+            if existing is not None and (
+                existing.get("leased_by") == owner
+                and existing.get("lease_token") == claim_token
             ):
                 self.connection.staged_pending[key] = {
                     "op": "update",
@@ -145,11 +148,11 @@ class FakeCursor:
             return
         if normalized.startswith("DELETE FROM pending_evaluations"):
             key = (str(params[0]), str(params[1]))
-            owner = params[2]
+            owner, claim_token = params[2], params[3]
             existing = self.connection.pending_rows.get(key)
-            if existing is not None and existing.get("leased_by") in (
-                None,
-                owner,
+            if existing is not None and (
+                existing.get("leased_by") == owner
+                and existing.get("lease_token") == claim_token
             ):
                 self.connection.staged_pending[key] = {"op": "delete"}
             return
@@ -403,7 +406,10 @@ class TestPostgresPendingEvaluationStore:
         record = store.enqueue(env, enqueued_at=T0)
         assert record.attempts == 0
         assert record.leased_by == "w1"
-        assert store.due(T0) == (record,)
+        assert record.claim_token is not None
+        claimed = store.due(T0)
+        assert len(claimed) == 1
+        assert claimed[0].event == record.event
 
         updated = store.reschedule(
             env.tenant_id,
@@ -411,14 +417,21 @@ class TestPostgresPendingEvaluationStore:
             error="RuntimeError",
             next_attempt_at=T0 + timedelta(seconds=30),
             owner="w1",
+            claim_token=claimed[0].claim_token,
         )
         assert updated is not None
         assert updated.attempts == 1
         assert updated.last_error == "RuntimeError"
         assert store.due(T0) == ()
-        assert len(store.due(T0 + timedelta(seconds=31))) == 1
+        reclaimed = store.due(T0 + timedelta(seconds=31))
+        assert len(reclaimed) == 1
 
-        store.complete(env.tenant_id, env.event_id, owner="w1")
+        store.complete(
+            env.tenant_id,
+            env.event_id,
+            owner="w1",
+            claim_token=reclaimed[0].claim_token,
+        )
         assert store.due(T0 + timedelta(days=1)) == ()
 
     def test_enqueue_is_idempotent(self) -> None:
@@ -434,6 +447,7 @@ class TestPostgresPendingEvaluationStore:
             error="x",
             next_attempt_at=T0 + timedelta(seconds=30),
             owner="w1",
+            claim_token=first.claim_token,
         )
         again = store.enqueue(env, enqueued_at=T0 + timedelta(hours=1))
         assert again.attempts == 1  # first row wins, attempts preserved
@@ -529,6 +543,7 @@ class TestPostgresPendingEvaluationStore:
             error="x",
             next_attempt_at=T0 + timedelta(hours=2),
             owner="worker-b",
+            claim_token=claimed[0].claim_token,
         )
         assert rescheduled is not None
         assert rescheduled.attempts == 1
@@ -539,11 +554,17 @@ class TestPostgresPendingEvaluationStore:
                 error="y",
                 next_attempt_at=T0 + timedelta(hours=3),
                 owner="worker-a",
+                claim_token=claimed[0].claim_token,
             )
             is None
         )
         # A cannot complete B's leased row either.
-        store_a.complete(env.tenant_id, env.event_id, owner="worker-a")
+        store_a.complete(
+            env.tenant_id,
+            env.event_id,
+            owner="worker-a",
+            claim_token=claimed[0].claim_token,
+        )
         assert len(store_b.due(T0 + timedelta(hours=2))) == 1
 
     def test_tenant_scope_restricts_claims(self) -> None:
@@ -559,6 +580,52 @@ class TestPostgresPendingEvaluationStore:
 
         claimed = scoped.due(T0 + timedelta(hours=1))
         assert [r.event.tenant_id for r in claimed] == ["tenant-a"]
+
+    def test_stale_claim_token_cannot_fence_new_owner(self) -> None:
+        """Worker A's lease expires, B reclaims (new token); delayed A
+        can neither reschedule nor complete B's work."""
+        connection = FakeConnection()
+        store_a = PostgresPendingEvaluationStore(
+            connection, worker_id="worker-a"
+        )
+        store_b = PostgresPendingEvaluationStore(
+            connection, worker_id="worker-b"
+        )
+        env = envelope()
+        a_record = store_a.enqueue(env, enqueued_at=T0)
+
+        # Lease expires; B claims and gets a fresh fencing token.
+        b_claim = store_b.due(T0 + timedelta(hours=1))[0]
+        assert b_claim.claim_token != a_record.claim_token
+
+        # Delayed A finishes late with its superseded token: denied.
+        assert (
+            store_a.reschedule(
+                env.tenant_id,
+                env.event_id,
+                error="stale",
+                next_attempt_at=T0 + timedelta(hours=2),
+                owner="worker-a",
+                claim_token=a_record.claim_token,
+            )
+            is None
+        )
+        store_a.complete(
+            env.tenant_id,
+            env.event_id,
+            owner="worker-a",
+            claim_token=a_record.claim_token,
+        )
+        # B's claim is untouched; it completes with its own token.
+        b_reclaim = store_b.due(T0 + timedelta(hours=2))
+        assert len(b_reclaim) == 1
+        store_b.complete(
+            env.tenant_id,
+            env.event_id,
+            owner="worker-b",
+            claim_token=b_reclaim[0].claim_token,
+        )
+        assert store_b.due(T0 + timedelta(days=1)) == ()
 
 
 class TestAtomicEvaluationConsistency:

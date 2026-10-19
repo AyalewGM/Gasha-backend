@@ -4,7 +4,7 @@ import os
 import socket
 from collections.abc import Mapping
 from datetime import datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.contracts import FraudEventEnvelope
@@ -264,6 +264,7 @@ class PostgresPendingEvaluationStore:
             next_attempt_at=enqueued_at,
             leased_by=self._worker_id,
             leased_until=enqueued_at + self._lease_ttl,
+            claim_token=str(uuid4()),
         )
         with self._connection.cursor() as cursor:
             cursor.execute(
@@ -271,9 +272,9 @@ class PostgresPendingEvaluationStore:
                 INSERT INTO pending_evaluations (
                     tenant_id, event_id, record_json,
                     attempts, next_attempt_at, enqueued_at,
-                    leased_by, leased_until
+                    leased_by, leased_until, lease_token
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (tenant_id, event_id) DO NOTHING
                 """,
                 (
@@ -285,6 +286,7 @@ class PostgresPendingEvaluationStore:
                     enqueued_at,
                     self._worker_id,
                     enqueued_at + self._lease_ttl,
+                    record.claim_token,
                 ),
             )
         self._connection.commit()
@@ -309,7 +311,9 @@ class PostgresPendingEvaluationStore:
             cursor.execute(
                 """
                 UPDATE pending_evaluations AS pe
-                SET leased_by = %s, leased_until = %s
+                SET leased_by = %s,
+                    leased_until = %s,
+                    lease_token = gen_random_uuid()
                 WHERE (pe.tenant_id, pe.event_id) IN (
                     SELECT tenant_id, event_id
                     FROM pending_evaluations
@@ -322,7 +326,8 @@ class PostgresPendingEvaluationStore:
                     LIMIT %s
                     FOR UPDATE SKIP LOCKED
                 )
-                RETURNING pe.record_json, pe.leased_by, pe.leased_until
+                RETURNING pe.record_json, pe.leased_by,
+                          pe.leased_until, pe.lease_token
                 """,
                 (
                     self._worker_id,
@@ -341,7 +346,15 @@ class PostgresPendingEvaluationStore:
             PendingEvaluationRecord.model_validate_json(
                 str(row["record_json"])
             ).model_copy(
-                update={"leased_by": row["leased_by"], "leased_until": row["leased_until"]}
+                update={
+                    "leased_by": row["leased_by"],
+                    "leased_until": row["leased_until"],
+                    "claim_token": (
+                        str(row["lease_token"])
+                        if row["lease_token"] is not None
+                        else None
+                    ),
+                }
             )
             for row in rows
         )
@@ -354,6 +367,7 @@ class PostgresPendingEvaluationStore:
         error: str,
         next_attempt_at: datetime,
         owner: str | None = None,
+        claim_token: str | None = None,
     ) -> PendingEvaluationRecord | None:
         require_tenant(tenant_id, self._tenant_ids)
         record = self._get(tenant_id, event_id)
@@ -378,7 +392,8 @@ class PostgresPendingEvaluationStore:
                     next_attempt_at = %s,
                     last_error = %s
                 WHERE tenant_id = %s AND event_id = %s
-                  AND (leased_by IS NULL OR leased_by = %s)
+                  AND leased_by = %s
+                  AND lease_token IS NOT DISTINCT FROM %s
                 """,
                 (
                     updated.model_dump_json(),
@@ -388,6 +403,7 @@ class PostgresPendingEvaluationStore:
                     tenant_id,
                     str(event_id),
                     owner,
+                    claim_token,
                 ),
             )
             applied = cursor.rowcount > 0
@@ -400,6 +416,7 @@ class PostgresPendingEvaluationStore:
         event_id: UUID,
         *,
         owner: str | None = None,
+        claim_token: str | None = None,
     ) -> None:
         require_tenant(tenant_id, self._tenant_ids)
         with self._connection.cursor() as cursor:
@@ -407,9 +424,10 @@ class PostgresPendingEvaluationStore:
                 """
                 DELETE FROM pending_evaluations
                 WHERE tenant_id = %s AND event_id = %s
-                  AND (leased_by IS NULL OR leased_by = %s)
+                  AND leased_by = %s
+                  AND lease_token IS NOT DISTINCT FROM %s
                 """,
-                (tenant_id, str(event_id), owner),
+                (tenant_id, str(event_id), owner, claim_token),
             )
         self._connection.commit()
 
@@ -420,7 +438,8 @@ class PostgresPendingEvaluationStore:
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT record_json, leased_by, leased_until
+                SELECT record_json, leased_by, leased_until,
+                       lease_token
                 FROM pending_evaluations
                 WHERE tenant_id = %s AND event_id = %s
                 """,
@@ -432,6 +451,14 @@ class PostgresPendingEvaluationStore:
         return PendingEvaluationRecord.model_validate_json(
             str(row["record_json"])
         ).model_copy(
-            update={"leased_by": row["leased_by"], "leased_until": row["leased_until"]}
+            update={
+                "leased_by": row["leased_by"],
+                "leased_until": row["leased_until"],
+                "claim_token": (
+                    str(row["lease_token"])
+                    if row["lease_token"] is not None
+                    else None
+                ),
+            }
         )
 

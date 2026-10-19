@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS pending_evaluations (
     last_error TEXT,
     leased_by TEXT,
     leased_until TIMESTAMPTZ,
+    lease_token UUID,
     PRIMARY KEY (tenant_id, event_id)
 );
 
