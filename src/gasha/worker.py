@@ -78,9 +78,10 @@ class WorkerSettings(BaseSettings):
     # When set, durable Postgres stores replace the in-memory references.
     postgres_dsn: str | None = None
 
-    # Trusted tenant authorization for ingestion and durable repositories;
-    # unset means unrestricted (single-tenant/dev deployments).
-    # In multi-tenant deployments every worker SHOULD be scoped.
+    # Trusted tenant authorization for ingestion and durable repositories.
+    # REQUIRED (non-empty) whenever postgres_dsn is set — a durable/
+    # production worker must not run unscoped. Only the in-memory dev
+    # path may run without a scope.
     tenant_ids: list[str] | None = None
 
     # Stable identity stamped on claimed pending-evaluation leases.
@@ -149,12 +150,18 @@ def build_stores(
             None,  # in-memory dev mode keeps the sequential save path
         )
 
+    if not settings.tenant_ids:
+        # Fail closed before touching the database: a durable worker
+        # must never run with an unrestricted tenant scope — any event
+        # on its topic would be processed, evaluated and persisted.
+        raise ValueError(
+            "GASHA_TENANT_IDS is required when GASHA_POSTGRES_DSN is "
+            "set: a durable worker must declare its authorized tenant "
+            "scope (list every tenant it may process, including "
+            "single-tenant deployments)."
+        )
     connection = _postgres_connection(settings.postgres_dsn)
-    tenant_ids = (
-        tuple(settings.tenant_ids)
-        if settings.tenant_ids is not None
-        else None
-    )
+    tenant_ids = tuple(settings.tenant_ids)
     return (
         PostgresIngestionStore(connection, tenant_ids=tenant_ids),
         PostgresDeadLetterSink(connection, tenant_ids=tenant_ids),

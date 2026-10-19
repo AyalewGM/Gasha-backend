@@ -113,6 +113,23 @@ class TestBuildStores:
         assert isinstance(dead_letters, InMemoryDeadLetterSink)
         assert isinstance(pending, InMemoryPendingEvaluationStore)
 
+    @pytest.mark.parametrize("scope", [None, []])
+    def test_postgres_dsn_requires_tenant_scope(
+        self, scope, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A durable worker must never start unscoped: missing/empty
+        GASHA_TENANT_IDS is a startup error raised *before* any
+        database connection is attempted."""
+        monkeypatch.setattr(
+            "gasha.worker._postgres_connection",
+            lambda dsn: pytest.fail("connect attempted without scope"),
+        )
+        settings = WorkerSettings(
+            postgres_dsn="postgresql://example/db", tenant_ids=scope
+        )
+        with pytest.raises(ValueError, match="GASHA_TENANT_IDS"):
+            build_stores(settings)
+
 
 class _FakeError:
     def __init__(self, fatal: bool) -> None:

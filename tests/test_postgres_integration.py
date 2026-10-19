@@ -358,3 +358,229 @@ def test_scoped_repositories_deny_foreign_tenant(pg):
     ):
         with pytest.raises(PermissionError):
             action()
+
+
+def _connect():
+    import psycopg
+    from psycopg.rows import dict_row
+
+    connection = psycopg.connect(DSN, row_factory=dict_row)
+    for path in sorted(MIGRATIONS.glob("*.sql")):
+        connection.execute(path.read_text())
+    connection.commit()
+    return connection
+
+
+def test_separate_connections_crash_recovery_and_idempotency(pg):
+    """Two real psycopg connections: worker-A writes the pending row and
+    crashes mid-evaluation; worker-B on a separate connection claims the
+    expired lease and completes exactly once — repeat reconcile is a
+    no-op."""
+    conn_a = _connect()
+    conn_b = _connect()
+    try:
+        pending_a = PostgresPendingEvaluationStore(
+            conn_a, tenant_ids=("tenant-a",), worker_id="a"
+        )
+        pending_b = PostgresPendingEvaluationStore(
+            conn_b, tenant_ids=("tenant-a",), worker_id="b"
+        )
+        persistence = PostgresEvaluationPersistence(
+            conn_b, tenant_ids=("tenant-a",)
+        )
+        evals = PostgresShadowEvaluationRepository(
+            conn_b, tenant_ids=("tenant-a",)
+        )
+        audit = PostgresDecisionAuditRepository(
+            conn_b, tenant_ids=("tenant-a",)
+        )
+        ingestion = IngestionService(
+            {"synthetic-core-banking": ReferenceJsonAdapter()},
+            store=PostgresIngestionStore(conn_a, tenant_ids=("tenant-a",)),
+        )
+        env = envelope()
+        event = inbound_for(env)
+        policies = {"tenant-a": POLICY}
+        orchestrator = ShadowOrchestrator(
+            policies,
+            evaluations=evals,
+            audit=audit,
+            persistence=persistence,
+        )
+        dead_letters = InMemoryDeadLetterSink()
+
+        # Worker A: evaluate explodes -> failure recorded, offset acked.
+        def explode(
+            envelope_arg: FraudEventEnvelope,
+            policy: DecisionPolicy | None = None,
+        ) -> object:
+            raise RuntimeError("worker A died")
+
+        worker_a = IngestionWorker(
+            _StubConsumer([[event]]),
+            ingestion,
+            evaluate=explode,
+            evaluation_complete=lambda t, e: evals.get(t, e) is not None,
+            policy_for=lambda t: policies.get(t),
+            pending=pending_a,
+            retry_backoff=timedelta(seconds=0),
+            dead_letters=dead_letters,
+            worker_id="a",
+            tenant_ids=("tenant-a",),
+        )
+        worker_a.run_once(max_events=1)
+        assert evals.get(env.tenant_id, env.event_id) is None
+        conn_a.close()  # simulate process death; lease stays held by "a"
+
+        # Worker B on a separate connection takes over after lease expiry.
+        conn_b.execute(
+            "UPDATE pending_evaluations SET leased_until = %s",
+            (datetime.now(UTC) - timedelta(seconds=1),),
+        )
+        conn_b.commit()
+        worker_b = IngestionWorker(
+            _StubConsumer([]),
+            ingestion,
+            evaluate=orchestrator.evaluate,
+            evaluation_complete=lambda t, e: evals.get(t, e) is not None,
+            pending=pending_b,
+            retry_backoff=timedelta(seconds=0),
+            dead_letters=dead_letters,
+            worker_id="b",
+            tenant_ids=("tenant-a",),
+        )
+        worker_b.run_once(max_events=1)
+
+        persisted_eval = evals.get(env.tenant_id, env.event_id)
+        persisted_audit = audit.get(env.tenant_id, env.event_id)
+        assert persisted_eval is not None
+        assert persisted_audit is not None
+        assert persisted_audit.decision == persisted_eval.evaluation.decision
+
+        # Idempotent: repeated reconciles never add rows.
+        worker_b.run_once(max_events=1)
+        worker_b.run_once(max_events=1)
+        row = conn_b.execute(
+            "SELECT count(*) AS n FROM shadow_evaluations"
+        ).fetchone()
+        assert row is not None
+        assert int(row["n"]) == 1
+        assert dead_letters.records == ()
+    finally:
+        conn_b.close()
+
+
+def test_worker_ingestion_rejects_foreign_tenant(pg):
+    """Startup-scoped worker cannot ingest an out-of-scope tenant."""
+    conn = _connect()
+    try:
+        pending = PostgresPendingEvaluationStore(
+            conn, tenant_ids=("tenant-a",), worker_id="w"
+        )
+        ingestion = IngestionService(
+            {"synthetic-core-banking": ReferenceJsonAdapter()},
+            store=PostgresIngestionStore(conn, tenant_ids=("tenant-a",)),
+        )
+        foreign = inbound_for(envelope("tenant-b"))
+        worker = IngestionWorker(
+            _StubConsumer([[foreign]]),
+            ingestion,
+            evaluate=lambda e, p=None: pytest.fail("foreign tenant"),
+            pending=pending,
+            dead_letters=InMemoryDeadLetterSink(),
+            worker_id="w",
+            tenant_ids=("tenant-a",),
+        )
+        with pytest.raises(PermissionError):
+            worker.run_once(max_events=1)
+        row = conn.execute(
+            "SELECT count(*) AS n FROM ingestion_records"
+        ).fetchone()
+        assert row is not None
+        assert int(row["n"]) == 0
+    finally:
+        conn.close()
+
+
+def test_claim_and_recovery_performance(pg, capsys):
+    """Timing evidence: claim throughput and end-to-end restart
+    recovery over real Postgres. Loose bounds only — numbers are
+    reported, not asserted tightly."""
+    import time
+
+    conn = _connect()
+    try:
+        writer = PostgresPendingEvaluationStore(
+            conn, tenant_ids=("tenant-a",), worker_id="seed"
+        )
+        envs = [envelope() for _ in range(200)]
+        start = time.perf_counter()
+        for env in envs:
+            writer.enqueue(env, enqueued_at=T0)
+        seed_s = time.perf_counter() - start
+
+        conn.execute(
+            "UPDATE pending_evaluations SET leased_by = NULL, "
+            "leased_until = NULL, next_attempt_at = %s",
+            (T0,),
+        )
+        conn.commit()
+
+        claimant = PostgresPendingEvaluationStore(
+            conn,
+            tenant_ids=("tenant-a",),
+            worker_id="perf",
+            lease_ttl=timedelta(minutes=30),
+        )
+        start = time.perf_counter()
+        claimed = claimant.due(T0, limit=500)
+        claim_s = time.perf_counter() - start
+        assert len(claimed) == 200
+
+        evals = PostgresShadowEvaluationRepository(
+            conn, tenant_ids=("tenant-a",)
+        )
+        audit = PostgresDecisionAuditRepository(conn, tenant_ids=("tenant-a",))
+        persistence = PostgresEvaluationPersistence(
+            conn, tenant_ids=("tenant-a",)
+        )
+        orchestrator = ShadowOrchestrator(
+            {"tenant-a": POLICY},
+            evaluations=evals,
+            audit=audit,
+            persistence=persistence,
+        )
+        ingestion = IngestionService(
+            {"synthetic-core-banking": ReferenceJsonAdapter()},
+            store=PostgresIngestionStore(conn, tenant_ids=("tenant-a",)),
+        )
+        worker = IngestionWorker(
+            _StubConsumer([]),
+            ingestion,
+            evaluate=orchestrator.evaluate,
+            evaluation_complete=lambda t, e: evals.get(t, e) is not None,
+            pending=claimant,
+            dead_letters=InMemoryDeadLetterSink(),
+            worker_id="perf",
+            tenant_ids=("tenant-a",),
+        )
+        start = time.perf_counter()
+        worker.run_once(max_events=1)  # claim batch 1 (limit 100)
+        worker.run_once(max_events=1)  # claim batch 2
+        recovery_s = time.perf_counter() - start
+
+        row = conn.execute(
+            "SELECT count(*) AS n FROM shadow_evaluations"
+        ).fetchone()
+        assert row is not None
+        assert int(row["n"]) == 200
+        with capsys.disabled():
+            print(
+                f"\nPERF seed_200_enqueues={seed_s:.3f}s "
+                f"claim_200_skip_locked={claim_s:.3f}s "
+                f"recover_200_evals={recovery_s:.3f}s"
+            )
+        assert claim_s < 5.0
+        assert recovery_s < 60.0
+    finally:
+        conn.close()
