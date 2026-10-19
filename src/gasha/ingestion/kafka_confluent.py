@@ -34,6 +34,11 @@ class _Record:
         return topic
 
     @property
+    def partition(self) -> int | None:
+        partition: int = self._message.partition()
+        return partition
+
+    @property
     def offset(self) -> int | None:
         offset: int = self._message.offset()
         return offset

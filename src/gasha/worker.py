@@ -17,6 +17,9 @@ from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.adapter import BankEventAdapter
 from gasha.ingestion.kafka_confluent import ConfluentKafkaConsumer
 from gasha.ingestion.kafka_json import JsonEventConsumer
+from gasha.ingestion.postgres_evaluations import (
+    PostgresShadowEvaluationRepository,
+)
 from gasha.ingestion.postgres_store import (
     PostgresDeadLetterSink,
     PostgresIngestionStore,
@@ -113,7 +116,7 @@ def build_stores(
         PostgresIngestionStore(connection),
         PostgresDeadLetterSink(connection),
         PostgresDecisionAuditRepository(connection),
-        InMemoryShadowEvaluationRepository(),
+        PostgresShadowEvaluationRepository(connection),
     )
 
 
@@ -159,6 +162,9 @@ def build_worker(
         JsonEventConsumer(consumer, dead_letters=dead_letters),
         ingestion,
         evaluate=orchestrator.evaluate,
+        evaluation_complete=lambda tenant_id, event_id: (
+            evaluations.get(tenant_id, event_id) is not None
+        ),
         dead_letters=dead_letters,
         metrics=metrics,
     )
