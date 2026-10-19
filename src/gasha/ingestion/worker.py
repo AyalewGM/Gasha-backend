@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import socket
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -76,6 +78,7 @@ class IngestionWorker:
         clock: Callable[[], datetime] | None = None,
         dead_letters: DeadLetterSink | None = None,
         metrics: MetricsRegistry | None = None,
+        worker_id: str | None = None,
     ) -> None:
         self._consumer = consumer
         self._ingestion = ingestion
@@ -88,6 +91,9 @@ class IngestionWorker:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._dead_letters = dead_letters or ingestion.dead_letter_sink
         self._metrics = metrics
+        self._worker_id = worker_id or (
+            f"{socket.gethostname()}-{os.getpid()}"
+        )
 
     def run_once(self, *, max_events: int = 1) -> int:
         """Reconciles due pending evaluations, then processes and
@@ -111,7 +117,9 @@ class IngestionWorker:
                 # Evaluation completed durably before the crash; the
                 # ledger entry is stale — close it out.
                 self._pending.complete(
-                    envelope.tenant_id, envelope.event_id
+                    envelope.tenant_id,
+                    envelope.event_id,
+                    owner=self._worker_id,
                 )
                 continue
             self._evaluate_pending(envelope, record)
@@ -133,7 +141,17 @@ class IngestionWorker:
                 enqueued_at=self._clock(),
                 policy=self._pinned_policy(envelope),
             )
-            self._evaluate_pending(envelope, record)
+            now = self._clock()
+            if record.next_attempt_at <= now and record.leased_by in (
+                None,
+                self._worker_id,
+            ):
+                # Fresh (or already-due) record owned by this worker.
+                # A redelivery during backoff, or a record leased to
+                # another worker, is re-acked untouched — the stored
+                # attempt schedule is preserved regardless of transport
+                # redelivery.
+                self._evaluate_pending(envelope, record)
             return
         self._evaluate_event(self._evaluate, envelope, event)
 
@@ -176,7 +194,11 @@ class IngestionWorker:
             envelope.event_id,
             error=type(exc).__name__,
             next_attempt_at=self._clock() + self._retry_backoff,
+            owner=self._worker_id,
         )
+        if record is None:
+            # Lease lost mid-evaluation; the owning worker manages it.
+            return
         if self._metrics is not None:
             self._metrics.increment(
                 "gasha_worker_evaluation_retries",
@@ -194,7 +216,11 @@ class IngestionWorker:
 
     def _pending_complete(self, envelope: FraudEventEnvelope) -> None:
         if self._pending is not None:
-            self._pending.complete(envelope.tenant_id, envelope.event_id)
+            self._pending.complete(
+                envelope.tenant_id,
+                envelope.event_id,
+                owner=self._worker_id,
+            )
 
     def _already_evaluated(self, envelope: FraudEventEnvelope) -> bool:
         if self._evaluation_complete is None:

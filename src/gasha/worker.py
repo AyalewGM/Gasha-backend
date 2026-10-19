@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
+from datetime import timedelta
 from pathlib import Path
+from typing import cast
 
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -76,6 +78,19 @@ class WorkerSettings(BaseSettings):
     # When set, durable Postgres stores replace the in-memory references.
     postgres_dsn: str | None = None
 
+    # Authorized tenant scope for this worker's pending-evaluation
+    # claims; unset means unrestricted (single-tenant/dev deployments).
+    # In multi-tenant deployments every worker SHOULD be scoped.
+    tenant_ids: list[str] | None = None
+
+    # Stable identity stamped on claimed pending-evaluation leases.
+    # Defaults to "<hostname>-<pid>" when unset.
+    worker_id: str | None = None
+
+    # Seconds a claimed pending evaluation stays leased to this worker
+    # before another worker may take it over (crash recovery window).
+    lease_ttl_s: float = 300.0
+
 
 class PolicyFile(BaseModel):
     policies: dict[str, DecisionPolicy]
@@ -92,9 +107,13 @@ def load_policies(path: str | None) -> dict[str, DecisionPolicy]:
 
 def _postgres_connection(dsn: str) -> Connection:
     import psycopg
+    from psycopg.rows import dict_row
 
-    connection: Connection = psycopg.connect(dsn)
-    return connection
+    # dict_row: every repository indexes result rows by column name —
+    # psycopg's default tuple rows would raise TypeError/KeyError.
+    return cast(
+        Connection, psycopg.connect(dsn, row_factory=dict_row)
+    )
 
 
 def build_stores(
@@ -118,17 +137,35 @@ def build_stores(
             InMemoryDeadLetterSink(),
             InMemoryDecisionAuditRepository(),
             InMemoryShadowEvaluationRepository(),
-            InMemoryPendingEvaluationStore(),
+            InMemoryPendingEvaluationStore(
+                tenant_ids=(
+                    tuple(settings.tenant_ids)
+                    if settings.tenant_ids is not None
+                    else None
+                ),
+                worker_id=settings.worker_id,
+                lease_ttl=timedelta(seconds=settings.lease_ttl_s),
+            ),
             None,  # in-memory dev mode keeps the sequential save path
         )
 
     connection = _postgres_connection(settings.postgres_dsn)
+    tenant_ids = (
+        tuple(settings.tenant_ids)
+        if settings.tenant_ids is not None
+        else None
+    )
     return (
         PostgresIngestionStore(connection),
         PostgresDeadLetterSink(connection),
         PostgresDecisionAuditRepository(connection),
         PostgresShadowEvaluationRepository(connection),
-        PostgresPendingEvaluationStore(connection),
+        PostgresPendingEvaluationStore(
+            connection,
+            tenant_ids=tenant_ids,
+            worker_id=settings.worker_id,
+            lease_ttl=timedelta(seconds=settings.lease_ttl_s),
+        ),
         PostgresEvaluationPersistence(connection),
     )
 
@@ -191,6 +228,7 @@ def build_worker(
         policy_for=lambda tenant_id: policies.get(tenant_id),
         dead_letters=dead_letters,
         metrics=metrics,
+        worker_id=settings.worker_id,
     )
     return worker, consumer
 

@@ -38,6 +38,7 @@ class FakeCursor:
         self.connection = connection
         self.row: dict[str, object] | None = None
         self.rows_out: list[dict[str, object]] = []
+        self.rowcount = 0
 
     def execute(self, query: str, params: tuple[object, ...]) -> None:
         normalized = " ".join(query.split())
@@ -78,7 +79,14 @@ class FakeCursor:
             tenant_id, event_id = params[0], params[1]
             self.connection.staged_pending.setdefault(
                 (str(tenant_id), str(event_id)),
-                {"op": "insert", "row": {"record_json": params[2]}},
+                {
+                    "op": "insert",
+                    "row": {
+                        "record_json": params[2],
+                        "leased_by": params[6],
+                        "leased_until": params[7],
+                    },
+                },
             )
             return
         if normalized.startswith(
@@ -88,28 +96,62 @@ class FakeCursor:
             self.row = self.connection.pending_rows.get(key)
             return
         if normalized.startswith(
-            "SELECT record_json FROM pending_evaluations WHERE "
-            "next_attempt_at"
+            "UPDATE pending_evaluations AS pe SET leased_by"
         ):
-            self.rows_out = [
-                row
-                for row in self.connection.pending_rows.values()
-                if datetime.fromisoformat(
-                    json.loads(str(row["record_json"]))["next_attempt_at"]
-                )
-                <= params[0]
-            ][: params[1]]
+            # Atomic claim: due + in-scope + unleased rows are leased
+            # to this worker in one statement.
+            worker_id, leased_until, now = params[0], params[1], params[2]
+            tenant_ids = params[3]
+            limit = int(str(params[7]))
+            claimed: list[dict[str, object]] = []
+            for key, row in self.connection.pending_rows.items():
+                if len(claimed) >= limit:
+                    break
+                record = json.loads(str(row["record_json"]))
+                if (
+                    datetime.fromisoformat(record["next_attempt_at"])
+                    > now
+                ):
+                    continue
+                if tenant_ids is not None and key[0] not in tenant_ids:
+                    continue
+                if (
+                    row.get("leased_until") is not None
+                    and row["leased_until"] > now
+                    and row.get("leased_by") != worker_id
+                ):
+                    continue
+                row["leased_by"] = worker_id
+                row["leased_until"] = leased_until
+                claimed.append({"record_json": row["record_json"]})
+            self.rows_out = claimed
+            self.rowcount = len(claimed)
             return
         if normalized.startswith("UPDATE pending_evaluations"):
             key = (str(params[4]), str(params[5]))
-            self.connection.staged_pending[key] = {
-                "op": "update",
-                "row": {"record_json": params[0]},
-            }
+            owner = params[6]
+            existing = self.connection.pending_rows.get(key)
+            if existing is not None and existing.get("leased_by") in (
+                None,
+                owner,
+            ):
+                self.connection.staged_pending[key] = {
+                    "op": "update",
+                    "row": {**existing, "record_json": params[0]},
+                }
+                self.rowcount = 1
+            else:
+                self.rowcount = 0
             return
         if normalized.startswith("DELETE FROM pending_evaluations"):
             key = (str(params[0]), str(params[1]))
-            self.connection.staged_pending[key] = {"op": "delete"}
+            owner = params[2]
+            existing = self.connection.pending_rows.get(key)
+            if existing is not None and existing.get("leased_by") in (
+                None,
+                owner,
+            ):
+                self.connection.staged_pending[key] = {"op": "delete"}
             return
         raise AssertionError(f"unexpected query: {normalized}")
 
@@ -353,11 +395,14 @@ class TestPostgresPendingEvaluationStore:
 
     def test_enqueue_due_reschedule_complete(self) -> None:
         connection = FakeConnection()
-        store = PostgresPendingEvaluationStore(connection)
+        store = PostgresPendingEvaluationStore(
+            connection, worker_id="w1"
+        )
         env = envelope()
 
         record = store.enqueue(env, enqueued_at=T0)
         assert record.attempts == 0
+        assert record.leased_by == "w1"
         assert store.due(T0) == (record,)
 
         updated = store.reschedule(
@@ -365,18 +410,22 @@ class TestPostgresPendingEvaluationStore:
             env.event_id,
             error="RuntimeError",
             next_attempt_at=T0 + timedelta(seconds=30),
+            owner="w1",
         )
+        assert updated is not None
         assert updated.attempts == 1
         assert updated.last_error == "RuntimeError"
         assert store.due(T0) == ()
         assert len(store.due(T0 + timedelta(seconds=31))) == 1
 
-        store.complete(env.tenant_id, env.event_id)
+        store.complete(env.tenant_id, env.event_id, owner="w1")
         assert store.due(T0 + timedelta(days=1)) == ()
 
     def test_enqueue_is_idempotent(self) -> None:
         connection = FakeConnection()
-        store = PostgresPendingEvaluationStore(connection)
+        store = PostgresPendingEvaluationStore(
+            connection, worker_id="w1"
+        )
         env = envelope()
         first = store.enqueue(env, enqueued_at=T0)
         store.reschedule(
@@ -384,6 +433,7 @@ class TestPostgresPendingEvaluationStore:
             env.event_id,
             error="x",
             next_attempt_at=T0 + timedelta(seconds=30),
+            owner="w1",
         )
         again = store.enqueue(env, enqueued_at=T0 + timedelta(hours=1))
         assert again.attempts == 1  # first row wins, attempts preserved
@@ -451,6 +501,64 @@ class TestPostgresPendingEvaluationStore:
         # Reconcile again: nothing left, still exactly one row.
         worker2.run_once(max_events=1)
         assert len(connection.rows) == 1
+
+    def test_concurrent_workers_claim_disjoint_rows(self) -> None:
+        """Two worker instances over the same table can never claim the
+        same pending row while the first lease is held."""
+        connection = FakeConnection()
+        store_a = PostgresPendingEvaluationStore(
+            connection, worker_id="worker-a"
+        )
+        store_b = PostgresPendingEvaluationStore(
+            connection, worker_id="worker-b"
+        )
+        env = envelope()
+        store_a.enqueue(env, enqueued_at=T0)
+
+        # Worker A's enqueue lease is held; B cannot claim the row.
+        assert store_b.due(T0) == ()
+        # After A's lease expires, B takes it over atomically.
+        claimed = store_b.due(T0 + timedelta(hours=1))
+        assert len(claimed) == 1
+        assert claimed[0].event.event_id == env.event_id
+
+        # B's reschedule while owning the lease applies; A's is denied.
+        rescheduled = store_b.reschedule(
+            env.tenant_id,
+            env.event_id,
+            error="x",
+            next_attempt_at=T0 + timedelta(hours=2),
+            owner="worker-b",
+        )
+        assert rescheduled is not None
+        assert rescheduled.attempts == 1
+        assert (
+            store_a.reschedule(
+                env.tenant_id,
+                env.event_id,
+                error="y",
+                next_attempt_at=T0 + timedelta(hours=3),
+                owner="worker-a",
+            )
+            is None
+        )
+        # A cannot complete B's leased row either.
+        store_a.complete(env.tenant_id, env.event_id, owner="worker-a")
+        assert len(store_b.due(T0 + timedelta(hours=2))) == 1
+
+    def test_tenant_scope_restricts_claims(self) -> None:
+        """A store scoped to tenant-a never claims tenant-b's rows."""
+        connection = FakeConnection()
+        scoped = PostgresPendingEvaluationStore(
+            connection, tenant_ids=("tenant-a",), worker_id="w1"
+        )
+        env_a = envelope("tenant-a")
+        env_b = envelope("tenant-b")
+        scoped.enqueue(env_a, enqueued_at=T0)
+        scoped.enqueue(env_b, enqueued_at=T0)
+
+        claimed = scoped.due(T0 + timedelta(hours=1))
+        assert [r.event.tenant_id for r in claimed] == ["tenant-a"]
 
 
 class TestAtomicEvaluationConsistency:

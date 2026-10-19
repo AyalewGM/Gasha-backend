@@ -476,6 +476,63 @@ class TestPendingEvaluationRecovery:
         worker3.run_once(max_events=1)
         assert calls["n"] == 2
 
+    def test_redelivery_during_backoff_preserves_attempt_schedule(
+        self,
+    ) -> None:
+        """A Kafka duplicate arriving while the record backs off is
+        re-acked untouched: the stored next_attempt_at, not transport
+        redelivery, decides when the next attempt runs."""
+        body = json.loads(event_json())
+        payload = json.dumps(body).encode()
+        now = [T0]
+        pending = InMemoryPendingEvaluationStore()
+        calls = {"n": 0}
+
+        def always_fails(
+            envelope: FraudEventEnvelope,
+            policy: DecisionPolicy | None = None,
+        ) -> None:
+            calls["n"] += 1
+            raise RuntimeError("still down")
+
+        worker1, _, _ = self._workers(
+            pending,
+            make_ingestion(),
+            always_fails,
+            evaluation_complete=lambda t, e: False,
+            clock=lambda: now[0],
+            records=[FakeRecord(payload, 0)],
+        )
+        worker1.run_once(max_events=1)
+        assert calls["n"] == 1
+
+        # Duplicate redelivery before backoff elapses: the ledger row
+        # exists with a future next_attempt_at — re-ack, no retry.
+        worker2, batch2, _ = self._workers(
+            pending,
+            make_ingestion(),
+            always_fails,
+            evaluation_complete=lambda t, e: False,
+            clock=lambda: now[0],
+            records=[FakeRecord(payload, 1)],
+        )
+        worker2.run_once(max_events=1)
+        assert calls["n"] == 1
+        assert batch2.commits == 1
+
+        # Once the stored backoff elapses, the next redelivery retries.
+        now[0] += timedelta(seconds=31)
+        worker3, _, _ = self._workers(
+            pending,
+            make_ingestion(),
+            always_fails,
+            evaluation_complete=lambda t, e: False,
+            clock=lambda: now[0],
+            records=[FakeRecord(payload, 2)],
+        )
+        worker3.run_once(max_events=1)
+        assert calls["n"] == 2
+
     def test_terminal_failure_dead_letters_after_max_attempts(self) -> None:
         body = json.loads(event_json())
         now = [T0]

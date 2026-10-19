@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
+import socket
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from gasha.domain.models import DecisionPolicy
@@ -204,10 +206,29 @@ class PostgresPendingEvaluationStore:
 
     Rows survive process restarts, so acknowledged-but-unevaluated
     events are recovered autonomously — no transport redelivery needed.
+
+    ``tenant_ids`` is the worker's authorized tenant scope — claims and
+    mutations never touch rows outside it (``None`` = unrestricted).
+    ``worker_id``/``lease_ttl`` implement atomic work ownership: ``due``
+    claims due rows in one ``FOR UPDATE SKIP LOCKED`` statement, and
+    ``reschedule``/``complete`` only mutate rows still leased to this
+    worker.
     """
 
-    def __init__(self, connection: Connection) -> None:
+    def __init__(
+        self,
+        connection: Connection,
+        *,
+        tenant_ids: tuple[str, ...] | None = None,
+        worker_id: str | None = None,
+        lease_ttl: timedelta = timedelta(minutes=5),
+    ) -> None:
         self._connection = connection
+        self._tenant_ids = tenant_ids
+        self._worker_id = worker_id or (
+            f"{socket.gethostname()}-{os.getpid()}"
+        )
+        self._lease_ttl = lease_ttl
 
     def enqueue(
         self,
@@ -222,15 +243,18 @@ class PostgresPendingEvaluationStore:
             policy=policy,
             enqueued_at=enqueued_at,
             next_attempt_at=enqueued_at,
+            leased_by=self._worker_id,
+            leased_until=enqueued_at + self._lease_ttl,
         )
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
                 INSERT INTO pending_evaluations (
                     tenant_id, event_id, record_json,
-                    attempts, next_attempt_at, enqueued_at
+                    attempts, next_attempt_at, enqueued_at,
+                    leased_by, leased_until
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (tenant_id, event_id) DO NOTHING
                 """,
                 (
@@ -240,6 +264,8 @@ class PostgresPendingEvaluationStore:
                     0,
                     enqueued_at,
                     enqueued_at,
+                    self._worker_id,
+                    enqueued_at + self._lease_ttl,
                 ),
             )
         self._connection.commit()
@@ -250,18 +276,48 @@ class PostgresPendingEvaluationStore:
     def due(
         self, now: datetime, *, limit: int = 100
     ) -> tuple[PendingEvaluationRecord, ...]:
+        """Atomically claims up to ``limit`` due rows for this worker.
+
+        One ``UPDATE ... FOR UPDATE SKIP LOCKED ... RETURNING`` — each
+        due, in-scope, unleased row is stamped ``leased_by``/``leased_until``
+        in the same statement, so concurrent workers can never claim the
+        same row.
+        """
+        tenant_ids = (
+            list(self._tenant_ids) if self._tenant_ids is not None else None
+        )
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT record_json
-                FROM pending_evaluations
-                WHERE next_attempt_at <= %s
-                ORDER BY enqueued_at ASC
-                LIMIT %s
+                UPDATE pending_evaluations AS pe
+                SET leased_by = %s, leased_until = %s
+                WHERE (pe.tenant_id, pe.event_id) IN (
+                    SELECT tenant_id, event_id
+                    FROM pending_evaluations
+                    WHERE next_attempt_at <= %s
+                      AND (%s::text[] IS NULL OR tenant_id = ANY(%s))
+                      AND (leased_until IS NULL
+                           OR leased_until <= %s
+                           OR leased_by = %s)
+                    ORDER BY enqueued_at ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING pe.record_json
                 """,
-                (now, limit),
+                (
+                    self._worker_id,
+                    now + self._lease_ttl,
+                    now,
+                    tenant_ids,
+                    tenant_ids,
+                    now,
+                    self._worker_id,
+                    limit,
+                ),
             )
             rows = cursor.fetchall()
+        self._connection.commit()
         return tuple(
             PendingEvaluationRecord.model_validate_json(
                 str(row["record_json"])
@@ -276,7 +332,8 @@ class PostgresPendingEvaluationStore:
         *,
         error: str,
         next_attempt_at: datetime,
-    ) -> PendingEvaluationRecord:
+        owner: str | None = None,
+    ) -> PendingEvaluationRecord | None:
         record = self._get(tenant_id, event_id)
         if record is None:
             raise KeyError(
@@ -299,6 +356,7 @@ class PostgresPendingEvaluationStore:
                     next_attempt_at = %s,
                     last_error = %s
                 WHERE tenant_id = %s AND event_id = %s
+                  AND (leased_by IS NULL OR leased_by = %s)
                 """,
                 (
                     updated.model_dump_json(),
@@ -307,19 +365,28 @@ class PostgresPendingEvaluationStore:
                     error,
                     tenant_id,
                     str(event_id),
+                    owner,
                 ),
             )
+            applied = cursor.rowcount > 0
         self._connection.commit()
-        return updated
+        return updated if applied else None
 
-    def complete(self, tenant_id: str, event_id: UUID) -> None:
+    def complete(
+        self,
+        tenant_id: str,
+        event_id: UUID,
+        *,
+        owner: str | None = None,
+    ) -> None:
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
                 DELETE FROM pending_evaluations
                 WHERE tenant_id = %s AND event_id = %s
+                  AND (leased_by IS NULL OR leased_by = %s)
                 """,
-                (tenant_id, str(event_id)),
+                (tenant_id, str(event_id), owner),
             )
         self._connection.commit()
 
