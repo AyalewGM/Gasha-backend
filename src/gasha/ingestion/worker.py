@@ -22,6 +22,7 @@ from gasha.ingestion.service import (
 from gasha.ingestion.transport import EventBatch
 from gasha.observability.metrics import MetricsRegistry
 from gasha.poc.historical import MissingTenantPolicyError
+from gasha.tenant_scope import require_tenant
 
 
 class CommittableEventConsumer(Protocol):
@@ -79,7 +80,9 @@ class IngestionWorker:
         dead_letters: DeadLetterSink | None = None,
         metrics: MetricsRegistry | None = None,
         worker_id: str | None = None,
+        tenant_ids: tuple[str, ...] | None = None,
     ) -> None:
+        self._tenant_ids = tenant_ids
         self._consumer = consumer
         self._ingestion = ingestion
         self._evaluate = evaluate
@@ -111,6 +114,7 @@ class IngestionWorker:
             return
         for record in self._pending.due(self._clock()):
             envelope = record.event
+            require_tenant(envelope.tenant_id, self._tenant_ids)
             if self._evaluation_complete is not None and self._already_evaluated(
                 envelope
             ):
@@ -125,6 +129,7 @@ class IngestionWorker:
             self._evaluate_pending(envelope, record)
 
     def _process(self, event: InboundBankEvent) -> None:
+        require_tenant(event.tenant_id, self._tenant_ids)
         result = self._ingestion.ingest(event)
         envelope = result.envelope
         if envelope is None or self._evaluate is None:
@@ -142,10 +147,10 @@ class IngestionWorker:
                 policy=self._pinned_policy(envelope),
             )
             now = self._clock()
-            if record.next_attempt_at <= now and record.leased_by in (
-                None,
-                self._worker_id,
-            ):
+            if (record.next_attempt_at <= now
+                and record.leased_by == self._worker_id
+                and record.leased_until is not None
+                and record.leased_until > now):
                 # Fresh (or already-due) record owned by this worker.
                 # A redelivery during backoff, or a record leased to
                 # another worker, is re-acked untouched — the stored
@@ -290,3 +295,4 @@ class IngestionWorker:
                     "reason": reason.value,
                 },
             )
+

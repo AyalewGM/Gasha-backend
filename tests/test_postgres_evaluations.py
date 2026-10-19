@@ -90,7 +90,7 @@ class FakeCursor:
             )
             return
         if normalized.startswith(
-            "SELECT record_json FROM pending_evaluations WHERE tenant_id"
+            "SELECT record_json, leased_by, leased_until FROM pending_evaluations WHERE tenant_id"
         ):
             key = (str(params[0]), str(params[1]))
             self.row = self.connection.pending_rows.get(key)
@@ -123,7 +123,7 @@ class FakeCursor:
                     continue
                 row["leased_by"] = worker_id
                 row["leased_until"] = leased_until
-                claimed.append({"record_json": row["record_json"]})
+                claimed.append(dict(row))
             self.rows_out = claimed
             self.rowcount = len(claimed)
             return
@@ -555,7 +555,7 @@ class TestPostgresPendingEvaluationStore:
         env_a = envelope("tenant-a")
         env_b = envelope("tenant-b")
         scoped.enqueue(env_a, enqueued_at=T0)
-        scoped.enqueue(env_b, enqueued_at=T0)
+        PostgresPendingEvaluationStore(connection).enqueue(env_b, enqueued_at=T0)
 
         claimed = scoped.due(T0 + timedelta(hours=1))
         assert [r.event.tenant_id for r in claimed] == ["tenant-a"]
@@ -681,3 +681,60 @@ class TestAtomicEvaluationConsistency:
         assert audit.decision == first.decision
         assert evals.evaluation.decision == first.decision
         assert audit.decision.policy_version == "policy-1"
+
+
+
+def test_takeover_redelivery_reads_authoritative_owner():
+    connection = FakeConnection()
+    a = PostgresPendingEvaluationStore(connection, worker_id="a")
+    b = PostgresPendingEvaluationStore(connection, worker_id="b")
+    env = envelope()
+    a.enqueue(env, enqueued_at=T0)
+    now = T0 + timedelta(hours=1)
+    claimed = b.due(now)[0]
+    assert claimed.leased_by == "b"
+    assert claimed.leased_until == now + timedelta(minutes=5)
+    duplicate = a.enqueue(env, enqueued_at=now)
+    assert duplicate.leased_by == "b"
+    assert duplicate.leased_until == claimed.leased_until
+    a.complete(env.tenant_id, env.event_id, owner="a")
+    assert a.enqueue(env, enqueued_at=now).leased_by == "b"
+
+
+def test_pending_scope_rejects_all_direct_access():
+    import pytest
+    connection = FakeConnection()
+    env = envelope("tenant-b")
+    scoped = PostgresPendingEvaluationStore(connection, tenant_ids=("tenant-a",))
+    for action in (
+        lambda: scoped.enqueue(env, enqueued_at=T0),
+        lambda: scoped._get(env.tenant_id, env.event_id),
+        lambda: scoped.complete(env.tenant_id, env.event_id),
+        lambda: scoped.reschedule(env.tenant_id, env.event_id, error="x", next_attempt_at=T0),
+        lambda: PostgresShadowEvaluationRepository(connection, tenant_ids=("tenant-a",)).get(env.tenant_id, env.event_id),
+    ):
+        with pytest.raises(PermissionError):
+            action()
+    assert not connection.pending_rows
+
+
+def test_worker_denies_tenant_before_ingestion():
+    import pytest
+
+    from gasha.ingestion.transport import EventBatch
+    env = envelope("tenant-b")
+    class Consumer:
+        commits = 0
+        def poll_batch(self, *, max_events=1):
+            return EventBatch((inbound_for(env),), 1)
+        def commit(self):
+            self.commits += 1
+    class ForbiddenIngestion:
+        dead_letter_sink = InMemoryDeadLetterSink()
+        def ingest(self, event):
+            raise AssertionError("unauthorized event reached ingestion")
+    consumer = Consumer()
+    worker = IngestionWorker(consumer, ForbiddenIngestion(), tenant_ids=("tenant-a",))
+    with pytest.raises(PermissionError):
+        worker.run_once()
+    assert consumer.commits == 0

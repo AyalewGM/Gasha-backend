@@ -14,6 +14,7 @@ from gasha.ingestion.pending import PendingEvaluationRecord
 from gasha.ingestion.service import IngestionRecord
 from gasha.poc.outcomes import OutcomeRecord
 from gasha.postgres import Connection
+from gasha.tenant_scope import require_tenant
 
 
 class PostgresIngestionStore:
@@ -23,12 +24,16 @@ class PostgresIngestionStore:
     accepted record so conflicting payloads never overwrite.
     """
 
-    def __init__(self, connection: Connection) -> None:
+    def __init__(
+        self, connection: Connection, *, tenant_ids: tuple[str, ...] | None = None
+    ) -> None:
+        self._tenant_ids = tenant_ids
         self._connection = connection
 
     def get(
         self, tenant_id: str, event_id: UUID
     ) -> IngestionRecord | None:
+        require_tenant(tenant_id, self._tenant_ids)
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -50,6 +55,7 @@ class PostgresIngestionStore:
         )
 
     def save(self, record: IngestionRecord) -> IngestionRecord:
+        require_tenant(record.envelope.tenant_id, self._tenant_ids)
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -83,10 +89,15 @@ class PostgresIngestionStore:
 class PostgresDeadLetterSink:
     """Append-only dead-letter sink for rejected inbound events."""
 
-    def __init__(self, connection: Connection) -> None:
+    def __init__(
+        self, connection: Connection, *, tenant_ids: tuple[str, ...] | None = None
+    ) -> None:
+        self._tenant_ids = tenant_ids
         self._connection = connection
 
     def put(self, record: RejectionRecord) -> None:
+        if record.tenant_id is not None:
+            require_tenant(record.tenant_id, self._tenant_ids)
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -113,12 +124,16 @@ class PostgresOutcomeStore:
     and the T0 decision is never mutated.
     """
 
-    def __init__(self, connection: Connection) -> None:
+    def __init__(
+        self, connection: Connection, *, tenant_ids: tuple[str, ...] | None = None
+    ) -> None:
+        self._tenant_ids = tenant_ids
         self._connection = connection
 
     def outcomes(
         self, tenant_id: str, event_id: UUID
     ) -> tuple[OutcomeRecord, ...]:
+        require_tenant(tenant_id, self._tenant_ids)
         rows = self._history("outcome_records", tenant_id, event_id)
         return tuple(
             OutcomeRecord.model_validate_json(str(row["record_json"]))
@@ -128,6 +143,7 @@ class PostgresOutcomeStore:
     def incumbent_outcomes(
         self, tenant_id: str, event_id: UUID
     ) -> tuple[IncumbentOutcomeRecord, ...]:
+        require_tenant(tenant_id, self._tenant_ids)
         rows = self._history(
             "incumbent_outcome_records", tenant_id, event_id
         )
@@ -160,6 +176,7 @@ class PostgresOutcomeStore:
         self, table: str, tenant_id: str, event_id: UUID
     ) -> list[Mapping[str, object]]:
         # Table names are internal constants, never user input.
+        require_tenant(tenant_id, self._tenant_ids)
         with self._connection.cursor() as cursor:
             cursor.execute(
                 f"""
@@ -180,6 +197,7 @@ class PostgresOutcomeStore:
         record_json: str,
         recorded_at: datetime | None,
     ) -> None:
+        require_tenant(tenant_id, self._tenant_ids)
         with self._connection.cursor() as cursor:
             cursor.execute(
                 f"""
@@ -237,6 +255,7 @@ class PostgresPendingEvaluationStore:
         enqueued_at: datetime,
         policy: DecisionPolicy | None = None,
     ) -> PendingEvaluationRecord:
+        require_tenant(event.tenant_id, self._tenant_ids)
         key = (event.tenant_id, event.event_id)
         record = PendingEvaluationRecord(
             event=event,
@@ -303,7 +322,7 @@ class PostgresPendingEvaluationStore:
                     LIMIT %s
                     FOR UPDATE SKIP LOCKED
                 )
-                RETURNING pe.record_json
+                RETURNING pe.record_json, pe.leased_by, pe.leased_until
                 """,
                 (
                     self._worker_id,
@@ -321,6 +340,8 @@ class PostgresPendingEvaluationStore:
         return tuple(
             PendingEvaluationRecord.model_validate_json(
                 str(row["record_json"])
+            ).model_copy(
+                update={"leased_by": row["leased_by"], "leased_until": row["leased_until"]}
             )
             for row in rows
         )
@@ -334,6 +355,7 @@ class PostgresPendingEvaluationStore:
         next_attempt_at: datetime,
         owner: str | None = None,
     ) -> PendingEvaluationRecord | None:
+        require_tenant(tenant_id, self._tenant_ids)
         record = self._get(tenant_id, event_id)
         if record is None:
             raise KeyError(
@@ -379,6 +401,7 @@ class PostgresPendingEvaluationStore:
         *,
         owner: str | None = None,
     ) -> None:
+        require_tenant(tenant_id, self._tenant_ids)
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -393,10 +416,11 @@ class PostgresPendingEvaluationStore:
     def _get(
         self, tenant_id: str, event_id: UUID
     ) -> PendingEvaluationRecord | None:
+        require_tenant(tenant_id, self._tenant_ids)
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT record_json
+                SELECT record_json, leased_by, leased_until
                 FROM pending_evaluations
                 WHERE tenant_id = %s AND event_id = %s
                 """,
@@ -407,4 +431,7 @@ class PostgresPendingEvaluationStore:
             return None
         return PendingEvaluationRecord.model_validate_json(
             str(row["record_json"])
+        ).model_copy(
+            update={"leased_by": row["leased_by"], "leased_until": row["leased_until"]}
         )
+

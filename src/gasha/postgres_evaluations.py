@@ -6,6 +6,7 @@ from uuid import UUID
 from gasha.decision.audit import DecisionAuditRecord
 from gasha.orchestration import ShadowEvaluationRecord
 from gasha.postgres import Connection
+from gasha.tenant_scope import require_tenant
 
 
 class PostgresShadowEvaluationRepository:
@@ -16,12 +17,16 @@ class PostgresShadowEvaluationRepository:
     in-memory contract.
     """
 
-    def __init__(self, connection: Connection) -> None:
+    def __init__(
+        self, connection: Connection, *, tenant_ids: tuple[str, ...] | None = None
+    ) -> None:
+        self._tenant_ids = tenant_ids
         self._connection = connection
 
     def get(
         self, tenant_id: str, event_id: UUID
     ) -> ShadowEvaluationRecord | None:
+        require_tenant(tenant_id, self._tenant_ids)
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -39,6 +44,7 @@ class PostgresShadowEvaluationRepository:
         )
 
     def save(self, record: ShadowEvaluationRecord) -> ShadowEvaluationRecord:
+        require_tenant(record.event.tenant_id, self._tenant_ids)
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -76,7 +82,10 @@ class PostgresEvaluationPersistence:
     the originally persisted pair intact on replay.
     """
 
-    def __init__(self, connection: Connection) -> None:
+    def __init__(
+        self, connection: Connection, *, tenant_ids: tuple[str, ...] | None = None
+    ) -> None:
+        self._tenant_ids = tenant_ids
         self._connection = connection
 
     def save(
@@ -85,6 +94,10 @@ class PostgresEvaluationPersistence:
         audit: DecisionAuditRecord,
     ) -> ShadowEvaluationRecord:
         decision = audit.decision
+        require_tenant(record.event.tenant_id, self._tenant_ids)
+        require_tenant(decision.tenant_id, self._tenant_ids)
+        if (decision.tenant_id, decision.event_id) != (record.event.tenant_id, record.event.event_id):
+            raise ValueError("audit and evaluation identity mismatch")
         try:
             with self._connection.cursor() as cursor:
                 cursor.execute(
@@ -139,3 +152,4 @@ class PostgresEvaluationPersistence:
                 "atomic evaluation save completed without a record"
             )
         return persisted
+

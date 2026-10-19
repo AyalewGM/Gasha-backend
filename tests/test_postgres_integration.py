@@ -210,7 +210,7 @@ class TestClaimAndOwnership:
             pg, tenant_ids=("tenant-a",), worker_id="a"
         )
         scoped.enqueue(envelope("tenant-a"), enqueued_at=T0)
-        scoped.enqueue(envelope("tenant-b"), enqueued_at=T0)
+        PostgresPendingEvaluationStore(pg).enqueue(envelope("tenant-b"), enqueued_at=T0)
         pg.execute(
             "UPDATE pending_evaluations SET leased_by = NULL, "
             "leased_until = NULL"
@@ -327,3 +327,34 @@ class _StubConsumer:
 
     def commit(self) -> None:
         self.commits += 1
+
+
+
+def test_takeover_metadata_survives_redelivery(pg):
+    a = PostgresPendingEvaluationStore(pg, worker_id="a")
+    b = PostgresPendingEvaluationStore(pg, worker_id="b")
+    env = envelope()
+    a.enqueue(env, enqueued_at=T0)
+    now = T0 + timedelta(hours=1)
+    claimed = b.due(now)[0]
+    assert claimed.leased_by == "b"
+    duplicate = a.enqueue(env, enqueued_at=now)
+    assert duplicate.leased_by == "b"
+    assert duplicate.leased_until == claimed.leased_until
+    a.complete(env.tenant_id, env.event_id, owner="a")
+    assert a.enqueue(env, enqueued_at=now).leased_by == "b"
+
+
+def test_scoped_repositories_deny_foreign_tenant(pg):
+    env = envelope("tenant-b")
+    pending = PostgresPendingEvaluationStore(pg, tenant_ids=("tenant-a",))
+    for action in (
+        lambda: pending.enqueue(env, enqueued_at=T0),
+        lambda: pending._get(env.tenant_id, env.event_id),
+        lambda: pending.complete(env.tenant_id, env.event_id),
+        lambda: PostgresIngestionStore(pg, tenant_ids=("tenant-a",)).get(env.tenant_id, env.event_id),
+        lambda: PostgresShadowEvaluationRepository(pg, tenant_ids=("tenant-a",)).get(env.tenant_id, env.event_id),
+        lambda: PostgresDecisionAuditRepository(pg, tenant_ids=("tenant-a",)).get(env.tenant_id, env.event_id),
+    ):
+        with pytest.raises(PermissionError):
+            action()

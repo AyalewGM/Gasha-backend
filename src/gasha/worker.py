@@ -78,8 +78,8 @@ class WorkerSettings(BaseSettings):
     # When set, durable Postgres stores replace the in-memory references.
     postgres_dsn: str | None = None
 
-    # Authorized tenant scope for this worker's pending-evaluation
-    # claims; unset means unrestricted (single-tenant/dev deployments).
+    # Trusted tenant authorization for ingestion and durable repositories;
+    # unset means unrestricted (single-tenant/dev deployments).
     # In multi-tenant deployments every worker SHOULD be scoped.
     tenant_ids: list[str] | None = None
 
@@ -156,17 +156,17 @@ def build_stores(
         else None
     )
     return (
-        PostgresIngestionStore(connection),
-        PostgresDeadLetterSink(connection),
-        PostgresDecisionAuditRepository(connection),
-        PostgresShadowEvaluationRepository(connection),
+        PostgresIngestionStore(connection, tenant_ids=tenant_ids),
+        PostgresDeadLetterSink(connection, tenant_ids=tenant_ids),
+        PostgresDecisionAuditRepository(connection, tenant_ids=tenant_ids),
+        PostgresShadowEvaluationRepository(connection, tenant_ids=tenant_ids),
         PostgresPendingEvaluationStore(
             connection,
             tenant_ids=tenant_ids,
             worker_id=settings.worker_id,
             lease_ttl=timedelta(seconds=settings.lease_ttl_s),
         ),
-        PostgresEvaluationPersistence(connection),
+        PostgresEvaluationPersistence(connection, tenant_ids=tenant_ids),
     )
 
 
@@ -229,6 +229,7 @@ def build_worker(
         dead_letters=dead_letters,
         metrics=metrics,
         worker_id=settings.worker_id,
+        tenant_ids=tuple(settings.tenant_ids) if settings.tenant_ids is not None else None,
     )
     return worker, consumer
 
@@ -254,3 +255,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

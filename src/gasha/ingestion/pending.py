@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.contracts import FraudEventEnvelope
+from gasha.tenant_scope import require_tenant
 
 
 class PendingEvaluationRecord(BaseModel):
@@ -121,6 +122,7 @@ class InMemoryPendingEvaluationStore:
         enqueued_at: datetime,
         policy: DecisionPolicy | None = None,
     ) -> PendingEvaluationRecord:
+        require_tenant(event.tenant_id, self._tenant_ids)
         key = (event.tenant_id, event.event_id)
         existing = self._records.get(key)
         if existing is not None:
@@ -177,6 +179,7 @@ class InMemoryPendingEvaluationStore:
         next_attempt_at: datetime,
         owner: str | None = None,
     ) -> PendingEvaluationRecord | None:
+        require_tenant(tenant_id, self._tenant_ids)
         key = (tenant_id, event_id)
         record = self._records.get(key)
         if record is None:
@@ -203,6 +206,7 @@ class InMemoryPendingEvaluationStore:
         *,
         owner: str | None = None,
     ) -> None:
+        require_tenant(tenant_id, self._tenant_ids)
         record = self._records.get((tenant_id, event_id))
         if (
             record is not None
@@ -211,3 +215,4 @@ class InMemoryPendingEvaluationStore:
         ):
             return
         self._records.pop((tenant_id, event_id), None)
+
