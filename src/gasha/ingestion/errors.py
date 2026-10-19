@@ -48,6 +48,10 @@ class RejectionRecord(BaseModel):
     schema_version: str | None = None
     adapter_version: str | None = None
     payload_fingerprint: str | None = None
+    # Transport coordinates for replay evidence (Kafka topic/partition/offset).
+    topic: str | None = None
+    partition: int | None = None
+    offset: int | None = None
     rejected_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
