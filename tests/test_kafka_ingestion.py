@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -11,6 +11,7 @@ from gasha.domain.models import DecisionAction, DecisionPolicy, OperatingMode
 from gasha.ingestion.contracts import FraudEventEnvelope, InboundBankEvent
 from gasha.ingestion.errors import RejectionReason
 from gasha.ingestion.kafka_json import JsonEventConsumer
+from gasha.ingestion.pending import InMemoryPendingEvaluationStore
 from gasha.ingestion.reference import ReferenceJsonAdapter
 from gasha.ingestion.service import (
     IngestionOutcome,
@@ -358,6 +359,224 @@ class TestEvaluationRecovery:
         )
         worker3.run_once(max_events=1)
         assert len(evaluated) == 1
+
+
+class TestPendingEvaluationRecovery:
+    """Acknowledged-but-unevaluated events recover autonomously from the
+    pending ledger — no Kafka redelivery required."""
+
+    def _workers(
+        self,
+        pending,
+        ingestion,
+        evaluate,
+        evaluation_complete=None,
+        clock=None,
+        retry_backoff=None,
+        max_attempts=3,
+        records=None,
+    ):
+        consumer, batch, dead_letters = make_consumer(records or [])
+        worker = IngestionWorker(
+            consumer,
+            ingestion,
+            evaluate=evaluate,
+            evaluation_complete=evaluation_complete,
+            pending=pending,
+            max_evaluation_attempts=max_attempts,
+            retry_backoff=retry_backoff or timedelta(seconds=30),
+            clock=clock,
+            dead_letters=dead_letters,
+        )
+        return worker, batch, dead_letters
+
+    def test_restart_recovers_acknowledged_event_without_redelivery(
+        self,
+    ) -> None:
+        body = json.loads(event_json())
+        event_id = body["payload"]["event_id"]
+        now = [T0]
+        pending = InMemoryPendingEvaluationStore()
+        ingestion = make_ingestion()
+        evaluated: list[FraudEventEnvelope] = []
+        calls = {"n": 0}
+
+        def flaky(envelope: FraudEventEnvelope) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("decision store down")
+            evaluated.append(envelope)
+
+        # Delivery 1: ingest accepted, evaluation fails, offset commits.
+        worker1, batch1, dead_letters = self._workers(
+            pending,
+            ingestion,
+            flaky,
+            clock=lambda: now[0],
+            records=[FakeRecord(json.dumps(body).encode(), 0)],
+        )
+        worker1.run_once(max_events=1)
+        assert batch1.commits == 1
+        assert evaluated == []
+        assert dead_letters.records == ()
+        record = pending.due(now[0] + timedelta(days=1))[0]
+        assert record.attempts == 1
+
+        # Ordinary restart: fresh worker, EMPTY consumer — nothing
+        # redelivered. Backoff elapsed; reconcile completes the event.
+        now[0] += timedelta(seconds=31)
+        worker2, batch2, _ = self._workers(
+            pending, ingestion, flaky, clock=lambda: now[0]
+        )
+        worker2.run_once(max_events=1)
+
+        assert len(evaluated) == 1
+        assert str(evaluated[0].event_id) == event_id
+        assert pending.due(now[0] + timedelta(days=1)) == ()
+        assert batch2.commits == 0  # nothing to acknowledge
+        assert calls["n"] == 2
+
+    def test_retry_backoff_defers_retry(self) -> None:
+        body = json.loads(event_json())
+        now = [T0]
+        pending = InMemoryPendingEvaluationStore()
+        calls = {"n": 0}
+
+        def always_fails(envelope: FraudEventEnvelope) -> None:
+            calls["n"] += 1
+            raise RuntimeError("still down")
+
+        worker1, _, _ = self._workers(
+            pending,
+            make_ingestion(),
+            always_fails,
+            clock=lambda: now[0],
+            records=[FakeRecord(json.dumps(body).encode(), 0)],
+        )
+        worker1.run_once(max_events=1)
+        assert calls["n"] == 1
+
+        # Restart before backoff elapses: ledger exists but is not due.
+        worker2, _, _ = self._workers(
+            pending,
+            make_ingestion(),
+            always_fails,
+            clock=lambda: now[0],
+        )
+        worker2.run_once(max_events=1)
+        assert calls["n"] == 1
+
+        now[0] += timedelta(seconds=31)
+        worker3, _, _ = self._workers(
+            pending,
+            make_ingestion(),
+            always_fails,
+            clock=lambda: now[0],
+        )
+        worker3.run_once(max_events=1)
+        assert calls["n"] == 2
+
+    def test_terminal_failure_dead_letters_after_max_attempts(self) -> None:
+        body = json.loads(event_json())
+        now = [T0]
+        pending = InMemoryPendingEvaluationStore()
+
+        def always_fails(envelope: FraudEventEnvelope) -> None:
+            raise RuntimeError("down")
+
+        # attempt 1 on delivery
+        worker1, _, dead1 = self._workers(
+            pending,
+            make_ingestion(),
+            always_fails,
+            clock=lambda: now[0],
+            max_attempts=2,
+            records=[FakeRecord(json.dumps(body).encode(), 0)],
+        )
+        worker1.run_once(max_events=1)
+        assert dead1.records == ()
+
+        now[0] += timedelta(seconds=31)
+        # attempt 2 after restart → terminal: DLQ + ledger cleared
+        worker2, _, dead2 = self._workers(
+            pending,
+            make_ingestion(),
+            always_fails,
+            clock=lambda: now[0],
+            max_attempts=2,
+        )
+        worker2.run_once(max_events=1)
+        assert len(dead2.records) == 1
+        assert dead2.records[0].reason == RejectionReason.EVALUATION_FAILURE
+        assert "after 2 attempts" in dead2.records[0].detail
+        assert pending.due(now[0] + timedelta(days=1)) == ()
+
+    def test_missing_policy_dead_letters_immediately(self) -> None:
+        body = json.loads(event_json())
+        pending = InMemoryPendingEvaluationStore()
+
+        def no_policy(envelope: FraudEventEnvelope) -> None:
+            raise MissingTenantPolicyError("no policy")
+
+        worker, _, dead = self._workers(
+            pending,
+            make_ingestion(),
+            no_policy,
+            clock=lambda: T0,
+            records=[FakeRecord(json.dumps(body).encode(), 0)],
+        )
+        worker.run_once(max_events=1)
+        assert len(dead.records) == 1
+        assert dead.records[0].reason == (
+            RejectionReason.TENANT_CONFIGURATION_UNAVAILABLE
+        )
+        assert pending.due(T0 + timedelta(days=1)) == ()
+
+    def test_stale_pending_completed_without_evaluation(self) -> None:
+        # Evaluation was durably persisted before the crash but the
+        # ledger entry survived — reconcile closes it without re-eval.
+        body = json.loads(event_json())
+        pending = InMemoryPendingEvaluationStore()
+        ingestion = make_ingestion()
+
+        completed: set[tuple[str, object]] = set()
+
+        def capture(envelope: FraudEventEnvelope) -> None:
+            completed.add((envelope.tenant_id, envelope.event_id))
+
+        worker1, _, _ = self._workers(
+            pending,
+            ingestion,
+            capture,
+            evaluation_complete=lambda t, e: (t, e) in completed,
+            clock=lambda: T0,
+            records=[FakeRecord(json.dumps(body).encode(), 0)],
+        )
+        worker1.run_once(max_events=1)
+        assert pending.due(T0 + timedelta(days=1)) == ()
+        assert len(completed) == 1
+
+        # Simulate a ledger row that outlived a crash before complete().
+        ingestion2 = make_ingestion()
+        env = ReferenceJsonAdapter().adapt(
+            InboundBankEvent.model_validate(body)
+        )
+        pending.enqueue(env, enqueued_at=T0)
+        calls = {"n": 0}
+
+        def counted(envelope: FraudEventEnvelope) -> None:
+            calls["n"] += 1
+
+        worker2, _, _ = self._workers(
+            pending,
+            ingestion2,
+            counted,
+            evaluation_complete=lambda t, e: True,
+            clock=lambda: T0,
+        )
+        worker2.run_once(max_events=1)
+        assert calls["n"] == 0
+        assert pending.due(T0 + timedelta(days=1)) == ()
 
 
 class TestKafkaToDecisionEndToEnd:
