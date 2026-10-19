@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
 from typing import Self
 from uuid import uuid4
 
 from gasha.domain.models import DecisionAction, DecisionPolicy, OperatingMode
 from gasha.ingestion.contracts import FraudEventEnvelope, InboundBankEvent
-from gasha.ingestion.postgres_evaluations import (
-    PostgresShadowEvaluationRepository,
+from gasha.ingestion.postgres_store import (
+    PostgresPendingEvaluationStore,
 )
 from gasha.ingestion.reference import ReferenceJsonAdapter
 from gasha.ingestion.service import (
@@ -17,6 +18,9 @@ from gasha.ingestion.service import (
 from gasha.ingestion.transport import EventBatch
 from gasha.ingestion.worker import IngestionWorker
 from gasha.orchestration import ShadowOrchestrator
+from gasha.postgres_evaluations import (
+    PostgresShadowEvaluationRepository,
+)
 
 T0 = datetime(2026, 2, 12, 9, 0, 0, tzinfo=UTC)
 
@@ -42,9 +46,45 @@ class FakeCursor:
                 {"record_json": record_json, "persisted_at": persisted_at},
             )
             return
-        if normalized.startswith("SELECT record_json FROM shadow_evaluations WHERE"):
+        if normalized.startswith(
+            "SELECT record_json FROM shadow_evaluations WHERE"
+        ):
             key = (str(params[0]), str(params[1]))
             self.row = self.connection.rows.get(key)
+            return
+        if normalized.startswith("INSERT INTO pending_evaluations"):
+            tenant_id, event_id = params[0], params[1]
+            self.connection.pending_rows.setdefault(
+                (str(tenant_id), str(event_id)),
+                {"record_json": params[2]},
+            )
+            return
+        if normalized.startswith(
+            "SELECT record_json FROM pending_evaluations WHERE tenant_id"
+        ):
+            key = (str(params[0]), str(params[1]))
+            self.row = self.connection.pending_rows.get(key)
+            return
+        if normalized.startswith(
+            "SELECT record_json FROM pending_evaluations WHERE "
+            "next_attempt_at"
+        ):
+            self.rows_out = [
+                row
+                for row in self.connection.pending_rows.values()
+                if datetime.fromisoformat(
+                    json.loads(str(row["record_json"]))["next_attempt_at"]
+                )
+                <= params[0]
+            ][: params[1]]
+            return
+        if normalized.startswith("UPDATE pending_evaluations"):
+            key = (str(params[4]), str(params[5]))
+            self.connection.pending_rows[key] = {"record_json": params[0]}
+            return
+        if normalized.startswith("DELETE FROM pending_evaluations"):
+            key = (str(params[0]), str(params[1]))
+            self.connection.pending_rows.pop(key, None)
             return
         raise AssertionError(f"unexpected query: {normalized}")
 
@@ -64,6 +104,7 @@ class FakeCursor:
 class FakeConnection:
     def __init__(self) -> None:
         self.rows: dict[tuple[str, str], dict[str, object]] = {}
+        self.pending_rows: dict[tuple[str, str], dict[str, object]] = {}
         self.commits = 0
 
     def cursor(self) -> FakeCursor:
@@ -249,3 +290,109 @@ class TestWorkerRestartDurability:
         forced = env_b.model_copy(update={"event_id": env_a.event_id})
         orchestrator.evaluate(forced)
         assert repo.get("tenant-b", env_a.event_id) is not None
+
+
+class TestPostgresPendingEvaluationStore:
+    """Durable pending ledger: enqueue/due/reschedule/complete round-trip
+    and a cross-worker restart recovery through the same connection."""
+
+    def test_enqueue_due_reschedule_complete(self) -> None:
+        connection = FakeConnection()
+        store = PostgresPendingEvaluationStore(connection)
+        env = envelope()
+
+        record = store.enqueue(env, enqueued_at=T0)
+        assert record.attempts == 0
+        assert store.due(T0) == (record,)
+
+        updated = store.reschedule(
+            env.tenant_id,
+            env.event_id,
+            error="RuntimeError",
+            next_attempt_at=T0 + timedelta(seconds=30),
+        )
+        assert updated.attempts == 1
+        assert updated.last_error == "RuntimeError"
+        assert store.due(T0) == ()
+        assert len(store.due(T0 + timedelta(seconds=31))) == 1
+
+        store.complete(env.tenant_id, env.event_id)
+        assert store.due(T0 + timedelta(days=1)) == ()
+
+    def test_enqueue_is_idempotent(self) -> None:
+        connection = FakeConnection()
+        store = PostgresPendingEvaluationStore(connection)
+        env = envelope()
+        first = store.enqueue(env, enqueued_at=T0)
+        store.reschedule(
+            env.tenant_id,
+            env.event_id,
+            error="x",
+            next_attempt_at=T0 + timedelta(seconds=30),
+        )
+        again = store.enqueue(env, enqueued_at=T0 + timedelta(hours=1))
+        assert again.attempts == 1  # first row wins, attempts preserved
+        assert again.enqueued_at == first.enqueued_at
+
+    def test_restart_recovery_end_to_end(self) -> None:
+        """Committed offset -> restart (new worker objects, same
+        Postgres stores, empty consumer) -> exactly one durable
+        evaluation."""
+        connection = FakeConnection()
+        pending = PostgresPendingEvaluationStore(connection)
+        repo = PostgresShadowEvaluationRepository(connection)
+        ingestion = IngestionService(
+            {"synthetic-core-banking": ReferenceJsonAdapter()}
+        )
+        env = envelope()
+        event = inbound_for(env)
+        dead_letters = InMemoryDeadLetterSink()
+        calls = {"n": 0}
+
+        orchestrator = ShadowOrchestrator(
+            {"tenant-a": POLICY}, evaluations=repo
+        )
+
+        def flaky(envelope_arg: FraudEventEnvelope) -> object:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("decision store down")
+            return orchestrator.evaluate(envelope_arg)
+
+        consumer1 = _StubConsumer([[event]])
+        worker1 = IngestionWorker(
+            consumer1,
+            ingestion,
+            evaluate=flaky,
+            evaluation_complete=lambda t, e: repo.get(t, e) is not None,
+            pending=pending,
+            retry_backoff=timedelta(seconds=0),
+            dead_letters=dead_letters,
+        )
+        worker1.run_once(max_events=1)
+        assert consumer1.commits == 1
+        assert repo.get(env.tenant_id, env.event_id) is None
+
+        # Restart: new worker over the same Postgres stores, no
+        # redelivery — reconcile produces the single durable evaluation.
+        consumer2 = _StubConsumer([])
+        worker2 = IngestionWorker(
+            consumer2,
+            ingestion,
+            evaluate=orchestrator.evaluate,
+            evaluation_complete=lambda t, e: repo.get(t, e) is not None,
+            pending=pending,
+            retry_backoff=timedelta(seconds=0),
+            dead_letters=dead_letters,
+        )
+        worker2.run_once(max_events=1)
+
+        persisted = repo.get(env.tenant_id, env.event_id)
+        assert persisted is not None
+        assert persisted.evaluation.decision.rule_version == "rules-1"
+        assert pending.due(datetime.now(UTC) + timedelta(days=1)) == ()
+        assert calls["n"] == 1
+
+        # Reconcile again: nothing left, still exactly one row.
+        worker2.run_once(max_events=1)
+        assert len(connection.rows) == 1

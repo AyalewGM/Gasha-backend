@@ -6,6 +6,7 @@ import pytest
 
 from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.kafka_confluent import ConfluentKafkaConsumer
+from gasha.ingestion.pending import InMemoryPendingEvaluationStore
 from gasha.ingestion.postgres_store import PostgresIngestionStore
 from gasha.ingestion.service import (
     InMemoryDeadLetterSink,
@@ -104,9 +105,12 @@ class TestBuildAdapters:
 
 class TestBuildStores:
     def test_in_memory_when_no_dsn(self) -> None:
-        ingestion, dead_letters, _, _ = build_stores(WorkerSettings())
+        ingestion, dead_letters, _, _, pending = build_stores(
+            WorkerSettings()
+        )
         assert isinstance(ingestion, InMemoryIngestionStore)
         assert isinstance(dead_letters, InMemoryDeadLetterSink)
+        assert isinstance(pending, InMemoryPendingEvaluationStore)
 
 
 class _FakeError:
@@ -127,6 +131,9 @@ class _FakeMessage:
 
     def topic(self) -> str:
         return "gasha.fraud-events"
+
+    def partition(self) -> int:
+        return 0
 
     def offset(self) -> int:
         return 7

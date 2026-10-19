@@ -17,12 +17,14 @@ from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.adapter import BankEventAdapter
 from gasha.ingestion.kafka_confluent import ConfluentKafkaConsumer
 from gasha.ingestion.kafka_json import JsonEventConsumer
-from gasha.ingestion.postgres_evaluations import (
-    PostgresShadowEvaluationRepository,
+from gasha.ingestion.pending import (
+    InMemoryPendingEvaluationStore,
+    PendingEvaluationStore,
 )
 from gasha.ingestion.postgres_store import (
     PostgresDeadLetterSink,
     PostgresIngestionStore,
+    PostgresPendingEvaluationStore,
 )
 from gasha.ingestion.reference import ReferenceJsonAdapter
 from gasha.ingestion.service import (
@@ -40,6 +42,9 @@ from gasha.orchestration import (
     ShadowOrchestrator,
 )
 from gasha.postgres import Connection
+from gasha.postgres_evaluations import (
+    PostgresShadowEvaluationRepository,
+)
 
 logger = logging.getLogger("gasha.worker")
 
@@ -97,6 +102,7 @@ def build_stores(
     DeadLetterSink,
     DecisionAuditRepository,
     ShadowEvaluationRepository,
+    PendingEvaluationStore,
 ]:
     """Durable stores when a DSN is configured, in-memory otherwise."""
     if settings.postgres_dsn is None:
@@ -109,6 +115,7 @@ def build_stores(
             InMemoryDeadLetterSink(),
             InMemoryDecisionAuditRepository(),
             InMemoryShadowEvaluationRepository(),
+            InMemoryPendingEvaluationStore(),
         )
 
     connection = _postgres_connection(settings.postgres_dsn)
@@ -117,6 +124,7 @@ def build_stores(
         PostgresDeadLetterSink(connection),
         PostgresDecisionAuditRepository(connection),
         PostgresShadowEvaluationRepository(connection),
+        PostgresPendingEvaluationStore(connection),
     )
 
 
@@ -139,7 +147,13 @@ def build_worker(
     settings: WorkerSettings,
 ) -> tuple[IngestionWorker, ConfluentKafkaConsumer]:
     metrics = InMemoryMetricsRegistry()
-    ingestion_store, dead_letters, audit, evaluations = build_stores(settings)
+    (
+        ingestion_store,
+        dead_letters,
+        audit,
+        evaluations,
+        pending,
+    ) = build_stores(settings)
     ingestion = IngestionService(
         build_adapters(settings),
         store=ingestion_store,
@@ -165,6 +179,7 @@ def build_worker(
         evaluation_complete=lambda tenant_id, event_id: (
             evaluations.get(tenant_id, event_id) is not None
         ),
+        pending=pending,
         dead_letters=dead_letters,
         metrics=metrics,
     )
