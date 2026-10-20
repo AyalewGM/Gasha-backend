@@ -31,3 +31,72 @@ jobs:
           tags: gasha-backend:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  postgres-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gasha_test
+          POSTGRES_PASSWORD: synthetic_ci_only
+          POSTGRES_DB: gasha_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gasha_test -d gasha_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      GASHA_TEST_POSTGRES_DSN: postgresql://gasha_test:synthetic_ci_only@localhost:5432/gasha_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e ".[dev,postgres]"
+      - name: Record PostgreSQL version
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+          with psycopg.connect(os.environ["GASHA_TEST_POSTGRES_DSN"]) as connection:
+              version = connection.execute("SHOW server_version_num").fetchone()[0]
+              assert 160000 <= int(version) < 170000, version
+              print("PostgreSQL server_version_num:", version)
+          PY
+      - name: Run PostgreSQL tests with failure and performance evidence
+        shell: bash
+        run: |
+          mkdir -p test-results
+          pytest -vv -rA --capture=tee-sys --junitxml=test-results/postgres.xml tests/test_postgres*.py 2>&1 | tee test-results/postgres.log
+      - name: Require executed tests and zero skips
+        if: always()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from xml.etree import ElementTree
+          report = Path("test-results/postgres.xml")
+          assert report.is_file(), "PostgreSQL test report missing"
+          root = ElementTree.parse(report).getroot()
+          cases = list(root.iter("testcase"))
+          skipped = list(root.iter("skipped"))
+          failures = list(root.iter("failure")) + list(root.iter("error"))
+          print(f"PostgreSQL evidence: {len(cases)} tests, {len(skipped)} skips, {len(failures)} failures/errors")
+          assert cases, "No PostgreSQL tests executed"
+          assert not skipped, "PostgreSQL verification must have zero skips"
+          assert not failures, "PostgreSQL verification contains failures/errors"
+          PY
+      - name: Preserve PostgreSQL evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-evidence
+          path: test-results/
+          if-no-files-found: error
