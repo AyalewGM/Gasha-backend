@@ -23,6 +23,7 @@ class RejectionReason(StrEnum):
     DUPLICATE_CONFLICT = "duplicate_conflict"
     ADAPTER_FAILURE = "adapter_failure"
     NORMALIZATION_FAILURE = "normalization_failure"
+    EVALUATION_FAILURE = "evaluation_failure"
 
 
 def payload_fingerprint(payload: Mapping[str, Any]) -> str:
@@ -47,6 +48,10 @@ class RejectionRecord(BaseModel):
     schema_version: str | None = None
     adapter_version: str | None = None
     payload_fingerprint: str | None = None
+    # Transport coordinates for replay evidence (Kafka topic/partition/offset).
+    topic: str | None = None
+    partition: int | None = None
+    offset: int | None = None
     rejected_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
