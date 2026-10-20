@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import os
+import socket
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import UUID
 
+from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.contracts import FraudEventEnvelope, InboundBankEvent
 from gasha.ingestion.errors import RejectionReason, RejectionRecord
-from gasha.ingestion.pending import PendingEvaluationStore
+from gasha.ingestion.lease import (
+    EvaluationLease,
+    LeaseLostError,
+    current_evaluation_lease,
+)
+from gasha.ingestion.pending import (
+    PendingEvaluationRecord,
+    PendingEvaluationStore,
+)
 from gasha.ingestion.service import (
     DeadLetterSink,
     IngestionOutcome,
@@ -16,6 +27,7 @@ from gasha.ingestion.service import (
 from gasha.ingestion.transport import EventBatch
 from gasha.observability.metrics import MetricsRegistry
 from gasha.poc.historical import MissingTenantPolicyError
+from gasha.tenant_scope import require_tenant
 
 
 class CommittableEventConsumer(Protocol):
@@ -60,25 +72,36 @@ class IngestionWorker:
         consumer: CommittableEventConsumer,
         ingestion: IngestionService,
         *,
-        evaluate: Callable[[FraudEventEnvelope], object] | None = None,
+        evaluate: (
+            Callable[[FraudEventEnvelope, DecisionPolicy | None], object]
+            | None
+        ) = None,
         evaluation_complete: Callable[[str, UUID], bool] | None = None,
+        policy_for: Callable[[str], DecisionPolicy | None] | None = None,
         pending: PendingEvaluationStore | None = None,
         max_evaluation_attempts: int = 3,
         retry_backoff: timedelta = timedelta(seconds=30),
         clock: Callable[[], datetime] | None = None,
         dead_letters: DeadLetterSink | None = None,
         metrics: MetricsRegistry | None = None,
+        worker_id: str | None = None,
+        tenant_ids: tuple[str, ...] | None = None,
     ) -> None:
+        self._tenant_ids = tenant_ids
         self._consumer = consumer
         self._ingestion = ingestion
         self._evaluate = evaluate
         self._evaluation_complete = evaluation_complete
+        self._policy_for = policy_for
         self._pending = pending
         self._max_evaluation_attempts = max_evaluation_attempts
         self._retry_backoff = retry_backoff
         self._clock = clock or (lambda: datetime.now(UTC))
         self._dead_letters = dead_letters or ingestion.dead_letter_sink
         self._metrics = metrics
+        self._worker_id = worker_id or (
+            f"{socket.gethostname()}-{os.getpid()}"
+        )
 
     def run_once(self, *, max_events: int = 1) -> int:
         """Reconciles due pending evaluations, then processes and
@@ -96,18 +119,24 @@ class IngestionWorker:
             return
         for record in self._pending.due(self._clock()):
             envelope = record.event
+            require_tenant(envelope.tenant_id, self._tenant_ids)
             if self._evaluation_complete is not None and self._already_evaluated(
                 envelope
             ):
                 # Evaluation completed durably before the crash; the
                 # ledger entry is stale — close it out.
                 self._pending.complete(
-                    envelope.tenant_id, envelope.event_id
+                    envelope.tenant_id,
+                    envelope.event_id,
+                    owner=self._worker_id,
+                    claim_token=record.claim_token,
+                    now=self._clock(),
                 )
                 continue
-            self._evaluate_pending(envelope)
+            self._evaluate_pending(envelope, record)
 
     def _process(self, event: InboundBankEvent) -> None:
+        require_tenant(event.tenant_id, self._tenant_ids)
         result = self._ingestion.ingest(event)
         envelope = result.envelope
         if envelope is None or self._evaluate is None:
@@ -119,58 +148,116 @@ class IngestionWorker:
         ):
             return
         if self._pending is not None:
-            self._pending.enqueue(envelope, enqueued_at=self._clock())
-            self._evaluate_pending(envelope)
+            record = self._pending.enqueue(
+                envelope,
+                enqueued_at=self._clock(),
+                policy=self._pinned_policy(envelope),
+            )
+            now = self._clock()
+            if (record.next_attempt_at <= now
+                and record.leased_by == self._worker_id
+                and record.leased_until is not None
+                and record.leased_until > now):
+                # Fresh (or already-due) record owned by this worker.
+                # A redelivery during backoff, or a record leased to
+                # another worker, is re-acked untouched — the stored
+                # attempt schedule is preserved regardless of transport
+                # redelivery.
+                self._evaluate_pending(envelope, record)
             return
         self._evaluate_event(self._evaluate, envelope, event)
 
-    def _evaluate_pending(self, envelope: FraudEventEnvelope) -> None:
+    def _pinned_policy(
+        self, envelope: FraudEventEnvelope
+    ) -> DecisionPolicy | None:
+        if self._policy_for is None:
+            return None
+        return self._policy_for(envelope.tenant_id)
+
+    def _evaluate_pending(
+        self,
+        envelope: FraudEventEnvelope,
+        record: PendingEvaluationRecord,
+    ) -> None:
         assert self._evaluate is not None
+        if (not record.claim_token or record.leased_until is None
+            or record.leased_until <= self._clock()):
+            return
+        context_token = current_evaluation_lease.set(
+            EvaluationLease(envelope.tenant_id, envelope.event_id, record.claim_token)
+        )
         try:
-            self._evaluate(envelope)
+            self._evaluate(envelope, record.policy)
+        except LeaseLostError:
+            return
         except MissingTenantPolicyError:
-            self._dead_letter(
-                envelope,
-                None,
+            self._terminal_failure(
+                record,
                 RejectionReason.TENANT_CONFIGURATION_UNAVAILABLE,
                 f"no decision policy registered for tenant "
                 f"{envelope.tenant_id!r}",
             )
-            self._pending_complete(envelope)
             return
         except Exception as exc:  # noqa: BLE001 - fail closed, retry later
-            self._evaluation_failed(envelope, exc)
+            self._evaluation_failed(envelope, record, exc)
             return
-        self._pending_complete(envelope)
+        finally:
+            current_evaluation_lease.reset(context_token)
+        self._pending_complete(envelope, record)
 
     def _evaluation_failed(
-        self, envelope: FraudEventEnvelope, exc: Exception
+        self, envelope: FraudEventEnvelope, claim: PendingEvaluationRecord, exc: Exception
     ) -> None:
         assert self._pending is not None
+        if claim.leased_until is None or claim.leased_until <= self._clock():
+            return
+        if claim.attempts + 1 >= self._max_evaluation_attempts:
+            self._terminal_failure(
+                claim, RejectionReason.EVALUATION_FAILURE,
+                f"evaluation failed after {claim.attempts + 1} attempts: {type(exc).__name__}",
+            )
+            return
         record = self._pending.reschedule(
-            envelope.tenant_id,
-            envelope.event_id,
+            envelope.tenant_id, envelope.event_id,
             error=type(exc).__name__,
             next_attempt_at=self._clock() + self._retry_backoff,
+            owner=self._worker_id, claim_token=claim.claim_token, now=self._clock(),
         )
-        if self._metrics is not None:
+        if record is not None and self._metrics is not None:
             self._metrics.increment(
-                "gasha_worker_evaluation_retries",
-                labels={"tenant_id": envelope.tenant_id},
+                "gasha_worker_evaluation_retries", labels={"tenant_id": envelope.tenant_id},
             )
-        if record.attempts >= self._max_evaluation_attempts:
-            self._dead_letter(
-                envelope,
-                None,
-                RejectionReason.EVALUATION_FAILURE,
-                f"evaluation failed after {record.attempts} attempts: "
-                f"{type(exc).__name__}",
-            )
-            self._pending_complete(envelope)
 
-    def _pending_complete(self, envelope: FraudEventEnvelope) -> None:
+    def _terminal_failure(
+        self, record: PendingEvaluationRecord, reason: RejectionReason, detail: str,
+    ) -> None:
+        assert self._pending is not None
+        envelope, policy = record.event, record.policy
+        rejection = RejectionRecord(
+            tenant_id=envelope.tenant_id, event_id=str(envelope.event_id),
+            reason=reason, detail=detail,
+            source_system=envelope.adapter.source_system,
+            schema_version=envelope.adapter.schema_version,
+            configuration_version=policy.configuration_version if policy else None,
+            policy_version=policy.policy_version if policy else None,
+            rule_version=policy.rule_version if policy else None,
+        )
+        self._pending.terminate(
+            record, rejection, dead_letters=self._dead_letters,
+            owner=self._worker_id, now=self._clock(),
+        )
+
+    def _pending_complete(
+        self, envelope: FraudEventEnvelope, record: PendingEvaluationRecord
+    ) -> None:
         if self._pending is not None:
-            self._pending.complete(envelope.tenant_id, envelope.event_id)
+            self._pending.complete(
+                envelope.tenant_id,
+                envelope.event_id,
+                owner=self._worker_id,
+                claim_token=record.claim_token,
+                now=self._clock(),
+            )
 
     def _already_evaluated(self, envelope: FraudEventEnvelope) -> bool:
         if self._evaluation_complete is None:
@@ -183,12 +270,14 @@ class IngestionWorker:
 
     def _evaluate_event(
         self,
-        evaluate: Callable[[FraudEventEnvelope], object],
+        evaluate: Callable[
+            [FraudEventEnvelope, DecisionPolicy | None], object
+        ],
         envelope: FraudEventEnvelope,
         event: InboundBankEvent,
     ) -> None:
         try:
-            evaluate(envelope)
+            evaluate(envelope, None)
         except MissingTenantPolicyError:
             self._dead_letter(
                 envelope,
@@ -238,3 +327,4 @@ class IngestionWorker:
                     "reason": reason.value,
                 },
             )
+

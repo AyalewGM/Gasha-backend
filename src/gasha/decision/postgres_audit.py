@@ -8,6 +8,7 @@ from uuid import UUID
 from gasha.decision.audit import DecisionAuditRecord
 from gasha.domain.models import FraudDecision
 from gasha.intelligence.provenance import IntelligenceEvidence
+from gasha.tenant_scope import require_tenant
 
 
 class Cursor(Protocol):
@@ -25,10 +26,14 @@ class Connection(Protocol):
 class PostgresDecisionAuditRepository:
     """PostgreSQL adapter for tenant/event idempotent decision audit records."""
 
-    def __init__(self, connection: Connection) -> None:
+    def __init__(
+        self, connection: Connection, *, tenant_ids: tuple[str, ...] | None = None
+    ) -> None:
+        self._tenant_ids = tenant_ids
         self.connection = connection
 
     def get(self, tenant_id: str, event_id: UUID) -> DecisionAuditRecord | None:
+        require_tenant(tenant_id, self._tenant_ids)
         with self.connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -45,6 +50,7 @@ class PostgresDecisionAuditRepository:
 
     def save(self, record: DecisionAuditRecord) -> DecisionAuditRecord:
         decision = record.decision
+        require_tenant(decision.tenant_id, self._tenant_ids)
         with self.connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -95,3 +101,4 @@ class PostgresDecisionAuditRepository:
                 IntelligenceEvidence.model_validate(item) for item in evidence_items
             ),
         )
+

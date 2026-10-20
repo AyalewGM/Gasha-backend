@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-from datetime import datetime
+import os
+import socket
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel
 
+from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.contracts import FraudEventEnvelope
+from gasha.ingestion.errors import RejectionRecord
+from gasha.ingestion.service import DeadLetterSink
+from gasha.tenant_scope import require_tenant
 
 
 class PendingEvaluationRecord(BaseModel):
@@ -18,16 +24,30 @@ class PendingEvaluationRecord(BaseModel):
     preserves the original canonical transaction plus adapter/schema and
     policy version provenance; retries evaluate exactly this envelope.
 
+    ``policy`` pins the tenant's ``DecisionPolicy`` snapshot taken at
+    enqueue time: every retry re-decides under the same immutable
+    policy/config/rule versions, so a tenant policy change mid-retry can
+    never produce audit and evaluation records that disagree.
+
     ``attempts``/``next_attempt_at`` implement bounded retries: each
     failure reschedules the record, and the worker dead-letters it once
     ``attempts`` reaches the configured maximum.
+
+    ``leased_by``/``leased_until`` implement multi-worker work
+    ownership: a due record is claimed atomically by one worker for the
+    lease window; other workers skip it until the lease expires.
     """
 
+    terminal: bool = False
     event: FraudEventEnvelope
+    policy: DecisionPolicy | None = None
     attempts: int = 0
     enqueued_at: datetime
     next_attempt_at: datetime
     last_error: str | None = None
+    claim_token: str | None = None
+    leased_by: str | None = None
+    leased_until: datetime | None = None
 
 
 class PendingEvaluationStore(Protocol):
@@ -36,10 +56,26 @@ class PendingEvaluationStore(Protocol):
     Implementations must persist across process restarts for recovery
     guarantees to hold; the in-memory store is the reference/dev
     implementation.
+
+    ``due`` is a claim, not a read: each returned record is atomically
+    leased to the calling worker for the store's lease window, so two
+    workers reconciling concurrently cannot evaluate the same event.
+    ``reschedule``/``complete`` are conditional on that ownership — a
+    worker that does not hold the lease leaves the row untouched and
+    gets ``None``/a no-op.
     """
 
+    def terminate(
+        self, record: PendingEvaluationRecord, rejection: RejectionRecord, *,
+        dead_letters: DeadLetterSink, owner: str, now: datetime,
+    ) -> bool: ...
+
     def enqueue(
-        self, event: FraudEventEnvelope, *, enqueued_at: datetime
+        self,
+        event: FraudEventEnvelope,
+        *,
+        enqueued_at: datetime,
+        policy: DecisionPolicy | None = None,
     ) -> PendingEvaluationRecord: ...
 
     def due(
@@ -53,29 +89,65 @@ class PendingEvaluationStore(Protocol):
         *,
         error: str,
         next_attempt_at: datetime,
-    ) -> PendingEvaluationRecord: ...
+        owner: str | None = None,
+        claim_token: str | None = None,
+        now: datetime | None = None,
+    ) -> PendingEvaluationRecord | None: ...
 
-    def complete(self, tenant_id: str, event_id: UUID) -> None: ...
+    def complete(
+        self,
+        tenant_id: str,
+        event_id: UUID,
+        *,
+        owner: str | None = None,
+        claim_token: str | None = None,
+        now: datetime | None = None,
+    ) -> None: ...
 
 
 class InMemoryPendingEvaluationStore:
     """Reference implementation; see ``PostgresPendingEvaluationStore``
-    for the durable production binding."""
+    for the durable production binding.
 
-    def __init__(self) -> None:
+    ``tenant_ids`` is the worker's authorized tenant scope (``None`` =
+    unrestricted dev mode); ``worker_id``/``lease_ttl`` give ``due``
+    the same claim semantics as the Postgres store.
+    """
+
+    def __init__(
+        self,
+        *,
+        tenant_ids: tuple[str, ...] | None = None,
+        worker_id: str | None = None,
+        lease_ttl: timedelta = timedelta(minutes=5),
+    ) -> None:
         self._records: dict[tuple[str, UUID], PendingEvaluationRecord] = {}
+        self._tenant_ids = tenant_ids
+        self._worker_id = worker_id or (
+            f"{socket.gethostname()}-{os.getpid()}"
+        )
+        self._lease_ttl = lease_ttl
 
     def enqueue(
-        self, event: FraudEventEnvelope, *, enqueued_at: datetime
+        self,
+        event: FraudEventEnvelope,
+        *,
+        enqueued_at: datetime,
+        policy: DecisionPolicy | None = None,
     ) -> PendingEvaluationRecord:
+        require_tenant(event.tenant_id, self._tenant_ids)
         key = (event.tenant_id, event.event_id)
         existing = self._records.get(key)
         if existing is not None:
             return existing
         record = PendingEvaluationRecord(
             event=event,
+            policy=policy,
             enqueued_at=enqueued_at,
             next_attempt_at=enqueued_at,
+            claim_token=str(uuid4()),
+            leased_by=self._worker_id,
+            leased_until=enqueued_at + self._lease_ttl,
         )
         self._records[key] = record
         return record
@@ -83,13 +155,34 @@ class InMemoryPendingEvaluationStore:
     def due(
         self, now: datetime, *, limit: int = 100
     ) -> tuple[PendingEvaluationRecord, ...]:
-        due = [
-            record
-            for record in self._records.values()
-            if record.next_attempt_at <= now
-        ]
-        due.sort(key=lambda record: record.enqueued_at)
-        return tuple(due[:limit])
+        claimed: list[PendingEvaluationRecord] = []
+        for key, record in self._records.items():
+            if len(claimed) >= limit:
+                break
+            if record.terminal or record.next_attempt_at > now:
+                continue
+            if (
+                self._tenant_ids is not None
+                and key[0] not in self._tenant_ids
+            ):
+                continue
+            if (
+                record.leased_until is not None
+                and record.leased_until > now
+            ):
+                continue
+            claimed.append(
+                record.model_copy(
+                    update={
+                        "claim_token": str(uuid4()),
+                        "leased_by": self._worker_id,
+                        "leased_until": now + self._lease_ttl,
+                    }
+                )
+            )
+            self._records[key] = claimed[-1]
+        claimed.sort(key=lambda record: record.enqueued_at)
+        return tuple(claimed)
 
     def reschedule(
         self,
@@ -98,23 +191,71 @@ class InMemoryPendingEvaluationStore:
         *,
         error: str,
         next_attempt_at: datetime,
-    ) -> PendingEvaluationRecord:
+        owner: str | None = None,
+        claim_token: str | None = None,
+        now: datetime | None = None,
+    ) -> PendingEvaluationRecord | None:
+        require_tenant(tenant_id, self._tenant_ids)
         key = (tenant_id, event_id)
         record = self._records.get(key)
         if record is None:
-            raise KeyError(
-                f"no pending evaluation for tenant {tenant_id!r} "
-                f"event {event_id}"
-            )
+            return None
+        if (not claim_token or record.claim_token != claim_token
+            or record.leased_by != owner
+            or record.leased_until is None
+            or record.leased_until <= (now or datetime.now(UTC))):
+            return None
         updated = record.model_copy(
             update={
                 "attempts": record.attempts + 1,
                 "next_attempt_at": next_attempt_at,
                 "last_error": error,
+                "leased_by": None,
+                "leased_until": None,
+                "claim_token": None,
             }
         )
         self._records[key] = updated
         return updated
 
-    def complete(self, tenant_id: str, event_id: UUID) -> None:
+    def complete(
+        self,
+        tenant_id: str,
+        event_id: UUID,
+        *,
+        owner: str | None = None,
+        claim_token: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        require_tenant(tenant_id, self._tenant_ids)
+        record = self._records.get((tenant_id, event_id))
+        if (
+            record is not None
+            and (not claim_token or record.claim_token != claim_token
+                 or record.leased_by != owner
+                 or record.leased_until is None
+                 or record.leased_until <= (now or datetime.now(UTC)))
+        ):
+            return
         self._records.pop((tenant_id, event_id), None)
+
+
+    def terminate(
+        self, record: PendingEvaluationRecord, rejection: RejectionRecord, *,
+        dead_letters: DeadLetterSink, owner: str, now: datetime,
+    ) -> bool:
+        tenant_id, event_id = record.event.tenant_id, record.event.event_id
+        require_tenant(tenant_id, self._tenant_ids)
+        current = self._records.get((tenant_id, event_id))
+        if (current is None or current.terminal or not record.claim_token
+            or current.claim_token != record.claim_token or current.leased_by != owner
+            or current.leased_until is None or current.leased_until <= now):
+            return False
+        if (rejection.tenant_id, rejection.event_id) != (tenant_id, str(event_id)):
+            raise ValueError("terminal rejection identity mismatch")
+        dead_letters.put(rejection)
+        self._records[(tenant_id, event_id)] = current.model_copy(update={
+            "terminal": True, "claim_token": None, "leased_by": None, "leased_until": None,
+            "attempts": current.attempts + 1,
+        })
+        return True

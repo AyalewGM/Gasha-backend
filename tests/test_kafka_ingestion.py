@@ -192,7 +192,7 @@ class TestIngestionWorker:
         consumer, batch_consumer, dead_letters = make_consumer(
             [FakeRecord(event_json(), 0)]
         )
-        worker = make_worker(consumer, dead_letters, evaluate=evaluated.append)
+        worker = make_worker(consumer, dead_letters, evaluate=lambda e, p=None: evaluated.append(e))
 
         assert worker.run_once(max_events=10) == 1
         assert len(evaluated) == 1
@@ -209,7 +209,7 @@ class TestIngestionWorker:
         evaluated: list[FraudEventEnvelope] = []
         completed: set[tuple[str, object]] = set()
 
-        def evaluate(envelope: FraudEventEnvelope) -> None:
+        def evaluate(envelope: FraudEventEnvelope, policy: DecisionPolicy | None = None) -> None:
             evaluated.append(envelope)
             completed.add((envelope.tenant_id, envelope.event_id))
 
@@ -253,7 +253,7 @@ class TestIngestionWorker:
         assert [r.offset for r in dead_letters.records] == [10, 12]
 
     def test_missing_policy_is_dead_lettered_not_raised(self) -> None:
-        def evaluate(_: FraudEventEnvelope) -> None:
+        def evaluate(_: FraudEventEnvelope, policy: DecisionPolicy | None = None) -> None:
             raise MissingTenantPolicyError("no policy")
 
         consumer, _, dead_letters = make_consumer([FakeRecord(event_json(), 0)])
@@ -266,7 +266,7 @@ class TestIngestionWorker:
         )
 
     def test_unexpected_evaluation_error_is_dead_lettered(self) -> None:
-        def evaluate(_: FraudEventEnvelope) -> None:
+        def evaluate(_: FraudEventEnvelope, policy: DecisionPolicy | None = None) -> None:
             raise RuntimeError("db down")
 
         consumer, _, dead_letters = make_consumer([FakeRecord(event_json(), 0)])
@@ -303,7 +303,7 @@ class TestEvaluationRecovery:
         completed: set[tuple[str, object]] = set()
         attempts = {"n": 0}
 
-        def flaky_evaluate(envelope: FraudEventEnvelope) -> None:
+        def flaky_evaluate(envelope: FraudEventEnvelope, policy: DecisionPolicy | None = None) -> None:
             attempts["n"] += 1
             if attempts["n"] == 1:
                 raise RuntimeError("audit store unavailable")
@@ -401,7 +401,7 @@ class TestPendingEvaluationRecovery:
         evaluated: list[FraudEventEnvelope] = []
         calls = {"n": 0}
 
-        def flaky(envelope: FraudEventEnvelope) -> None:
+        def flaky(envelope: FraudEventEnvelope, policy: DecisionPolicy | None = None) -> None:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("decision store down")
@@ -419,7 +419,7 @@ class TestPendingEvaluationRecovery:
         assert batch1.commits == 1
         assert evaluated == []
         assert dead_letters.records == ()
-        record = pending.due(now[0] + timedelta(days=1))[0]
+        record = next(iter(pending._records.values()))
         assert record.attempts == 1
 
         # Ordinary restart: fresh worker, EMPTY consumer — nothing
@@ -442,7 +442,7 @@ class TestPendingEvaluationRecovery:
         pending = InMemoryPendingEvaluationStore()
         calls = {"n": 0}
 
-        def always_fails(envelope: FraudEventEnvelope) -> None:
+        def always_fails(envelope: FraudEventEnvelope, policy: DecisionPolicy | None = None) -> None:
             calls["n"] += 1
             raise RuntimeError("still down")
 
@@ -476,12 +476,69 @@ class TestPendingEvaluationRecovery:
         worker3.run_once(max_events=1)
         assert calls["n"] == 2
 
+    def test_redelivery_during_backoff_preserves_attempt_schedule(
+        self,
+    ) -> None:
+        """A Kafka duplicate arriving while the record backs off is
+        re-acked untouched: the stored next_attempt_at, not transport
+        redelivery, decides when the next attempt runs."""
+        body = json.loads(event_json())
+        payload = json.dumps(body).encode()
+        now = [T0]
+        pending = InMemoryPendingEvaluationStore()
+        calls = {"n": 0}
+
+        def always_fails(
+            envelope: FraudEventEnvelope,
+            policy: DecisionPolicy | None = None,
+        ) -> None:
+            calls["n"] += 1
+            raise RuntimeError("still down")
+
+        worker1, _, _ = self._workers(
+            pending,
+            make_ingestion(),
+            always_fails,
+            evaluation_complete=lambda t, e: False,
+            clock=lambda: now[0],
+            records=[FakeRecord(payload, 0)],
+        )
+        worker1.run_once(max_events=1)
+        assert calls["n"] == 1
+
+        # Duplicate redelivery before backoff elapses: the ledger row
+        # exists with a future next_attempt_at — re-ack, no retry.
+        worker2, batch2, _ = self._workers(
+            pending,
+            make_ingestion(),
+            always_fails,
+            evaluation_complete=lambda t, e: False,
+            clock=lambda: now[0],
+            records=[FakeRecord(payload, 1)],
+        )
+        worker2.run_once(max_events=1)
+        assert calls["n"] == 1
+        assert batch2.commits == 1
+
+        # Once the stored backoff elapses, the next redelivery retries.
+        now[0] += timedelta(seconds=31)
+        worker3, _, _ = self._workers(
+            pending,
+            make_ingestion(),
+            always_fails,
+            evaluation_complete=lambda t, e: False,
+            clock=lambda: now[0],
+            records=[FakeRecord(payload, 2)],
+        )
+        worker3.run_once(max_events=1)
+        assert calls["n"] == 2
+
     def test_terminal_failure_dead_letters_after_max_attempts(self) -> None:
         body = json.loads(event_json())
         now = [T0]
         pending = InMemoryPendingEvaluationStore()
 
-        def always_fails(envelope: FraudEventEnvelope) -> None:
+        def always_fails(envelope: FraudEventEnvelope, policy: DecisionPolicy | None = None) -> None:
             raise RuntimeError("down")
 
         # attempt 1 on delivery
@@ -515,7 +572,7 @@ class TestPendingEvaluationRecovery:
         body = json.loads(event_json())
         pending = InMemoryPendingEvaluationStore()
 
-        def no_policy(envelope: FraudEventEnvelope) -> None:
+        def no_policy(envelope: FraudEventEnvelope, policy: DecisionPolicy | None = None) -> None:
             raise MissingTenantPolicyError("no policy")
 
         worker, _, dead = self._workers(
@@ -541,7 +598,7 @@ class TestPendingEvaluationRecovery:
 
         completed: set[tuple[str, object]] = set()
 
-        def capture(envelope: FraudEventEnvelope) -> None:
+        def capture(envelope: FraudEventEnvelope, policy: DecisionPolicy | None = None) -> None:
             completed.add((envelope.tenant_id, envelope.event_id))
 
         worker1, _, _ = self._workers(
@@ -564,7 +621,7 @@ class TestPendingEvaluationRecovery:
         pending.enqueue(env, enqueued_at=T0)
         calls = {"n": 0}
 
-        def counted(envelope: FraudEventEnvelope) -> None:
+        def counted(envelope: FraudEventEnvelope, policy: DecisionPolicy | None = None) -> None:
             calls["n"] += 1
 
         worker2, _, _ = self._workers(
@@ -572,7 +629,7 @@ class TestPendingEvaluationRecovery:
             ingestion2,
             counted,
             evaluation_complete=lambda t, e: True,
-            clock=lambda: T0,
+            clock=lambda: T0 + timedelta(minutes=6),
         )
         worker2.run_once(max_events=1)
         assert calls["n"] == 0
@@ -632,7 +689,7 @@ class TestKafkaToDecisionEndToEnd:
         calls = {"n": 0}
         original = orchestrator.evaluate
 
-        def crashing_evaluate(envelope: FraudEventEnvelope) -> object:
+        def crashing_evaluate(envelope: FraudEventEnvelope, policy: DecisionPolicy | None = None) -> object:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("simulated crash")
@@ -698,8 +755,9 @@ def test_worker_respects_operating_mode(mode: OperatingMode) -> None:
     worker = IngestionWorker(
         consumer,
         make_ingestion(),
-        evaluate=seen.append,
+        evaluate=lambda e, p=None: seen.append(e),
         dead_letters=dead_letters,
     )
     worker.run_once(max_events=1)
     assert seen[0].operating_mode == mode
+

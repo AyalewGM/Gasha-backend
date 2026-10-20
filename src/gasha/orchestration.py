@@ -8,6 +8,7 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from gasha.decision.audit import (
+    DecisionAuditRecord,
     DecisionAuditRepository,
     InMemoryDecisionAuditRepository,
     audit_record,
@@ -45,6 +46,24 @@ class ShadowEvaluationRepository(Protocol):
     ) -> ShadowEvaluationRecord | None: ...
 
     def save(self, record: ShadowEvaluationRecord) -> ShadowEvaluationRecord: ...
+
+
+class EvaluationPersistence(Protocol):
+    """Atomic persistence boundary for audit + shadow evaluation.
+
+    One evaluation produces two durable artifacts — the decision audit
+    and the shadow evaluation record. They must land together: an
+    implementation writes both in a single transaction (or returns the
+    already-persisted pair on first-write-wins), so a retry can never
+    find the audit committed while the evaluation is missing, and
+    evidence never disagrees across the two stores.
+    """
+
+    def save(
+        self,
+        record: ShadowEvaluationRecord,
+        audit: DecisionAuditRecord,
+    ) -> ShadowEvaluationRecord: ...
 
 
 class InMemoryShadowEvaluationRepository:
@@ -92,6 +111,7 @@ class ShadowOrchestrator:
         clock: Callable[[], datetime] | None = None,
         metrics: MetricsRegistry | None = None,
         journey: JourneyIntelligence | None = None,
+        persistence: EvaluationPersistence | None = None,
     ) -> None:
         self._policies = dict(policies)
         self._evaluations = evaluations or InMemoryShadowEvaluationRepository()
@@ -99,14 +119,21 @@ class ShadowOrchestrator:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._metrics = metrics
         self._journey = journey
+        self._persistence = persistence
 
     @property
     def evaluations(self) -> ShadowEvaluationRepository:
         return self._evaluations
 
-    def evaluate(self, event: FraudEventEnvelope) -> DecisionEnvelope:
-        policy = self._policies.get(event.tenant_id)
-        if policy is None:
+    def evaluate(
+        self,
+        event: FraudEventEnvelope,
+        policy: DecisionPolicy | None = None,
+    ) -> DecisionEnvelope:
+        """Evaluate under ``policy`` when given (pinned replay snapshot)
+        else the tenant's currently registered policy."""
+        resolved = policy or self._policies.get(event.tenant_id)
+        if resolved is None:
             raise MissingTenantPolicyError(
                 f"no decision policy registered for tenant "
                 f"{event.tenant_id!r}"
@@ -123,7 +150,7 @@ class ShadowOrchestrator:
 
         try:
             evaluation = ModeAwareDecisionService(
-                policy,
+                resolved,
                 operating_mode=event.operating_mode,
                 clock=self._clock,
             ).decide(
@@ -147,21 +174,22 @@ class ShadowOrchestrator:
                 labels={"tenant_id": event.tenant_id},
             )
 
+        record = ShadowEvaluationRecord(
+            event=event,
+            evaluation=evaluation,
+            persisted_at=self._clock(),
+            journey=assessment,
+        )
+        audit = audit_record(
+            evaluation.decision,
+            signal_policy_versions=event.signal_policy_versions,
+        )
         try:
-            self._audit.save(
-                audit_record(
-                    evaluation.decision,
-                    signal_policy_versions=event.signal_policy_versions,
-                )
-            )
-            self._evaluations.save(
-                ShadowEvaluationRecord(
-                    event=event,
-                    evaluation=evaluation,
-                    persisted_at=self._clock(),
-                    journey=assessment,
-                )
-            )
+            if self._persistence is not None:
+                self._persistence.save(record, audit)
+            else:
+                self._audit.save(audit)
+                self._evaluations.save(record)
         except Exception:
             self._count("gasha_persistence_failures", event.tenant_id)
             raise
