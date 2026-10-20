@@ -419,7 +419,7 @@ class TestPendingEvaluationRecovery:
         assert batch1.commits == 1
         assert evaluated == []
         assert dead_letters.records == ()
-        record = pending.due(now[0] + timedelta(days=1))[0]
+        record = next(iter(pending._records.values()))
         assert record.attempts == 1
 
         # Ordinary restart: fresh worker, EMPTY consumer — nothing
@@ -629,7 +629,7 @@ class TestPendingEvaluationRecovery:
             ingestion2,
             counted,
             evaluation_complete=lambda t, e: True,
-            clock=lambda: T0,
+            clock=lambda: T0 + timedelta(minutes=6),
         )
         worker2.run_once(max_events=1)
         assert calls["n"] == 0
@@ -760,3 +760,4 @@ def test_worker_respects_operating_mode(mode: OperatingMode) -> None:
     )
     worker.run_once(max_events=1)
     assert seen[0].operating_mode == mode
+

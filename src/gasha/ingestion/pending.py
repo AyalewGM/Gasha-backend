@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import UUID, uuid4
 
@@ -34,12 +34,6 @@ class PendingEvaluationRecord(BaseModel):
     ``leased_by``/``leased_until`` implement multi-worker work
     ownership: a due record is claimed atomically by one worker for the
     lease window; other workers skip it until the lease expires.
-
-    ``claim_token`` is the fencing token: every claim (enqueue or
-    ``due``) issues a fresh unique token, and ``reschedule``/``complete``
-    only apply when the presented token still matches — a worker whose
-    lease expired and was reclaimed cannot stale-write the new owner's
-    work.
     """
 
     event: FraudEventEnvelope
@@ -48,9 +42,9 @@ class PendingEvaluationRecord(BaseModel):
     enqueued_at: datetime
     next_attempt_at: datetime
     last_error: str | None = None
+    claim_token: str | None = None
     leased_by: str | None = None
     leased_until: datetime | None = None
-    claim_token: str | None = None
 
 
 class PendingEvaluationStore(Protocol):
@@ -63,9 +57,9 @@ class PendingEvaluationStore(Protocol):
     ``due`` is a claim, not a read: each returned record is atomically
     leased to the calling worker for the store's lease window, so two
     workers reconciling concurrently cannot evaluate the same event.
-    ``reschedule``/``complete`` are conditional on the fencing token
-    issued at claim time — a caller presenting a superseded token
-    leaves the row untouched and gets ``None``/a no-op.
+    ``reschedule``/``complete`` are conditional on that ownership — a
+    worker that does not hold the lease leaves the row untouched and
+    gets ``None``/a no-op.
     """
 
     def enqueue(
@@ -89,6 +83,7 @@ class PendingEvaluationStore(Protocol):
         next_attempt_at: datetime,
         owner: str | None = None,
         claim_token: str | None = None,
+        now: datetime | None = None,
     ) -> PendingEvaluationRecord | None: ...
 
     def complete(
@@ -98,6 +93,7 @@ class PendingEvaluationStore(Protocol):
         *,
         owner: str | None = None,
         claim_token: str | None = None,
+        now: datetime | None = None,
     ) -> None: ...
 
 
@@ -141,9 +137,9 @@ class InMemoryPendingEvaluationStore:
             policy=policy,
             enqueued_at=enqueued_at,
             next_attempt_at=enqueued_at,
+            claim_token=str(uuid4()),
             leased_by=self._worker_id,
             leased_until=enqueued_at + self._lease_ttl,
-            claim_token=str(uuid4()),
         )
         self._records[key] = record
         return record
@@ -165,15 +161,14 @@ class InMemoryPendingEvaluationStore:
             if (
                 record.leased_until is not None
                 and record.leased_until > now
-                and record.leased_by != self._worker_id
             ):
                 continue
             claimed.append(
                 record.model_copy(
                     update={
+                        "claim_token": str(uuid4()),
                         "leased_by": self._worker_id,
                         "leased_until": now + self._lease_ttl,
-                        "claim_token": str(uuid4()),
                     }
                 )
             )
@@ -190,27 +185,26 @@ class InMemoryPendingEvaluationStore:
         next_attempt_at: datetime,
         owner: str | None = None,
         claim_token: str | None = None,
+        now: datetime | None = None,
     ) -> PendingEvaluationRecord | None:
         require_tenant(tenant_id, self._tenant_ids)
         key = (tenant_id, event_id)
         record = self._records.get(key)
         if record is None:
-            raise KeyError(
-                f"no pending evaluation for tenant {tenant_id!r} "
-                f"event {event_id}"
-            )
-        if record.leased_by is not None and record.leased_by != owner:
             return None
-        if (
-            record.claim_token is not None
-            and record.claim_token != claim_token
-        ):
+        if (not claim_token or record.claim_token != claim_token
+            or record.leased_by != owner
+            or record.leased_until is None
+            or record.leased_until <= (now or datetime.now(UTC))):
             return None
         updated = record.model_copy(
             update={
                 "attempts": record.attempts + 1,
                 "next_attempt_at": next_attempt_at,
                 "last_error": error,
+                "leased_by": None,
+                "leased_until": None,
+                "claim_token": None,
             }
         )
         self._records[key] = updated
@@ -223,15 +217,16 @@ class InMemoryPendingEvaluationStore:
         *,
         owner: str | None = None,
         claim_token: str | None = None,
+        now: datetime | None = None,
     ) -> None:
         require_tenant(tenant_id, self._tenant_ids)
         record = self._records.get((tenant_id, event_id))
-        if record is not None and (
-            (record.leased_by is not None and record.leased_by != owner)
-            or (
-                record.claim_token is not None
-                and record.claim_token != claim_token
-            )
+        if (
+            record is not None
+            and (not claim_token or record.claim_token != claim_token
+                 or record.leased_by != owner
+                 or record.leased_until is None
+                 or record.leased_until <= (now or datetime.now(UTC)))
         ):
             return
         self._records.pop((tenant_id, event_id), None)

@@ -10,6 +10,11 @@ from uuid import UUID
 from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.contracts import FraudEventEnvelope, InboundBankEvent
 from gasha.ingestion.errors import RejectionReason, RejectionRecord
+from gasha.ingestion.lease import (
+    EvaluationLease,
+    LeaseLostError,
+    current_evaluation_lease,
+)
 from gasha.ingestion.pending import (
     PendingEvaluationRecord,
     PendingEvaluationStore,
@@ -125,6 +130,7 @@ class IngestionWorker:
                     envelope.event_id,
                     owner=self._worker_id,
                     claim_token=record.claim_token,
+                    now=self._clock(),
                 )
                 continue
             self._evaluate_pending(envelope, record)
@@ -174,8 +180,16 @@ class IngestionWorker:
         record: PendingEvaluationRecord,
     ) -> None:
         assert self._evaluate is not None
+        if (not record.claim_token or record.leased_until is None
+            or record.leased_until <= self._clock()):
+            return
+        context_token = current_evaluation_lease.set(
+            EvaluationLease(envelope.tenant_id, envelope.event_id, record.claim_token)
+        )
         try:
             self._evaluate(envelope, record.policy)
+        except LeaseLostError:
+            return
         except MissingTenantPolicyError:
             self._dead_letter(
                 envelope,
@@ -184,58 +198,49 @@ class IngestionWorker:
                 f"no decision policy registered for tenant "
                 f"{envelope.tenant_id!r}",
             )
-            self._pending_complete(envelope, record.claim_token)
+            self._pending_complete(envelope, record)
             return
         except Exception as exc:  # noqa: BLE001 - fail closed, retry later
-            self._evaluation_failed(envelope, exc, record.claim_token)
+            self._evaluation_failed(envelope, record, exc)
             return
-        self._pending_complete(envelope, record.claim_token)
+        finally:
+            current_evaluation_lease.reset(context_token)
+        self._pending_complete(envelope, record)
 
     def _evaluation_failed(
-        self,
-        envelope: FraudEventEnvelope,
-        exc: Exception,
-        claim_token: str | None = None,
+        self, envelope: FraudEventEnvelope, claim: PendingEvaluationRecord, exc: Exception
     ) -> None:
         assert self._pending is not None
-        try:
-            record = self._pending.reschedule(
-                envelope.tenant_id,
-                envelope.event_id,
-                error=type(exc).__name__,
-                next_attempt_at=self._clock() + self._retry_backoff,
-                owner=self._worker_id,
-                claim_token=claim_token,
-            )
-        except KeyError:
-            record = None
-        if record is None:
-            # Lease lost mid-evaluation; the owning worker manages it.
+        if claim.leased_until is None or claim.leased_until <= self._clock():
             return
-        if self._metrics is not None:
-            self._metrics.increment(
-                "gasha_worker_evaluation_retries",
-                labels={"tenant_id": envelope.tenant_id},
-            )
-        if record.attempts >= self._max_evaluation_attempts:
+        if claim.attempts + 1 >= self._max_evaluation_attempts:
             self._dead_letter(
-                envelope,
-                None,
-                RejectionReason.EVALUATION_FAILURE,
-                f"evaluation failed after {record.attempts} attempts: "
-                f"{type(exc).__name__}",
+                envelope, None, RejectionReason.EVALUATION_FAILURE,
+                f"evaluation failed after {claim.attempts + 1} attempts: {type(exc).__name__}",
             )
-            self._pending_complete(envelope, claim_token)
+            self._pending_complete(envelope, claim)
+            return
+        record = self._pending.reschedule(
+            envelope.tenant_id, envelope.event_id,
+            error=type(exc).__name__,
+            next_attempt_at=self._clock() + self._retry_backoff,
+            owner=self._worker_id, claim_token=claim.claim_token, now=self._clock(),
+        )
+        if record is not None and self._metrics is not None:
+            self._metrics.increment(
+                "gasha_worker_evaluation_retries", labels={"tenant_id": envelope.tenant_id},
+            )
 
     def _pending_complete(
-        self, envelope: FraudEventEnvelope, claim_token: str | None
+        self, envelope: FraudEventEnvelope, record: PendingEvaluationRecord
     ) -> None:
         if self._pending is not None:
             self._pending.complete(
                 envelope.tenant_id,
                 envelope.event_id,
                 owner=self._worker_id,
-                claim_token=claim_token,
+                claim_token=record.claim_token,
+                now=self._clock(),
             )
 
     def _already_evaluated(self, envelope: FraudEventEnvelope) -> bool:

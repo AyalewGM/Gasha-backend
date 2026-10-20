@@ -69,7 +69,7 @@ class WorkerSettings(BaseSettings):
     poll_timeout_s: float = 1.0
     batch_size: int = 50
 
-    # {"<source_system>": "<adapter_type>"} — adapter_type in ADAPTER_TYPES.
+    # {"<source_system>": "<adapter_type>"}   adapter_type in ADAPTER_TYPES.
     adapter_map: dict[str, str] = {"reference-json": "reference-json"}
 
     # {"<tenant_id>": {<DecisionPolicy fields>}} JSON file path.
@@ -79,7 +79,7 @@ class WorkerSettings(BaseSettings):
     postgres_dsn: str | None = None
 
     # Trusted tenant authorization for ingestion and durable repositories.
-    # REQUIRED (non-empty) whenever postgres_dsn is set — a durable/
+    # REQUIRED (non-empty) whenever postgres_dsn is set   a durable/
     # production worker must not run unscoped. Only the in-memory dev
     # path may run without a scope.
     tenant_ids: list[str] | None = None
@@ -110,7 +110,7 @@ def _postgres_connection(dsn: str) -> Connection:
     import psycopg
     from psycopg.rows import dict_row
 
-    # dict_row: every repository indexes result rows by column name —
+    # dict_row: every repository indexes result rows by column name  
     # psycopg's default tuple rows would raise TypeError/KeyError.
     return cast(
         Connection, psycopg.connect(dsn, row_factory=dict_row)
@@ -130,7 +130,7 @@ def build_stores(
     """Durable stores when a DSN is configured, in-memory otherwise."""
     if settings.postgres_dsn is None:
         logger.warning(
-            "GASHA_POSTGRES_DSN unset — using in-memory stores "
+            "GASHA_POSTGRES_DSN unset   using in-memory stores "
             "(dev mode; decisions are not durable)"
         )
         return (
@@ -152,7 +152,7 @@ def build_stores(
 
     if not settings.tenant_ids:
         # Fail closed before touching the database: a durable worker
-        # must never run with an unrestricted tenant scope — any event
+        # must never run with an unrestricted tenant scope   any event
         # on its topic would be processed, evaluated and persisted.
         raise ValueError(
             "GASHA_TENANT_IDS is required when GASHA_POSTGRES_DSN is "
@@ -173,7 +173,7 @@ def build_stores(
             worker_id=settings.worker_id,
             lease_ttl=timedelta(seconds=settings.lease_ttl_s),
         ),
-        PostgresEvaluationPersistence(connection, tenant_ids=tenant_ids),
+        PostgresEvaluationPersistence(connection, tenant_ids=tenant_ids, require_lease=True),
     )
 
 

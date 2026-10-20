@@ -1,7 +1,7 @@
 """Real-PostgreSQL integration tests for the M2 durable stores.
 
 Skipped unless ``GASHA_TEST_POSTGRES_DSN`` points at a database where the
-migrations may be applied — e.g.::
+migrations may be applied   e.g.::
 
     docker run -d -p 55432:5432 -e POSTGRES_USER=gasha \
         -e POSTGRES_PASSWORD=gasha -e POSTGRES_DB=gasha postgres:16-alpine
@@ -10,7 +10,7 @@ migrations may be applied — e.g.::
 
 These exercise the actual psycopg row contract (``dict_row``), the
 SKIP-LOCKED claim, cross-worker ownership, tenant scoping, and
-restart recovery — the parts the in-memory fakes only approximate.
+restart recovery   the parts the in-memory fakes only approximate.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ pytestmark = pytest.mark.skipif(
     not DSN, reason="GASHA_TEST_POSTGRES_DSN not set"
 )
 
-T0 = datetime(2026, 2, 12, 9, 0, 0, tzinfo=UTC)
+T0 = datetime.now(UTC)
 MIGRATIONS = Path(__file__).resolve().parent.parent / "db" / "migrations"
 TABLES = (
     "pending_evaluations",
@@ -130,14 +130,14 @@ def inbound_for(env: FraudEventEnvelope) -> InboundBankEvent:
 
 
 class TestRealRowContract:
-    """Each SELECT result is consumed via row["record_json"] — this only
+    """Each SELECT result is consumed via row["record_json"]   this only
     works if the connection yields dict_row-shaped rows."""
 
     def test_dict_row_reads(self, pg) -> None:
         store = PostgresPendingEvaluationStore(pg, worker_id="w1")
         env = envelope()
         store.enqueue(env, enqueued_at=T0)
-        due = store.due(T0)
+        due = store.due(T0 + timedelta(minutes=6))
         assert len(due) == 1
         assert due[0].event.event_id == env.event_id
 
@@ -145,7 +145,7 @@ class TestRealRowContract:
 class TestClaimAndOwnership:
     def test_concurrent_claims_are_disjoint(self, pg) -> None:
         """Two workers on *separate psycopg connections* (as separate
-        worker processes would run) claim simultaneously — SKIP-LOCKED
+        worker processes would run) claim simultaneously   SKIP-LOCKED
         keeps every row exclusive."""
         writer = PostgresPendingEvaluationStore(pg, worker_id="seed")
         envs = [envelope() for _ in range(10)]
@@ -160,14 +160,19 @@ class TestClaimAndOwnership:
 
         conn_a = _connect()
         conn_b = _connect()
+        assert conn_a.info.backend_pid != conn_b.info.backend_pid
         try:
+            errors: list = []
             claimed_a: list = []
             claimed_b: list = []
             barrier = threading.Barrier(2)
 
             def claim(store, out):
-                barrier.wait()
-                out.extend(store.due(T0, limit=100))
+                try:
+                    barrier.wait(timeout=10)
+                    out.extend(store.due(T0, limit=100))
+                except Exception as exc:  # noqa: BLE001 - propagate thread failures
+                    errors.append(exc)
 
             store_a = PostgresPendingEvaluationStore(conn_a, worker_id="a")
             store_b = PostgresPendingEvaluationStore(conn_b, worker_id="b")
@@ -178,11 +183,12 @@ class TestClaimAndOwnership:
             ta.join()
             tb.join()
 
+            assert not errors
             ids_a = {r.event.event_id for r in claimed_a}
             ids_b = {r.event.event_id for r in claimed_b}
             assert ids_a.isdisjoint(ids_b)
             assert ids_a | ids_b == {e.event_id for e in envs}
-            # Tokens differ per claim — each worker's fencing token is
+            # Tokens differ per claim   each worker's fencing token is
             # unique to its own claim generation.
             tokens = {r.claim_token for r in claimed_a + claimed_b}
             assert len(tokens) == len(claimed_a) + len(claimed_b)
@@ -204,7 +210,7 @@ class TestClaimAndOwnership:
         assert store_b.due(T0) == ()  # A's lease held
         claimed = store_b.due(T0 + timedelta(minutes=1))
         assert [r.event.event_id for r in claimed] == [env.event_id]
-        # A can no longer mutate B's row — its stale lease/token fence it.
+        # A can no longer mutate B's row   its stale lease/token fence it.
         assert (
             store_a.reschedule(
                 env.tenant_id,
@@ -222,7 +228,7 @@ class TestClaimAndOwnership:
             owner="a",
             claim_token=claimed[0].claim_token,
         )
-        assert len(store_b.due(T0 + timedelta(minutes=2))) == 1
+        assert store_b.due(T0 + timedelta(minutes=2)) == ()
 
     def test_tenant_scope_restricts_claims(self, pg) -> None:
         scoped = PostgresPendingEvaluationStore(
@@ -412,16 +418,15 @@ def test_delayed_worker_token_fences_stale_writes(pg):
         assert store_b.due(T0 + timedelta(days=1)) == ()
 
         # A wakes up and finishes late. Its stale token cannot
-        # reschedule anything — the row B completed is gone.
-        with pytest.raises(KeyError):
-            store_a.reschedule(
+        # reschedule anything   the row B completed is gone.
+        assert store_a.reschedule(
                 env.tenant_id,
                 env.event_id,
                 error="late",
                 next_attempt_at=T0 + timedelta(hours=2),
                 owner="a",
                 claim_token=a_record.claim_token,
-            )
+            ) is None
         # A's complete is a no-op against whatever row exists now.
         store_a.complete(
             env.tenant_id,
@@ -431,7 +436,7 @@ def test_delayed_worker_token_fences_stale_writes(pg):
         )
 
         # If A's in-flight evaluation lands after B's, first-write-wins
-        # keeps B's evidence — exactly one audit + one eval, B's decision.
+        # keeps B's evidence   exactly one audit + one eval, B's decision.
         evals_a = PostgresShadowEvaluationRepository(
             conn_a, tenant_ids=("tenant-a",)
         )
@@ -489,7 +494,7 @@ def _connect():
 def test_separate_connections_crash_recovery_and_idempotency(pg):
     """Two real psycopg connections: worker-A writes the pending row and
     crashes mid-evaluation; worker-B on a separate connection claims the
-    expired lease and completes exactly once — repeat reconcile is a
+    expired lease and completes exactly once   repeat reconcile is a
     no-op."""
     conn_a = _connect()
     conn_b = _connect()
@@ -619,7 +624,7 @@ def test_worker_ingestion_rejects_foreign_tenant(pg):
 
 def test_claim_and_recovery_performance(pg, capsys):
     """Timing evidence: claim throughput and end-to-end restart
-    recovery over real Postgres. Loose bounds only — numbers are
+    recovery over real Postgres. Loose bounds only   numbers are
     reported, not asserted tightly."""
     import time
 
@@ -651,6 +656,8 @@ def test_claim_and_recovery_performance(pg, capsys):
         claimed = claimant.due(T0, limit=500)
         claim_s = time.perf_counter() - start
         assert len(claimed) == 200
+        conn.execute("UPDATE pending_evaluations SET leased_until = NULL")
+        conn.commit()
 
         evals = PostgresShadowEvaluationRepository(
             conn, tenant_ids=("tenant-a",)
@@ -699,3 +706,62 @@ def test_claim_and_recovery_performance(pg, capsys):
         assert recovery_s < 60.0
     finally:
         conn.close()
+
+def test_stale_claim_fenced_with_reused_worker_identity(pg):
+    from gasha.ingestion.lease import (
+        EvaluationLease,
+        LeaseLostError,
+        current_evaluation_lease,
+    )
+    conn_a, conn_b = _connect(), _connect()
+    try:
+        a = PostgresPendingEvaluationStore(conn_a, worker_id='shared-id')
+        b = PostgresPendingEvaluationStore(conn_b, worker_id='shared-id')
+        env = envelope()
+        old = a.enqueue(env, enqueued_at=datetime.now(UTC), policy=POLICY)
+        conn_b.execute(
+            'UPDATE pending_evaluations SET leased_until = clock_timestamp() - interval \'1 second\''
+        )
+        conn_b.commit()
+        # Expiry alone fences writes, even before anyone takes over.
+        assert a.reschedule(env.tenant_id, env.event_id, error='late',
+                            next_attempt_at=datetime.now(UTC), owner='shared-id',
+                            claim_token=old.claim_token) is None
+        a.complete(env.tenant_id, env.event_id, owner='shared-id', claim_token=old.claim_token)
+        new = b.due(datetime.now(UTC))[0]
+        assert new.claim_token and new.claim_token != old.claim_token
+        # Reusing a worker_id cannot authorize an old generation.
+        a.complete(env.tenant_id, env.event_id, owner='shared-id', claim_token=old.claim_token)
+        assert a.reschedule(env.tenant_id, env.event_id, error='late',
+                            next_attempt_at=datetime.now(UTC), owner='shared-id',
+                            claim_token=old.claim_token) is None
+        orchestrator = ShadowOrchestrator(
+            {'tenant-a': POLICY},
+            persistence=PostgresEvaluationPersistence(conn_a, require_lease=True),
+        )
+        context = current_evaluation_lease.set(
+            EvaluationLease(env.tenant_id, env.event_id, old.claim_token)
+        )
+        try:
+            with pytest.raises(LeaseLostError):
+                orchestrator.evaluate(env, POLICY)
+        finally:
+            current_evaluation_lease.reset(context)
+        assert PostgresShadowEvaluationRepository(conn_b).get(env.tenant_id, env.event_id) is None
+        assert PostgresDecisionAuditRepository(conn_b).get(env.tenant_id, env.event_id) is None
+        assert b._get(env.tenant_id, env.event_id).claim_token == new.claim_token
+        context = current_evaluation_lease.set(
+            EvaluationLease(env.tenant_id, env.event_id, new.claim_token)
+        )
+        try:
+            orchestrator.evaluate(env, POLICY)
+        finally:
+            current_evaluation_lease.reset(context)
+        b.complete(env.tenant_id, env.event_id, owner='shared-id', claim_token=new.claim_token)
+        assert b._get(env.tenant_id, env.event_id) is None
+        audit = PostgresDecisionAuditRepository(conn_b).get(env.tenant_id, env.event_id)
+        evaluation = PostgresShadowEvaluationRepository(conn_b).get(env.tenant_id, env.event_id)
+        assert audit.decision == evaluation.evaluation.decision
+    finally:
+        conn_a.close()
+        conn_b.close()

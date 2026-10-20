@@ -104,7 +104,7 @@ class FakeCursor:
             # to this worker in one statement.
             worker_id, leased_until, now = params[0], params[1], params[2]
             tenant_ids = params[3]
-            limit = int(str(params[7]))
+            limit = int(str(params[6]))
             claimed: list[dict[str, object]] = []
             for key, row in self.connection.pending_rows.items():
                 if len(claimed) >= limit:
@@ -120,7 +120,6 @@ class FakeCursor:
                 if (
                     row.get("leased_until") is not None
                     and row["leased_until"] > now
-                    and row.get("leased_by") != worker_id
                 ):
                     continue
                 row["leased_by"] = worker_id
@@ -140,7 +139,7 @@ class FakeCursor:
             ):
                 self.connection.staged_pending[key] = {
                     "op": "update",
-                    "row": {**existing, "record_json": params[0]},
+                    "row": {**existing, "record_json": params[0], "leased_by": None, "leased_until": None, "lease_token": None},
                 }
                 self.rowcount = 1
             else:
@@ -173,7 +172,7 @@ class FakeCursor:
 
 class FakeConnection:
     """Transactional fake: execute() stages writes; commit() merges them
-    atomically; rollback() discards them — like a real Postgres tx."""
+    atomically; rollback() discards them   like a real Postgres tx."""
 
     def __init__(self) -> None:
         self.rows: dict[tuple[str, str], dict[str, object]] = {}
@@ -362,7 +361,7 @@ class TestWorkerRestartDurability:
         assert persisted is not None
         assert persisted.evaluation.decision.rule_version == "rules-1"
 
-        # Worker 3: redelivery again — now skipped, still exactly one row.
+        # Worker 3: redelivery again   now skipped, still exactly one row.
         consumer3 = _StubConsumer([[event]])
         worker3 = IngestionWorker(
             consumer3,
@@ -407,9 +406,8 @@ class TestPostgresPendingEvaluationStore:
         assert record.attempts == 0
         assert record.leased_by == "w1"
         assert record.claim_token is not None
-        claimed = store.due(T0)
-        assert len(claimed) == 1
-        assert claimed[0].event == record.event
+        assert store.due(T0) == ()
+        claimed = (record,)
 
         updated = store.reschedule(
             env.tenant_id,
@@ -493,7 +491,7 @@ class TestPostgresPendingEvaluationStore:
         assert repo.get(env.tenant_id, env.event_id) is None
 
         # Restart: new worker over the same Postgres stores, no
-        # redelivery — reconcile produces the single durable evaluation.
+        # redelivery   reconcile produces the single durable evaluation.
         consumer2 = _StubConsumer([])
         worker2 = IngestionWorker(
             consumer2,
@@ -702,7 +700,7 @@ class TestAtomicEvaluationConsistency:
         assert persisted_eval is not None
         assert persisted_audit is not None
         # Same immutable decision on both sides: identical FraudDecision
-        # (including decided_at) and the attempt-1 version triple — not
+        # (including decided_at) and the attempt-1 version triple   not
         # the currently loaded V2.
         assert (
             persisted_audit.decision
@@ -719,7 +717,7 @@ class TestAtomicEvaluationConsistency:
         assert len(connection.audit_rows) == 1
         assert len(connection.rows) == 1
 
-        # Reconcile again — still exactly one consistent pair.
+        # Reconcile again   still exactly one consistent pair.
         worker2.run_once(max_events=1)
         assert len(connection.audit_rows) == 1
         assert len(connection.rows) == 1

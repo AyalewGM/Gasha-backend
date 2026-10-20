@@ -4,6 +4,7 @@ import json
 from uuid import UUID
 
 from gasha.decision.audit import DecisionAuditRecord
+from gasha.ingestion.lease import LeaseLostError, current_evaluation_lease
 from gasha.orchestration import ShadowEvaluationRecord
 from gasha.postgres import Connection
 from gasha.tenant_scope import require_tenant
@@ -83,8 +84,10 @@ class PostgresEvaluationPersistence:
     """
 
     def __init__(
-        self, connection: Connection, *, tenant_ids: tuple[str, ...] | None = None
+        self, connection: Connection, *, tenant_ids: tuple[str, ...] | None = None,
+        require_lease: bool = False,
     ) -> None:
+        self._require_lease = require_lease
         self._tenant_ids = tenant_ids
         self._connection = connection
 
@@ -100,6 +103,31 @@ class PostgresEvaluationPersistence:
             raise ValueError("audit and evaluation identity mismatch")
         try:
             with self._connection.cursor() as cursor:
+                lease = current_evaluation_lease.get()
+                if self._require_lease:
+                    if lease is None or (lease.tenant_id, lease.event_id) != (
+                        record.event.tenant_id, record.event.event_id
+                    ):
+                        raise LeaseLostError("missing or mismatched evaluation claim")
+                    cursor.execute(
+                        """SELECT lease_token FROM pending_evaluations
+                        WHERE tenant_id = %s AND event_id = %s
+                          AND lease_token = %s
+                        FOR UPDATE""",
+                        (lease.tenant_id, str(lease.event_id), lease.token),
+                    )
+                    if cursor.fetchone() is None:
+                        raise LeaseLostError("evaluation claim superseded")
+                    # Check database time after acquiring the lock: a lock wait
+                    # may itself have outlived the lease window.
+                    cursor.execute(
+                        """SELECT lease_token FROM pending_evaluations
+                        WHERE tenant_id = %s AND event_id = %s
+                          AND lease_token = %s AND leased_until > clock_timestamp()""",
+                        (lease.tenant_id, str(lease.event_id), lease.token),
+                    )
+                    if cursor.fetchone() is None:
+                        raise LeaseLostError("evaluation claim expired")
                 cursor.execute(
                     """
                     INSERT INTO fraud_decision_audit (
