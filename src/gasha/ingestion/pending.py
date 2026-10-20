@@ -10,6 +10,8 @@ from pydantic import BaseModel
 
 from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.contracts import FraudEventEnvelope
+from gasha.ingestion.errors import RejectionRecord
+from gasha.ingestion.service import DeadLetterSink
 from gasha.tenant_scope import require_tenant
 
 
@@ -36,6 +38,7 @@ class PendingEvaluationRecord(BaseModel):
     lease window; other workers skip it until the lease expires.
     """
 
+    terminal: bool = False
     event: FraudEventEnvelope
     policy: DecisionPolicy | None = None
     attempts: int = 0
@@ -61,6 +64,11 @@ class PendingEvaluationStore(Protocol):
     worker that does not hold the lease leaves the row untouched and
     gets ``None``/a no-op.
     """
+
+    def terminate(
+        self, record: PendingEvaluationRecord, rejection: RejectionRecord, *,
+        dead_letters: DeadLetterSink, owner: str, now: datetime,
+    ) -> bool: ...
 
     def enqueue(
         self,
@@ -151,7 +159,7 @@ class InMemoryPendingEvaluationStore:
         for key, record in self._records.items():
             if len(claimed) >= limit:
                 break
-            if record.next_attempt_at > now:
+            if record.terminal or record.next_attempt_at > now:
                 continue
             if (
                 self._tenant_ids is not None
@@ -231,3 +239,23 @@ class InMemoryPendingEvaluationStore:
             return
         self._records.pop((tenant_id, event_id), None)
 
+
+    def terminate(
+        self, record: PendingEvaluationRecord, rejection: RejectionRecord, *,
+        dead_letters: DeadLetterSink, owner: str, now: datetime,
+    ) -> bool:
+        tenant_id, event_id = record.event.tenant_id, record.event.event_id
+        require_tenant(tenant_id, self._tenant_ids)
+        current = self._records.get((tenant_id, event_id))
+        if (current is None or current.terminal or not record.claim_token
+            or current.claim_token != record.claim_token or current.leased_by != owner
+            or current.leased_until is None or current.leased_until <= now):
+            return False
+        if (rejection.tenant_id, rejection.event_id) != (tenant_id, str(event_id)):
+            raise ValueError("terminal rejection identity mismatch")
+        dead_letters.put(rejection)
+        self._records[(tenant_id, event_id)] = current.model_copy(update={
+            "terminal": True, "claim_token": None, "leased_by": None, "leased_until": None,
+            "attempts": current.attempts + 1,
+        })
+        return True

@@ -11,7 +11,7 @@ from gasha.ingestion.contracts import FraudEventEnvelope
 from gasha.ingestion.errors import RejectionRecord
 from gasha.ingestion.outcome_ingestion import IncumbentOutcomeRecord
 from gasha.ingestion.pending import PendingEvaluationRecord
-from gasha.ingestion.service import IngestionRecord
+from gasha.ingestion.service import DeadLetterSink, IngestionRecord
 from gasha.poc.outcomes import OutcomeRecord
 from gasha.postgres import Connection
 from gasha.tenant_scope import require_tenant
@@ -315,7 +315,7 @@ class PostgresPendingEvaluationStore:
                 WHERE (pe.tenant_id, pe.event_id) IN (
                     SELECT tenant_id, event_id
                     FROM pending_evaluations
-                    WHERE next_attempt_at <= %s
+                    WHERE NOT terminal AND next_attempt_at <= %s
                       AND (%s::text[] IS NULL OR tenant_id = ANY(%s))
                       AND (leased_until IS NULL
                            OR leased_until <= %s)
@@ -323,7 +323,7 @@ class PostgresPendingEvaluationStore:
                     LIMIT %s
                     FOR UPDATE SKIP LOCKED
                 )
-                RETURNING pe.record_json, pe.leased_by, pe.leased_until, pe.lease_token
+                RETURNING pe.record_json, pe.leased_by, pe.leased_until, pe.lease_token, pe.terminal
                 """,
                 (
                     self._worker_id,
@@ -341,7 +341,7 @@ class PostgresPendingEvaluationStore:
             PendingEvaluationRecord.model_validate_json(
                 str(row["record_json"])
             ).model_copy(
-                update={"leased_by": row["leased_by"], "leased_until": row["leased_until"], "claim_token": str(row["lease_token"]) if row["lease_token"] is not None else None}
+                update={"leased_by": row["leased_by"], "leased_until": row["leased_until"], "claim_token": str(row["lease_token"]) if row["lease_token"] is not None else None, "terminal": bool(row["terminal"])}
             )
             for row in rows
         )
@@ -432,7 +432,7 @@ class PostgresPendingEvaluationStore:
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT record_json, leased_by, leased_until, lease_token
+                SELECT record_json, leased_by, leased_until, lease_token, terminal
                 FROM pending_evaluations
                 WHERE tenant_id = %s AND event_id = %s
                 """ + (" FOR UPDATE" if lock else ""),
@@ -444,6 +444,60 @@ class PostgresPendingEvaluationStore:
         return PendingEvaluationRecord.model_validate_json(
             str(row["record_json"])
         ).model_copy(
-            update={"leased_by": row["leased_by"], "leased_until": row["leased_until"], "claim_token": str(row["lease_token"]) if row["lease_token"] is not None else None}
+            update={"leased_by": row["leased_by"], "leased_until": row["leased_until"], "claim_token": str(row["lease_token"]) if row["lease_token"] is not None else None, "terminal": bool(row["terminal"])}
         )
 
+
+    def terminate(
+        self, record: PendingEvaluationRecord, rejection: RejectionRecord, *,
+        dead_letters: DeadLetterSink, owner: str, now: datetime,
+    ) -> bool:
+        """Atomically append terminal evidence and retain an idempotency tombstone.
+
+        PostgreSQL writes its own DLQ in this transaction; the supplied sink
+        is used only by the reference store, never as an external callback.
+        """
+        tenant_id, event_id = record.event.tenant_id, record.event.event_id
+        require_tenant(tenant_id, self._tenant_ids)
+        if (rejection.tenant_id, rejection.event_id) != (tenant_id, str(event_id)):
+            raise ValueError("terminal rejection identity mismatch")
+        if not record.claim_token:
+            return False
+        try:
+            current = self._get(tenant_id, event_id, lock=True)
+            with self._connection.cursor() as cursor:
+                # Read database time after acquiring the row lock. Persistence
+                # uses the same lock, serializing success against termination.
+                cursor.execute(
+                    """SELECT tenant_id FROM pending_evaluations AS pe
+                    WHERE tenant_id = %s AND event_id = %s
+                      AND leased_by = %s AND lease_token = %s
+                      AND leased_until > clock_timestamp() AND NOT terminal
+                      AND NOT EXISTS (SELECT 1 FROM shadow_evaluations AS se
+                          WHERE se.tenant_id = pe.tenant_id AND se.event_id = pe.event_id)
+                    """, (tenant_id, str(event_id), owner, record.claim_token),
+                )
+                if current is None or cursor.fetchone() is None:
+                    self._connection.commit()
+                    return False
+                terminal = current.model_copy(update={
+                    "terminal": True, "claim_token": None, "leased_by": None,
+                    "leased_until": None, "attempts": current.attempts + 1,
+                })
+                cursor.execute(
+                    """INSERT INTO dead_letters (tenant_id, event_id, record_json, rejected_at)
+                    VALUES (%s, %s, %s, %s)""",
+                    (tenant_id, str(event_id), rejection.model_dump_json(), rejection.rejected_at),
+                )
+                cursor.execute(
+                    """UPDATE pending_evaluations SET terminal = TRUE,
+                    record_json = %s, attempts = %s,
+                    leased_by = NULL, leased_until = NULL, lease_token = NULL
+                    WHERE tenant_id = %s AND event_id = %s""",
+                    (terminal.model_dump_json(), terminal.attempts, tenant_id, str(event_id)),
+                )
+            self._connection.commit()
+            return True
+        except Exception:
+            self._connection.rollback()
+            raise

@@ -85,13 +85,13 @@ class FakeCursor:
                         "record_json": params[2],
                         "leased_by": params[6],
                         "leased_until": params[7],
-                        "lease_token": params[8],
+                        "lease_token": params[8], "terminal": False,
                     },
                 },
             )
             return
         if normalized.startswith(
-            "SELECT record_json, leased_by, leased_until, lease_token "
+            "SELECT record_json, leased_by, leased_until, lease_token, terminal "
             "FROM pending_evaluations WHERE tenant_id"
         ):
             key = (str(params[0]), str(params[1]))
@@ -110,6 +110,8 @@ class FakeCursor:
                 if len(claimed) >= limit:
                     break
                 record = json.loads(str(row["record_json"]))
+                if row.get("terminal"):
+                    continue
                 if (
                     datetime.fromisoformat(record["next_attempt_at"])
                     > now

@@ -49,6 +49,9 @@ class RejectionRecord(BaseModel):
     adapter_version: str | None = None
     payload_fingerprint: str | None = None
     # Transport coordinates for replay evidence (Kafka topic/partition/offset).
+    configuration_version: str | None = None
+    policy_version: str | None = None
+    rule_version: str | None = None
     topic: str | None = None
     partition: int | None = None
     offset: int | None = None
@@ -61,3 +64,4 @@ class EventRejection(Exception):
     def __init__(self, record: RejectionRecord) -> None:
         super().__init__(f"{record.reason.value}: {record.detail}")
         self.record = record
+

@@ -191,14 +191,12 @@ class IngestionWorker:
         except LeaseLostError:
             return
         except MissingTenantPolicyError:
-            self._dead_letter(
-                envelope,
-                None,
+            self._terminal_failure(
+                record,
                 RejectionReason.TENANT_CONFIGURATION_UNAVAILABLE,
                 f"no decision policy registered for tenant "
                 f"{envelope.tenant_id!r}",
             )
-            self._pending_complete(envelope, record)
             return
         except Exception as exc:  # noqa: BLE001 - fail closed, retry later
             self._evaluation_failed(envelope, record, exc)
@@ -214,11 +212,10 @@ class IngestionWorker:
         if claim.leased_until is None or claim.leased_until <= self._clock():
             return
         if claim.attempts + 1 >= self._max_evaluation_attempts:
-            self._dead_letter(
-                envelope, None, RejectionReason.EVALUATION_FAILURE,
+            self._terminal_failure(
+                claim, RejectionReason.EVALUATION_FAILURE,
                 f"evaluation failed after {claim.attempts + 1} attempts: {type(exc).__name__}",
             )
-            self._pending_complete(envelope, claim)
             return
         record = self._pending.reschedule(
             envelope.tenant_id, envelope.event_id,
@@ -230,6 +227,25 @@ class IngestionWorker:
             self._metrics.increment(
                 "gasha_worker_evaluation_retries", labels={"tenant_id": envelope.tenant_id},
             )
+
+    def _terminal_failure(
+        self, record: PendingEvaluationRecord, reason: RejectionReason, detail: str,
+    ) -> None:
+        assert self._pending is not None
+        envelope, policy = record.event, record.policy
+        rejection = RejectionRecord(
+            tenant_id=envelope.tenant_id, event_id=str(envelope.event_id),
+            reason=reason, detail=detail,
+            source_system=envelope.adapter.source_system,
+            schema_version=envelope.adapter.schema_version,
+            configuration_version=policy.configuration_version if policy else None,
+            policy_version=policy.policy_version if policy else None,
+            rule_version=policy.rule_version if policy else None,
+        )
+        self._pending.terminate(
+            record, rejection, dead_letters=self._dead_letters,
+            owner=self._worker_id, now=self._clock(),
+        )
 
     def _pending_complete(
         self, envelope: FraudEventEnvelope, record: PendingEvaluationRecord

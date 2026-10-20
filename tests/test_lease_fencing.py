@@ -48,3 +48,43 @@ def test_worker_persistence_rejects_missing_claim_context():
         orchestrator.evaluate(envelope(), POLICY)
     assert not connection.rows
     assert not connection.audit_rows
+
+
+def test_terminal_transition_is_idempotent_and_blocks_redelivery():
+    from gasha.ingestion.errors import RejectionReason, RejectionRecord
+    from gasha.ingestion.service import InMemoryDeadLetterSink
+    store = InMemoryPendingEvaluationStore(worker_id='a')
+    env = envelope()
+    claim = store.enqueue(env, enqueued_at=T0)
+    sink = InMemoryDeadLetterSink()
+    rejection = RejectionRecord(tenant_id=env.tenant_id, event_id=str(env.event_id),
+                                reason=RejectionReason.EVALUATION_FAILURE, detail='synthetic')
+    assert store.terminate(claim, rejection, dead_letters=sink, owner='a', now=T0)
+    assert not store.terminate(claim, rejection, dead_letters=sink, owner='a', now=T0)
+    assert store.enqueue(env, enqueued_at=T0).terminal
+    assert store.due(T0 + timedelta(days=1)) == ()
+    assert len(sink.records) == 1
+
+
+def test_late_worker_terminal_branches_do_not_emit_after_takeover():
+    from test_postgres_evaluations import _StubConsumer
+
+    from gasha.ingestion.errors import RejectionReason
+    from gasha.ingestion.service import IngestionService, InMemoryDeadLetterSink
+    from gasha.ingestion.worker import IngestionWorker
+    store = InMemoryPendingEvaluationStore(worker_id='same-worker')
+    env = envelope()
+    old = store.enqueue(env, enqueued_at=T0)
+    new = store.due(T0 + timedelta(minutes=6))[0]
+    sink = InMemoryDeadLetterSink()
+    worker = IngestionWorker(_StubConsumer([]), IngestionService({}),
+                             pending=store, dead_letters=sink,
+                             worker_id='same-worker', clock=lambda: T0)
+    for reason in (RejectionReason.EVALUATION_FAILURE,
+                   RejectionReason.TENANT_CONFIGURATION_UNAVAILABLE):
+        worker._terminal_failure(old, reason, 'late synthetic failure')
+        assert not sink.records
+    store.complete(env.tenant_id, env.event_id, owner='same-worker',
+                   claim_token=new.claim_token, now=T0 + timedelta(minutes=6))
+    worker._terminal_failure(old, RejectionReason.EVALUATION_FAILURE, 'late after success')
+    assert not sink.records

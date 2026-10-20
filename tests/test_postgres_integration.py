@@ -765,3 +765,87 @@ def test_stale_claim_fenced_with_reused_worker_identity(pg):
     finally:
         conn_a.close()
         conn_b.close()
+
+
+@pytest.mark.parametrize('reason_name', ['EVALUATION_FAILURE', 'TENANT_CONFIGURATION_UNAVAILABLE'])
+def test_late_terminal_failure_cannot_contradict_success(pg, reason_name):
+    from gasha.ingestion.errors import RejectionReason, RejectionRecord
+    from gasha.ingestion.lease import EvaluationLease, current_evaluation_lease
+    conn_a, conn_b = _connect(), _connect()
+    try:
+        a = PostgresPendingEvaluationStore(conn_a, worker_id='same-id')
+        b = PostgresPendingEvaluationStore(conn_b, worker_id='same-id')
+        env = envelope()
+        old = a.enqueue(env, enqueued_at=datetime.now(UTC), policy=POLICY)
+        conn_b.execute("UPDATE pending_evaluations SET leased_until = clock_timestamp() - interval '1 second'")
+        conn_b.commit()
+        new = b.due(datetime.now(UTC))[0]
+        rejection = RejectionRecord(
+            tenant_id=env.tenant_id, event_id=str(env.event_id),
+            reason=RejectionReason[reason_name], detail='late synthetic failure',
+        )
+        context = current_evaluation_lease.set(EvaluationLease(env.tenant_id, env.event_id, new.claim_token))
+        try:
+            ShadowOrchestrator(
+                {'tenant-a': POLICY},
+                persistence=PostgresEvaluationPersistence(conn_b, require_lease=True),
+            ).evaluate(env, POLICY)
+        finally:
+            current_evaluation_lease.reset(context)
+        # Even the current claim may not emit terminal failure after success.
+        assert not b.terminate(new, rejection, dead_letters=InMemoryDeadLetterSink(),
+                               owner='same-id', now=datetime.now(UTC))
+        assert not a.terminate(old, rejection, dead_letters=InMemoryDeadLetterSink(),
+                               owner='same-id', now=datetime.now(UTC))
+        b.complete(env.tenant_id, env.event_id, owner='same-id', claim_token=new.claim_token)
+        conn_a.close()
+        conn_a = _connect()  # restart with a fresh database session
+        restarted = PostgresPendingEvaluationStore(conn_a, worker_id='same-id')
+        assert not restarted.terminate(old, rejection, dead_letters=InMemoryDeadLetterSink(),
+                                      owner='same-id', now=datetime.now(UTC))
+        assert conn_a.execute('SELECT count(*) AS n FROM dead_letters').fetchone()['n'] == 0
+        audit = PostgresDecisionAuditRepository(conn_a).get(env.tenant_id, env.event_id)
+        evaluation = PostgresShadowEvaluationRepository(conn_a).get(env.tenant_id, env.event_id)
+        assert audit.decision == evaluation.evaluation.decision
+    finally:
+        conn_a.close()
+        conn_b.close()
+
+
+def test_terminal_dlq_rollback_and_restart_idempotency(pg):
+    import psycopg
+
+    from gasha.ingestion.errors import RejectionReason, RejectionRecord
+    store = PostgresPendingEvaluationStore(pg, worker_id='a')
+    env = envelope()
+    claim = store.enqueue(env, enqueued_at=datetime.now(UTC), policy=POLICY)
+    rejection = RejectionRecord(
+        tenant_id=env.tenant_id, event_id=str(env.event_id),
+        reason=RejectionReason.EVALUATION_FAILURE, detail='synthetic failure',
+        policy_version=POLICY.policy_version,
+    )
+    # Force failure after DLQ insert but before terminal finalization.
+    pg.execute('ALTER TABLE pending_evaluations ADD CONSTRAINT synthetic_reject_terminal CHECK (NOT terminal)')
+    pg.commit()
+    try:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            store.terminate(claim, rejection, dead_letters=InMemoryDeadLetterSink(),
+                            owner='a', now=datetime.now(UTC))
+        assert pg.execute('SELECT count(*) AS n FROM dead_letters').fetchone()['n'] == 0
+        assert not store._get(env.tenant_id, env.event_id).terminal
+    finally:
+        pg.execute('ALTER TABLE pending_evaluations DROP CONSTRAINT synthetic_reject_terminal')
+        pg.commit()
+    assert store.terminate(claim, rejection, dead_letters=InMemoryDeadLetterSink(),
+                           owner='a', now=datetime.now(UTC))
+    fresh = _connect()
+    try:
+        restarted = PostgresPendingEvaluationStore(fresh, worker_id='a')
+        assert not restarted.terminate(claim, rejection, dead_letters=InMemoryDeadLetterSink(),
+                                       owner='a', now=datetime.now(UTC))
+        recovered = restarted.enqueue(env, enqueued_at=datetime.now(UTC), policy=POLICY)
+        assert recovered.terminal and recovered.policy == POLICY
+        assert restarted.due(datetime.now(UTC) + timedelta(days=1)) == ()
+        assert fresh.execute('SELECT count(*) AS n FROM dead_letters').fetchone()['n'] == 1
+    finally:
+        fresh.close()
