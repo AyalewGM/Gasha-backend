@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -364,3 +365,19 @@ def test_v2_report_rejects_nonadjacent_percentile_inversion() -> None:
     payload["latency"]["p99_processing_latency_ms"] = 0.5
     with pytest.raises(ValidationError, match="processing latency"):
         POCReport.model_validate_json(json.dumps(payload))
+
+
+def test_v2_report_builder_keeps_negative_replay_lead_unknown() -> None:
+    empty = _empty_replay()
+    replay = HistoricalReplayReport(
+        results=empty.results,
+        metrics=replace(empty.metrics, mean_detection_lead_time_seconds=-3.0),
+    )
+    payload = build_poc_report(
+        tenant_id="synthetic-tenant",
+        dataset_id="synthetic-negative-replay-clock",
+        report=replay,
+        policies={},
+    ).model_dump(mode="json")
+    assert payload["latency"]["mean_detection_lead_time_seconds"] is None
+    POCReport.model_validate_json(json.dumps(payload))
