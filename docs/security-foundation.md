@@ -16,7 +16,14 @@ protected `gasha.api.main:app` remains importable and unwired by default.
 Do not build a bank deployment from a different Dockerfile or the source
 checkout.
 The protected application authenticates `/v1/` requests in ingress middleware
-before FastAPI parses any JSON. An invalid JSON body with no/invalid credential
+before FastAPI parses any JSON. Protection is classified from the effective
+Starlette ASGI route path (server-controlled `scope["path"]` and `scope["root_path"]`),
+not `request.url.path` or any caller-supplied `X-Forwarded-Prefix` header.
+Deployment ingress must configure and record the trusted ASGI `root_path` or
+mount prefix at the server/proxy boundary; unsupported external prefix mappings
+are not treated as authorization grants. Synthetic HTTP regression tests cover
+direct paths, `/bank`, nested `/gateway/bank`, prefixed/unprefixed ASGI paths,
+spoofed forwarded headers, auth/audit outages, and shadow-only operation. An invalid JSON body with no/invalid credential
 returns a redacted audited 401 (or 503 on identity/audit outage), not an
 unauthenticated 422 exposing validation details. Endpoint dependencies reuse
 the exact ingress principal; a dependency override cannot escalate it.
