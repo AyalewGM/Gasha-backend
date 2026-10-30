@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import Literal
+from math import isclose, isfinite
+from typing import Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from gasha.domain.models import DecisionPolicy
 from gasha.poc.ablation import AblationComparison, AblationReport
@@ -25,26 +26,78 @@ from gasha.poc.incumbent import IncumbentComparison, compare_incumbent
 POC_REPORT_SCHEMA_VERSION: Literal["poc-report-2"] = "poc-report-2"
 
 
-class RateEvidence(BaseModel):
-    """Rate with its measured population; zero denominators stay unknown."""
+def _same_rate(actual: float | None, expected: float | None) -> bool:
+    """Compare measured rates without accepting non-finite values or fake nulls."""
 
-    numerator: int = Field(ge=0)
-    denominator: int = Field(ge=0)
+    if actual is None or expected is None:
+        return actual is expected
+    return isfinite(actual) and isclose(actual, expected, rel_tol=1e-12, abs_tol=1e-12)
+
+
+class RateEvidence(BaseModel):
+    """Rate with a verified population and explicit zero-denominator semantics."""
+
+    numerator: int = Field(ge=0, strict=True)
+    denominator: int = Field(ge=0, strict=True)
     value: float | None
     undefined_reason: str | None = None
 
+    @model_validator(mode="after")
+    def verify_arithmetic(self) -> Self:
+        if self.numerator > self.denominator:
+            raise ValueError("rate numerator exceeds denominator")
+        if self.denominator == 0:
+            if self.value is not None or not (
+                self.undefined_reason and self.undefined_reason.strip()
+            ):
+                raise ValueError("zero-denominator rate requires null value and reason")
+        elif self.undefined_reason is not None or not _same_rate(
+            self.value, self.numerator / self.denominator
+        ):
+            raise ValueError("rate value must equal numerator / denominator")
+        return self
+
 
 class ConfusionSummary(BaseModel):
-    true_positives: int
-    false_positives: int
-    true_negatives: int
-    false_negatives: int
+    true_positives: int = Field(ge=0, strict=True)
+    false_positives: int = Field(ge=0, strict=True)
+    true_negatives: int = Field(ge=0, strict=True)
+    false_negatives: int = Field(ge=0, strict=True)
     recall: float | None
     precision: float | None
     false_positive_rate: float | None
     f1: float | None
     false_negative_rate: float | None
     rate_evidence: dict[str, RateEvidence]
+
+    @model_validator(mode="after")
+    def verify_confusion_rates(self) -> Self:
+        tp, fp, tn, fn = (
+            self.true_positives,
+            self.false_positives,
+            self.true_negatives,
+            self.false_negatives,
+        )
+        expected = {
+            "recall": (tp, tp + fn, "no_confirmed_fraud", self.recall),
+            "precision": (tp, tp + fp, "no_labeled_alerts", self.precision),
+            "f1": (2 * tp, 2 * tp + fp + fn, "no_positive_labels_or_alerts", self.f1),
+            "false_positive_rate": (
+                fp, fp + tn, "no_confirmed_legitimate", self.false_positive_rate
+            ),
+            "false_negative_rate": (fn, tp + fn, "no_confirmed_fraud", self.false_negative_rate),
+        }
+        if self.rate_evidence.keys() != expected.keys():
+            raise ValueError("confusion rate_evidence must have exactly five required rates")
+        for name, (numerator, denominator, empty_reason, reported) in expected.items():
+            rate = self.rate_evidence[name]
+            if (rate.numerator, rate.denominator) != (numerator, denominator):
+                raise ValueError(f"{name} population contradicts confusion counts")
+            if rate.undefined_reason != (empty_reason if denominator == 0 else None):
+                raise ValueError(f"{name} undefined reason contradicts population")
+            if not _same_rate(reported, rate.value):
+                raise ValueError(f"{name} contradicts rate_evidence")
+        return self
 
 
 class LatencySummary(BaseModel):
@@ -69,6 +122,24 @@ class SignalFamilySummary(BaseModel):
     max_risk_contribution: float | None
     reason_codes: list[str]
 
+    @model_validator(mode="after")
+    def verify_share(self) -> Self:
+        if min(
+            self.alerts_influenced,
+            self.driving_alerts,
+            self.true_positives_influenced,
+            self.false_positives_influenced,
+        ) < 0:
+            raise ValueError("signal-family counts cannot be negative")
+        rate = self.share_of_detected_fraud_evidence
+        if (
+            rate.numerator != self.true_positives_influenced
+            or rate.undefined_reason != ("no_detected_fraud" if rate.denominator == 0 else None)
+            or not _same_rate(rate.value, self.share_of_detected_fraud)
+        ):
+            raise ValueError("signal-family share contradicts its population evidence")
+        return self
+
 
 class AblationSummary(BaseModel):
     configuration_name: str
@@ -88,6 +159,22 @@ class AblationSummary(BaseModel):
     recall_delta_undefined_reason: str | None
     false_positive_delta: int
     detections_lost: int
+
+    @model_validator(mode="after")
+    def verify_confusion_rates(self) -> Self:
+        ConfusionSummary(
+            true_positives=self.true_positives,
+            false_positives=self.false_positives,
+            true_negatives=self.true_negatives,
+            false_negatives=self.false_negatives,
+            recall=self.recall,
+            precision=self.precision,
+            false_positive_rate=self.false_positive_rate,
+            f1=self.f1,
+            false_negative_rate=self.false_negative_rate,
+            rate_evidence=self.rate_evidence,
+        )
+        return self
 
 
 class UniqueDetectionSummary(BaseModel):
@@ -134,9 +221,9 @@ class POCReport(BaseModel):
     rule_versions: list[str]
     model_versions: list[str]
     signal_policy_versions: list[str]
-    total_events: int
-    labeled_events: int
-    unresolved_outcomes: int
+    total_events: int = Field(ge=0, strict=True)
+    labeled_events: int = Field(ge=0, strict=True)
+    unresolved_outcomes: int = Field(ge=0, strict=True)
     fraud_prevalence: float | None
     confusion: ConfusionSummary
     explainability_coverage: float | None
@@ -147,8 +234,96 @@ class POCReport(BaseModel):
     unique_detections: list[UniqueDetectionSummary]
     multi_signal: MultiSignalSummary
     incumbent_comparison: IncumbentSummary | None
-    unmatched_outcomes: int
+    unmatched_outcomes: int = Field(ge=0, strict=True)
     limitations: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def verify_report_arithmetic(self) -> Self:
+        """Validate internal arithmetic, never provenance, identity or bank acceptance."""
+
+        c = self.confusion
+        if (
+            self.total_events != self.labeled_events + self.unresolved_outcomes
+            or self.labeled_events != (
+                c.true_positives + c.false_positives + c.true_negatives + c.false_negatives
+            )
+        ):
+            raise ValueError("POC event totals contradict confusion population")
+        prevalence = (
+            (c.true_positives + c.false_negatives) / self.labeled_events
+            if self.labeled_events
+            else None
+        )
+        if not _same_rate(self.fraud_prevalence, prevalence):
+            raise ValueError("fraud prevalence contradicts labeled confusion population")
+
+        explained = self.explainability_coverage_evidence
+        if (
+            not _same_rate(self.explainability_coverage, explained.value)
+            or explained.undefined_reason
+            != ("no_alerts" if explained.denominator == 0 else None)
+            or explained.denominator < c.true_positives + c.false_positives
+            or explained.denominator > self.total_events
+        ):
+            raise ValueError("explainability coverage contradicts alert population")
+
+        for family in self.signal_attribution:
+            if family.share_of_detected_fraud_evidence.denominator != c.true_positives:
+                raise ValueError("signal-family share uses wrong detected-fraud population")
+
+        for case in self.ablation:
+            delta = (
+                case.recall - c.recall
+                if case.recall is not None and c.recall is not None
+                else None
+            )
+            contribution = -delta if delta is not None else None
+            if (
+                not _same_rate(case.recall_delta, delta)
+                or not _same_rate(case.incremental_recall_contribution, contribution)
+                or case.recall_delta_undefined_reason
+                != ("no_confirmed_fraud" if delta is None else None)
+            ):
+                raise ValueError("ablation recall delta contradicts full replay")
+
+        incumbent = self.incumbent_comparison
+        if incumbent is not None:
+            counts = (
+                incumbent.evaluated_cases,
+                incumbent.missing_incumbent_outcomes,
+                incumbent.both_detected,
+                incumbent.gasha_only_detected,
+                incumbent.incumbent_only_detected,
+                incumbent.neither_detected,
+                incumbent.incremental_confirmed_detection,
+            )
+            if (
+                min(counts) < 0
+                or incumbent.evaluated_cases
+                != (
+                    incumbent.both_detected + incumbent.gasha_only_detected
+                    + incumbent.incumbent_only_detected + incumbent.neither_detected
+                )
+                or incumbent.evaluated_cases
+                != sum((
+                    incumbent.gasha.true_positives,
+                    incumbent.gasha.false_positives,
+                    incumbent.gasha.true_negatives,
+                    incumbent.gasha.false_negatives,
+                ))
+                or incumbent.evaluated_cases
+                != sum((
+                    incumbent.incumbent.true_positives,
+                    incumbent.incumbent.false_positives,
+                    incumbent.incumbent.true_negatives,
+                    incumbent.incumbent.false_negatives,
+                ))
+                or incumbent.evaluated_cases + incumbent.missing_incumbent_outcomes
+                > self.labeled_events
+                or incumbent.incremental_confirmed_detection > incumbent.gasha_only_detected
+            ):
+                raise ValueError("incumbent comparison population is inconsistent")
+        return self
 
 
 def build_poc_report(

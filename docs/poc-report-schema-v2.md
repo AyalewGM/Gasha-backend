@@ -37,3 +37,15 @@ The versioned consumer checks in `tests/test_poc_report_schema_version.py`
 cover valid round trip; missing, legacy and unknown versions; required new
 evidence fields; and rejected builder version overrides. Existing #58 rate
 tests cover zero and nonzero population semantics.
+
+
+## Arithmetic-integrity checks (bounded internal consumer)
+
+The v2 Pydantic consumer now rejects inconsistent or non-finite rate evidence,
+missing/contradictory zero-denominator reasons, wrong confusion populations,
+negative counts, mismatched headline rates, false event totals/prevalence,
+explainability alert denominators, signal-family share denominators, ablation
+recall deltas and incumbent comparison partitions. These are *arithmetic*
+invariants, not authentication, signatures or verified data provenance. A
+consistent but fabricated payload can still pass; #42/#49 trusted collection
+and independent verification remain mandatory before any bank-facing use.
