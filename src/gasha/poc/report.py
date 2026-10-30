@@ -136,7 +136,7 @@ class LatencySummary(BaseModel):
             self.max_processing_latency_ms,
         )
         known = [value for value in percentiles if value is not None]
-        if any(left > right for left, right in zip(known, known[1:], strict=True)):
+        if any(left > right for left, right in zip(known[:-1], known[1:], strict=True)):
             raise ValueError("processing latency percentiles are not nondecreasing")
         if (
             self.mean_processing_latency_ms is not None
