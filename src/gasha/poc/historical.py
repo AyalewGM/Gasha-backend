@@ -62,6 +62,9 @@ class HistoricalTransactionEvent(BaseModel):
 
     @model_validator(mode="after")
     def validate_recorded_timestamps(self) -> HistoricalTransactionEvent:
+        return self._check_recorded_timestamps()
+
+    def _check_recorded_timestamps(self) -> HistoricalTransactionEvent:
         """Reject impossible recorded clock order without asserting source trust.
 
         Partial historical records may omit receipt and label times. Supplied
@@ -183,7 +186,7 @@ def replay_historical(
     # unchecked updates. Validate the full batch before sorting or deciding,
     # so mixed naive/aware clocks fail closed without partial replay evidence.
     for event in events:
-        event.validate_recorded_timestamps()
+        event._check_recorded_timestamps()
 
     for event in sorted(events, key=lambda item: item.transaction.occurred_at):
         tenant_id = event.transaction.tenant_id
