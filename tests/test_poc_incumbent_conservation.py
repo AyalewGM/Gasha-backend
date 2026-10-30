@@ -13,7 +13,6 @@ from pydantic import ValidationError
 from gasha.domain import models
 from gasha.poc import historical, outcomes, report
 
-
 Case = tuple[str, bool, bool, outcomes.IncumbentControlOutcome | None]
 
 _COHORTS: dict[str, tuple[Case, ...]] = {
