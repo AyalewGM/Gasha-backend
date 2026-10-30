@@ -1,14 +1,20 @@
 """#42 trusted identity/capability seam; synthetic identities only."""
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from gasha.security.access import (
-    AuthorizationRejected, Capability, CredentialRejected, IdentityUnavailable,
-    TrustedPrincipal, authenticate, authorize, tenant_audit_ref,
+    AuthorizationRejected,
+    Capability,
+    CredentialRejected,
+    IdentityUnavailable,
+    TrustedPrincipal,
+    authenticate,
+    authorize,
+    tenant_audit_ref,
 )
 
-NOW = datetime(2026, 10, 30, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 30, tzinfo=UTC)
 
 
 def principal(**changes: object) -> TrustedPrincipal:
