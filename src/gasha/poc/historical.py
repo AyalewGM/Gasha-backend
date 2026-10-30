@@ -294,6 +294,7 @@ def reconcile_outcomes(
             reconciled.append(result)
             continue
         matched.add(key)
+        alerted = result.decision.action in _ALERT_ACTIONS
         # Outcome confirmation updates classification, not the historical
         # detection clock. Replayed decisions have no observed alert timestamp.
         reconciled.append(
