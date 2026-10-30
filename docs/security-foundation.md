@@ -6,11 +6,17 @@ tenant headers are not accepted as decision authority. The request's tenant
 identifier must match the verifier's trusted tenant scope. Evaluation mode is
 always **SHADOW** and carries no bank intervention execution.
 
-The old caller-asserted policy/risk interface is isolated in
-`gasha.api.synthetic:app` for deterministic tests and loopback-only synthetic
-development. **Never** expose that app to bank credentials, bank networks,
-production outcomes or enforcement adapters. A developer choosing the
-synthetic app explicitly is not an identity or authorization mechanism.
+The old caller-asserted policy/risk interface is retained in the *source tree*
+as `gasha.api.synthetic:app` for deterministic tests and loopback-only
+synthetic development. The default bank-targeted `Dockerfile` **deletes that
+module before installing the package**, so even an overridden container
+entrypoint cannot import the synthetic ASGI application. CI builds the actual
+image and asserts that the synthetic module is unimportable while the
+protected `gasha.api.main:app` remains importable and unwired by default.
+Do not build a bank deployment from a different Dockerfile or the source
+checkout. Bank image signing, registry provenance and deployment approval
+remain separately gated under #46/#49. A developer choosing the synthetic
+app explicitly is not an identity or authorization mechanism.
 
 ## Trusted deployment dependencies
 
