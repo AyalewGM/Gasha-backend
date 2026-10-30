@@ -150,6 +150,10 @@ def test_poc_report_assembles_machine_readable_evidence() -> None:
     assert poc.incumbent_comparison.both_detected == 1
     assert poc.incumbent_comparison.incumbent_only_detected == 1
     assert poc.limitations
+    assert poc.latency.mean_decision_latency_seconds is None
+    assert poc.latency.mean_detection_lead_time_seconds is None
+    assert poc.latency.mean_processing_latency_ms is not None
+    assert any("historical decision latency" in item for item in poc.limitations)
 
     serialized = poc.model_dump(mode="json")
     assert serialized["confusion"]["true_positives"] == 2
