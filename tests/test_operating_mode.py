@@ -4,7 +4,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
-from gasha.api.main import app
+from gasha.api.synthetic import app
 from gasha.decision.mode import ModeAwareDecisionService
 from gasha.domain.models import (
     BeneficiaryType,
