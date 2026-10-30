@@ -316,6 +316,7 @@ def test_signal_family_accepts_valid_subset_counts() -> None:
     )
     assert summary.driving_alerts == 3
 
+
 def test_incumbent_cohort_uses_late_reconciled_fraud_label() -> None:
     policies = {"tenant-a": policy()}
     pending = event(
@@ -420,6 +421,7 @@ def test_incumbent_cohort_respects_latest_label_and_tenant_boundary() -> None:
     assert comparison.gasha.false_positives == 1
     assert comparison.incumbent.false_positives == 1
     assert comparison.incremental_confirmed_detection == 0
+
 
 def test_combined_historical_reconciliation_and_report_v2() -> None:
     """Issue #48: timing, reconciled cohort and nullable report rates together."""
