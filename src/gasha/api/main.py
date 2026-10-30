@@ -322,6 +322,7 @@ def readiness(request: Request) -> JSONResponse:
 def create_decision(
     payload: TrustedDecisionRequest,
     request: Request,
+    response: Response,
     principal: Annotated[TrustedPrincipal, Depends(get_principal)],
 ) -> FraudDecision:
     tx = payload.transaction
@@ -341,6 +342,9 @@ def create_decision(
         "succeeded", "recommendation_computed", context_ref=context.context_ref,
     )
     # A recommendation is not proof of a bank-executed intervention.
+    response.headers["X-Gasha-Context-Ref"] = context.context_ref
+    response.headers["X-Gasha-Signal-Version"] = context.signal_version
+    response.headers["X-Gasha-Source-Version"] = context.signal_source_version
     return decision
 
 
@@ -348,6 +352,7 @@ def create_decision(
 def create_evaluation(
     payload: TrustedDecisionRequest,
     request: Request,
+    response: Response,
     principal: Annotated[TrustedPrincipal, Depends(get_principal)],
 ) -> DecisionEnvelope:
     tx = payload.transaction
@@ -368,6 +373,9 @@ def create_evaluation(
         request, principal, tx.tenant_id, tx.event_id, action,
         "succeeded", "shadow_recommendation_computed", context_ref=context.context_ref,
     )
+    response.headers["X-Gasha-Context-Ref"] = context.context_ref
+    response.headers["X-Gasha-Signal-Version"] = context.signal_version
+    response.headers["X-Gasha-Source-Version"] = context.signal_source_version
     return result
 
 
