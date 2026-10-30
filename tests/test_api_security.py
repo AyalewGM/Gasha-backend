@@ -1,4 +1,5 @@
 """#42 HTTP-level negative and positive tests, using only synthetic credentials."""
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
@@ -190,7 +191,7 @@ def test_body_policy_scores_mode_and_claims_cannot_override_server(wired, extra)
     assert response.status_code == 422
 
 
-def test_authorized_outcome_ingestion_and_denied_mutations(wired) -> None:
+def test_outcome_write_is_unavailable_even_with_legacy_store_injected(wired) -> None:
     client, audit, store = wired
     eid = uuid4()
     body = {
@@ -198,32 +199,45 @@ def test_authorized_outcome_ingestion_and_denied_mutations(wired) -> None:
         "outcome": "confirmed_fraud", "outcome_source": "synthetic-review",
         "outcome_version": "synthetic-v1", "confirmed_at": NOW.isoformat(),
     }
-    forbidden = client.post("/v1/outcomes", json=body, headers=headers("wrong-capability"))
-    assert forbidden.status_code == 403
+    denied = client.post("/v1/outcomes", json=body, headers=headers("wrong-capability"))
+    assert denied.status_code == 403
     assert store.store.outcomes("tenant-a", eid) == ()
-    unauthorized = client.post(
+    cross_tenant = client.post(
         "/v1/outcomes", json={**body, "tenant_id": "tenant-b"}, headers=headers(),
     )
-    assert unauthorized.status_code == 404
+    assert cross_tenant.status_code == 404
     assert store.store.outcomes("tenant-b", eid) == ()
-    accepted = client.post("/v1/outcomes", json=body, headers=headers())
-    assert accepted.status_code == 200
-    assert accepted.json()["status"] == "accepted"
-    repeated = client.post("/v1/outcomes", json=body, headers=headers())
-    assert repeated.json()["status"] == "duplicate"
-    assert any(e.result == "denied" for e in audit.events)
+    for _ in range(2):
+        response = client.post("/v1/outcomes", json=body, headers=headers())
+        assert response.status_code == 503
+        assert response.json()["detail"] == "transactional outcome ingestion unavailable"
+        assert store.store.outcomes("tenant-a", eid) == ()
+    records = [e for e in audit.events if e.action == Capability.OUTCOME_SUBMIT.value
+               and e.reason == "transactional_outcome_unavailable"]
+    assert len(records) == 2
+    assert all(e.result == "failed" for e in records)
+    assert len({e.attempt_ref for e in records}) == 2
+    assert len({e.event_ref for e in records}) == 1
 
 
 def test_incumbent_outcome_has_separate_capability(wired) -> None:
-    client, _, _ = wired
+    client, audit, store = wired
+    eid = uuid4()
     body = {
-        "tenant_id": "tenant-a", "event_id": str(uuid4()),
+        "tenant_id": "tenant-a", "event_id": str(eid),
         "outcome": "review", "source_system": "synthetic-incumbent",
     }
-    assert client.post("/v1/incumbent-outcomes", json=body, headers=headers()).status_code == 200
+    allowed = client.post("/v1/incumbent-outcomes", json=body, headers=headers())
+    assert allowed.status_code == 503
     assert client.post(
         "/v1/incumbent-outcomes", json=body, headers=headers("wrong-capability"),
     ).status_code == 403
+    assert store.store.incumbent_outcomes("tenant-a", eid) == ()
+    assert any(
+        e.action == Capability.INCUMBENT_OUTCOME_SUBMIT.value
+        and e.reason == "transactional_outcome_unavailable" and e.result == "failed"
+        for e in audit.events
+    )
 
 
 def test_missing_context_or_audit_fails_closed(wired) -> None:
@@ -384,3 +398,97 @@ def test_missing_outcome_store_records_terminal_failure(wired) -> None:
     assert [e.result for e in events] == ["authorized", "failed"]
     assert events[0].attempt_ref == events[1].attempt_ref
     assert events[0].event_ref == events[1].event_ref
+
+
+@pytest.mark.parametrize("incumbent", [False, True])
+def test_terminal_audit_outage_never_orphans_protected_outcome(wired, incumbent) -> None:
+    client, _, store = wired
+
+    class FailingTerminalAudit(Audit):
+        def append(self, event) -> None:
+            if event.result == "failed" and event.reason == "transactional_outcome_unavailable":
+                raise RuntimeError("synthetic terminal audit outage")
+            super().append(event)
+
+    replacement = FailingTerminalAudit()
+    app.state.security_audit = replacement
+    eid = uuid4()
+    path = "/v1/incumbent-outcomes" if incumbent else "/v1/outcomes"
+    body = (
+        {"tenant_id": "tenant-a", "event_id": str(eid),
+         "outcome": "review", "source_system": "synthetic-incumbent"}
+        if incumbent else
+        {"tenant_id": "tenant-a", "event_id": str(eid),
+         "outcome": "confirmed_fraud", "outcome_source": "synthetic-review",
+         "outcome_version": "synthetic-v1", "confirmed_at": NOW.isoformat()}
+    )
+    for _ in range(2):
+        response = client.post(path, json=body, headers=headers())
+        assert response.status_code == 503
+        assert store.store.outcomes("tenant-a", eid) == ()
+        assert store.store.incumbent_outcomes("tenant-a", eid) == ()
+    assert sum(e.result == "authorized" for e in replacement.events) == 2
+    assert not any(e.result == "succeeded" for e in replacement.events)
+
+
+@pytest.mark.parametrize("incumbent", [False, True])
+def test_legacy_store_error_cannot_reach_protected_outcome_route(wired, incumbent) -> None:
+    client, audit, _ = wired
+
+    class ExplodingLegacyStore(OutcomeIngestionService):
+        def submit(self, record):
+            raise RuntimeError("synthetic outcome store outage")
+
+        def submit_incumbent(self, record):
+            raise RuntimeError("synthetic incumbent store outage")
+
+    app.state.outcome_ingestion = ExplodingLegacyStore()
+    eid = uuid4()
+    path = "/v1/incumbent-outcomes" if incumbent else "/v1/outcomes"
+    body = (
+        {"tenant_id": "tenant-a", "event_id": str(eid),
+         "outcome": "review", "source_system": "synthetic-incumbent"}
+        if incumbent else
+        {"tenant_id": "tenant-a", "event_id": str(eid),
+         "outcome": "confirmed_fraud", "outcome_source": "synthetic-review",
+         "outcome_version": "synthetic-v1", "confirmed_at": NOW.isoformat()}
+    )
+    response = client.post(path, json=body, headers=headers())
+    assert response.status_code == 503
+    assert response.json()["detail"] == "transactional outcome ingestion unavailable"
+    assert any(e.reason == "transactional_outcome_unavailable" for e in audit.events)
+
+
+@pytest.mark.parametrize("incumbent", [False, True])
+def test_concurrent_replays_are_denied_without_orphan_mutations(wired, incumbent) -> None:
+    client, audit, store = wired
+    eid = uuid4()
+    path = "/v1/incumbent-outcomes" if incumbent else "/v1/outcomes"
+    body = (
+        {"tenant_id": "tenant-a", "event_id": str(eid),
+         "outcome": "review", "source_system": "synthetic-incumbent"}
+        if incumbent else
+        {"tenant_id": "tenant-a", "event_id": str(eid),
+         "outcome": "confirmed_fraud", "outcome_source": "synthetic-review",
+         "outcome_version": "synthetic-v1", "confirmed_at": NOW.isoformat()}
+    )
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        responses = list(pool.map(
+            lambda _: client.post(path, json=body, headers=headers()), range(6),
+        ))
+    assert all(response.status_code == 503 for response in responses)
+    assert store.store.outcomes("tenant-a", eid) == ()
+    assert store.store.incumbent_outcomes("tenant-a", eid) == ()
+    cap = Capability.INCUMBENT_OUTCOME_SUBMIT if incumbent else Capability.OUTCOME_SUBMIT
+    failures = [e for e in audit.events if
+                e.action == cap.value and e.reason == "transactional_outcome_unavailable"]
+    assert len(failures) == 6
+    assert len({e.attempt_ref for e in failures}) == 6
+    assert len({e.event_ref for e in failures}) == 1
+
+
+def test_ready_never_claims_legacy_outcome_store_is_transactional(wired) -> None:
+    client, _, _ = wired
+    response = client.get("/health/ready")
+    assert response.status_code == 503
+    assert response.json()["checks"]["outcome_atomic_commit"] is False

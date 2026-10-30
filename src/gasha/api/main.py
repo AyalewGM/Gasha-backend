@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
-from typing import Annotated, Protocol
+from typing import Annotated, NoReturn, Protocol
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
@@ -28,7 +28,6 @@ from gasha.domain.models import (
 )
 from gasha.ingestion.outcome_ingestion import (
     IncumbentOutcomeRecord,
-    OutcomeIngestionService,
     OutcomeSubmission,
 )
 from gasha.poc.outcomes import OutcomeRecord
@@ -152,6 +151,7 @@ app = FastAPI(title="Gasha Protected Fraud Decision API", version="0.3.0")
 app.state.identity_verifier = None
 app.state.security_audit = None
 app.state.decision_context_provider = None
+# Legacy reference service remains injectable for negative tests, never bank writes.
 app.state.outcome_ingestion = None
 
 
@@ -286,13 +286,6 @@ def _trusted_context(
     return context
 
 
-def get_outcome_ingestion(request: Request) -> OutcomeIngestionService:
-    service = getattr(request.app.state, "outcome_ingestion", None)
-    if not isinstance(service, OutcomeIngestionService):
-        raise HTTPException(status_code=503, detail="outcome store unavailable")
-    return service
-
-
 @app.get("/health/live")
 def liveness() -> dict[str, str]:
     return {"status": "ok"}
@@ -307,9 +300,9 @@ def readiness(request: Request) -> JSONResponse:
         "decision_context_provider": (
             getattr(request.app.state, "decision_context_provider", None) is not None
         ),
-        "outcome_ingestion": isinstance(
-            getattr(request.app.state, "outcome_ingestion", None), OutcomeIngestionService
-        ),
+        # No durable outcome+terminal-audit atomic adapter is implemented.
+        # Legacy/in-memory dependency injection cannot turn this gate green.
+        "outcome_atomic_commit": False,
     }
     ready = all(checks.values())
     return JSONResponse(
@@ -379,27 +372,40 @@ def create_evaluation(
     return result
 
 
+def _reject_untransactional_outcome(
+    request: Request,
+    principal: TrustedPrincipal,
+    tenant_id: str,
+    event_id: UUID,
+    capability: Capability,
+) -> NoReturn:
+    """Fail closed until outcome and terminal audit can commit atomically.
+
+    The legacy OutcomeIngestionService reads then appends without a transaction;
+    accepting it here risks a changed outcome and HTTP 503 if terminal auditing
+    fails after the write. No injected in-memory service or request-controlled
+    switch is permitted to enable protected outcome mutation.
+    """
+    _require_action(request, principal, tenant_id, capability, event_id=event_id)
+    _operation_audit(
+        request, principal, tenant_id, event_id, capability,
+        "failed", "transactional_outcome_unavailable",
+    )
+    raise HTTPException(
+        status_code=503, detail="transactional outcome ingestion unavailable",
+    )
+
+
 @app.post("/v1/outcomes", response_model=OutcomeSubmission)
 def submit_outcome(
     record: OutcomeRecord,
     request: Request,
     principal: Annotated[TrustedPrincipal, Depends(get_principal)],
 ) -> OutcomeSubmission:
-    action = Capability.OUTCOME_SUBMIT
-    _require_action(request, principal, record.tenant_id, action, event_id=record.event_id)
-    try:
-        result = get_outcome_ingestion(request).submit(record)
-    except Exception as exc:
-        _operation_audit(
-            request, principal, record.tenant_id, record.event_id,
-            action, "failed", "outcome_store_unavailable",
-        )
-        raise HTTPException(status_code=503, detail="outcome store unavailable") from exc
-    _operation_audit(
-        request, principal, record.tenant_id, record.event_id,
-        action, "succeeded", "outcome_submitted",
+    """Bank-facing mutation disabled pending a trusted atomic outcome/audit port."""
+    _reject_untransactional_outcome(
+        request, principal, record.tenant_id, record.event_id, Capability.OUTCOME_SUBMIT,
     )
-    return result
 
 
 @app.post("/v1/incumbent-outcomes", response_model=OutcomeSubmission)
@@ -408,18 +414,8 @@ def submit_incumbent_outcome(
     request: Request,
     principal: Annotated[TrustedPrincipal, Depends(get_principal)],
 ) -> OutcomeSubmission:
-    action = Capability.INCUMBENT_OUTCOME_SUBMIT
-    _require_action(request, principal, record.tenant_id, action, event_id=record.event_id)
-    try:
-        result = get_outcome_ingestion(request).submit_incumbent(record)
-    except Exception as exc:
-        _operation_audit(
-            request, principal, record.tenant_id, record.event_id,
-            action, "failed", "outcome_store_unavailable",
-        )
-        raise HTTPException(status_code=503, detail="outcome store unavailable") from exc
-    _operation_audit(
+    """Same fail-closed boundary for incumbent-control outcome evidence."""
+    _reject_untransactional_outcome(
         request, principal, record.tenant_id, record.event_id,
-        action, "succeeded", "incumbent_outcome_submitted",
+        Capability.INCUMBENT_OUTCOME_SUBMIT,
     )
-    return result

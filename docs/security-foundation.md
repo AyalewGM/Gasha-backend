@@ -20,8 +20,9 @@ app explicitly is not an identity or authorization mechanism.
 
 ## Trusted deployment dependencies
 
-All four dependencies are absent by default, so the protected app cannot
-serve decision or outcome mutations without deliberate wiring:
+The protected decision routes require three trusted dependencies, all absent
+by default. Protected outcome mutation is disabled unconditionally until an
+atomic outcome-and-terminal-audit persistence adapter is independently accepted:
 
 - `identity_verifier`: provider-neutral `CredentialVerifier` validates
   credential signature/issuer/audience, expiry, rotation and revocation;
@@ -36,9 +37,12 @@ serve decision or outcome mutations without deliberate wiring:
   provider-declared collection/expiry window checked against service time.
   Provider trust/attestation and actual bank signal ingestion remain separate
   integration controls.
-- `outcome_ingestion`: explicitly provisioned `OutcomeIngestionService`
-  with a bank-approved durable and tenant-scoped store. The old in-memory
-  default is not silently mounted in the protected app.
+- The legacy `outcome_ingestion` field is deliberately ignored by protected
+  outcome routes. A mutable/in-memory `OutcomeIngestionService` cannot prove
+  that the outcome and correlated terminal audit commit atomically, and no
+  temporary injected service can enable bank writes. `/health/ready` reports
+  `outcome_atomic_commit=false` and HTTP 503 until an independently verified
+  durable transactional port and tenant-scoped idempotent retry contract exist.
 
 The provider controls are typed *interfaces*, not an actual Bank-approved
 identity service or provisioning record. The Bank must select identity,
@@ -51,8 +55,8 @@ retention, monitoring, incident procedures and deployment approval.
 | --- | --- | --- |
 | POST /v1/decisions | decision.submit | trusted principal + canonical transaction |
 | POST /v1/evaluations | decision.submit | trusted principal + canonical transaction |
-| POST /v1/outcomes | outcome.submit | trusted principal + outcome record |
-| POST /v1/incumbent-outcomes | incumbent_outcome.submit | trusted principal + incumbent record |
+| POST /v1/outcomes | outcome.submit (writes disabled; HTTP 503) | trusted principal + outcome record |
+| POST /v1/incumbent-outcomes | incumbent_outcome.submit (writes disabled; HTTP 503) | trusted principal + incumbent record |
 | GET /health/live | none | no sensitive response |
 | GET /health/ready | none | wiring presence only, not deep dependency verification |
 
@@ -66,11 +70,16 @@ tokens, request bodies, raw PII and secrets are never included in audit events.
 Each protected request receives a server-generated attempt reference; action
 authorization and terminal outcome use distinct result labels and share a
 hashed tenant/event reference. Successful evaluations include a server-chosen
-policy/signal context digest. Provider/store errors append a redacted terminal
-failure event before HTTP 503; an unavailable audit sink fails closed before
-mutation. These are interface-level controls. Durable audit/outcome atomicity
-must be established with a production transactional adapter under full #42;
-an audit failure after an outcome write is not claimed to roll back that write.
+policy/signal context digest. Provider errors append a redacted terminal failure event before HTTP 503.
+For both protected outcome routes, valid principal+tenant+capability still
+returns 503 with a redacted `transactional_outcome_unavailable` failure event
+and **no outcome state change**. Missing/broken audit blocks these attempts;
+legacy store injection cannot bypass the fail-closed route. Synthetic-only
+in-memory outcomes continue in the separately isolated dev application.
+Successful protected idempotent replay and transactional audit/outcome
+persistence are **not yet implemented**: they need a tenant-scoped durable
+adapter with atomic commit, concurrency/idempotency tests and independent
+Security/QA acceptance. A 503 is never represented as an accepted outcome.
 
 ## Remaining acceptance gates
 
