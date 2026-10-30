@@ -1,5 +1,5 @@
 """#42 HTTP-level negative and positive tests, using only synthetic credentials."""
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -8,14 +8,19 @@ from fastapi.testclient import TestClient
 
 from gasha.api.main import TrustedDecisionContext, app
 from gasha.domain.models import (
-    BeneficiaryType, CanonicalTransaction, DecisionPolicy, IntelligenceSnapshot,
+    BeneficiaryType,
+    CanonicalTransaction,
+    DecisionPolicy,
+    IntelligenceSnapshot,
 )
 from gasha.ingestion.outcome_ingestion import OutcomeIngestionService
 from gasha.security.access import (
-    Capability, CredentialRejected, TrustedPrincipal,
+    Capability,
+    CredentialRejected,
+    TrustedPrincipal,
 )
 
-NOW = datetime.now(timezone.utc)
+NOW = datetime.now(UTC)
 
 
 class Audit:
