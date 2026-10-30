@@ -47,8 +47,9 @@ class HistoricalTransactionEvent(BaseModel):
     ``transaction.occurred_at`` is the preserved historical event time and
     ``intelligence`` carries the point-in-time features assembled upstream by
     the same intelligence layer that feeds the production decision path.
-    ``received_at`` optionally records when the event reached Gasha so latency
-    measurement can separate queue delay from evaluation time.
+    ``received_at`` records the original receipt timestamp when known.
+    Historical bank decision/alert timestamps are not part of this contract;
+    replay execution cannot establish historical detection lead time.
     """
 
     transaction: CanonicalTransaction
@@ -79,7 +80,7 @@ class ReplayedEventResult:
     event: HistoricalTransactionEvent
     decision: FraudDecision
     classification: ReplayClassification
-    decision_latency: timedelta
+    decision_latency: timedelta | None
     detection_lead_time: timedelta | None
     evaluation_started_at: datetime | None = None
     evaluation_ended_at: datetime | None = None
@@ -238,11 +239,10 @@ def _result(
     label = event.label
     is_fraud = label.is_fraud if label is not None else None
 
-    lead_time = None
-    if alerted and label is not None and label.is_fraud and label.confirmed_at:
-        lead_time = label.confirmed_at - decision.decided_at
+    # decided_at is a *replay execution* timestamp, not a historical alert
+    # timestamp. A confirmed label does not establish when fraud was detected.
+    # Never fabricate lead time using the replay wall clock.
 
-    received_at = event.received_at or event.transaction.occurred_at
     processing_latency = None
     if evaluation_started_at is not None and evaluation_ended_at is not None:
         processing_latency = evaluation_ended_at - evaluation_started_at
@@ -251,8 +251,10 @@ def _result(
         event=event,
         decision=decision,
         classification=_classify(alerted, is_fraud),
-        decision_latency=decision.decided_at - received_at,
-        detection_lead_time=lead_time,
+        # Historical decision latency is unknown without the original bank
+        # decision timestamp. Processing latency is measured separately.
+        decision_latency=None,
+        detection_lead_time=None,
         evaluation_started_at=evaluation_started_at,
         evaluation_ended_at=evaluation_ended_at,
         processing_latency=processing_latency,
@@ -292,21 +294,12 @@ def reconcile_outcomes(
             reconciled.append(result)
             continue
         matched.add(key)
-        alerted = result.decision.action in _ALERT_ACTIONS
-        lead_time = result.detection_lead_time
-        if (
-            alerted
-            and matched_outcome.is_fraud
-            and matched_outcome.confirmed_at is not None
-        ):
-            lead_time = (
-                matched_outcome.confirmed_at - result.decision.decided_at
-            )
+        # Outcome confirmation updates classification, not the historical
+        # detection clock. Replayed decisions have no observed alert timestamp.
         reconciled.append(
             replace(
                 result,
                 classification=_classify(alerted, matched_outcome.is_fraud),
-                detection_lead_time=lead_time,
                 reconciled_outcome=matched_outcome,
             )
         )
@@ -351,7 +344,8 @@ def _metrics(results: list[ReplayedEventResult]) -> HistoricalReplayMetrics:
             and item.decision.reason_codes != ["NO_HIGH_RISK_SIGNAL"]
         ):
             explained += 1
-        latencies.append(item.decision_latency.total_seconds())
+        if item.decision_latency is not None:
+            latencies.append(item.decision_latency.total_seconds())
         if item.detection_lead_time is not None:
             lead_times.append(item.detection_lead_time.total_seconds())
         if item.processing_latency is not None:
