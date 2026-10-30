@@ -13,6 +13,7 @@ from gasha.poc.attribution import (
     attribute_signals,
 )
 from gasha.poc.historical import (
+    ALERT_ACTIONS,
     HistoricalReplayMetrics,
     HistoricalReplayReport,
     MissingTenantPolicyError,
@@ -186,10 +187,13 @@ def build_poc_report(
         metrics.true_negatives,
         metrics.false_negatives,
     )
+    all_alerts = sum(
+        result.decision.action in ALERT_ACTIONS for result in report.results
+    )
     explainability = _rate_evidence(
         metrics.explained_alerts,
-        metrics.true_positives + metrics.false_positives,
-        "no_labeled_alerts",
+        all_alerts,
+        "no_alerts",
     )
     if attribution is None:
         attribution = attribute_signals(report.results, policies)
@@ -215,7 +219,7 @@ def build_poc_report(
             )
     if explainability.value is None:
         derived_limitations.append(
-            "explainability coverage undefined: no labeled alerts"
+            "explainability coverage undefined: no alerts"
         )
     if metrics.true_positives == 0:
         derived_limitations.append(
