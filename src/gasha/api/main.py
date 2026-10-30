@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Annotated, Protocol
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from gasha.decision.mode import DecisionEnvelope, ModeAwareDecisionService
@@ -179,7 +180,7 @@ def liveness() -> dict[str, str]:
 
 
 @app.get("/health/ready")
-def readiness(request: Request) -> dict[str, object]:
+def readiness(request: Request) -> JSONResponse:
     """Non-sensitive wiring check only. #46 still requires dependency probes."""
     checks = {
         "identity_verifier": getattr(request.app.state, "identity_verifier", None) is not None,
@@ -191,10 +192,11 @@ def readiness(request: Request) -> dict[str, object]:
             getattr(request.app.state, "outcome_ingestion", None), OutcomeIngestionService
         ),
     }
-    return {
-        "status": "ready" if all(checks.values()) else "not_ready",
-        "checks": checks,
-    }
+    ready = all(checks.values())
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"status": "ready" if ready else "not_ready", "checks": checks},
+    )
 
 
 @app.post("/v1/decisions", response_model=FraudDecision)
