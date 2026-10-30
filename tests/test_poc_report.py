@@ -456,7 +456,10 @@ def test_combined_historical_reconciliation_and_report_v2() -> None:
     assert payload["latency"]["mean_detection_lead_time_seconds"] is None
     assert payload["confusion"]["true_positives"] == 1
     assert payload["confusion"]["rate_evidence"]["false_positive_rate"]["value"] is None
-    assert payload["confusion"]["rate_evidence"]["false_positive_rate"]["undefined_reason"] == "no_confirmed_legitimate"
+    assert (
+        payload["confusion"]["rate_evidence"]["false_positive_rate"]["undefined_reason"]
+        == "no_confirmed_legitimate"
+    )
     assert payload["incumbent_comparison"]["evaluated_cases"] == 1
     assert payload["incumbent_comparison"]["incremental_confirmed_detection"] == 1
     assert any("historical decision latency" in note for note in payload["limitations"])
