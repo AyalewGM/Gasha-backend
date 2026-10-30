@@ -177,3 +177,40 @@ def test_json_consumer_rejects_comparison_arithmetic_tampering(
 
     with pytest.raises(ValidationError, match="incumbent comparison population"):
         report.POCReport.model_validate_json(json.dumps(payload))
+
+
+def test_json_consumer_rejects_lower_bound_incremental_tampering() -> None:
+    # Two confirmed frauds occupy opposite exclusive alert cells.
+    # Their real-builder incremental detection is necessarily one.
+    payload = _payload("fraud")
+    comparison = payload["incumbent_comparison"]
+    assert isinstance(comparison, dict)
+    assert comparison["both_detected"] == 0
+    assert comparison["gasha_only_detected"] == 1
+    assert comparison["incumbent_only_detected"] == 1
+    assert comparison["neither_detected"] == 0
+    assert comparison["incremental_confirmed_detection"] == 1
+    report.POCReport.model_validate_json(json.dumps(payload))
+    comparison["incremental_confirmed_detection"] = 0
+    with pytest.raises(ValidationError, match="joint fraud allocation"):
+        report.POCReport.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize("cohort", list(_COHORTS))
+def test_json_builder_joint_fraud_allocation_is_feasible(cohort: str) -> None:
+    payload = _payload(cohort)
+    validated = report.POCReport.model_validate_json(json.dumps(payload))
+    incumbent = validated.incumbent_comparison
+    assert incumbent is not None
+    fraud = incumbent.gasha.true_positives + incumbent.gasha.false_negatives
+    gtp = incumbent.gasha.true_positives
+    itp = incumbent.incumbent.true_positives
+    x = incumbent.incremental_confirmed_detection
+    allocations = (gtp - x, x, itp - gtp + x, fraud - itp - x)
+    sizes = (
+        incumbent.both_detected,
+        incumbent.gasha_only_detected,
+        incumbent.incumbent_only_detected,
+        incumbent.neither_detected,
+    )
+    assert all(0 <= count <= size for count, size in zip(allocations, sizes, strict=True))
