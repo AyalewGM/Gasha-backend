@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+from starlette._utils import get_route_path
 from pydantic import BaseModel, ConfigDict
 
 from gasha.decision.mode import DecisionEnvelope, ModeAwareDecisionService
@@ -173,7 +174,10 @@ async def assign_attempt_ref(
     # FastAPI parses malformed JSON before executing Depends(get_principal).
     # Authenticate at ingress so bad JSON cannot skip credential verification
     # or the redacted authentication audit on protected endpoints.
-    if request.url.path.startswith("/v1/"):
+    # Use the same trusted ASGI scope/root_path resolution as Starlette routing.
+    # request.url.path includes deployment prefixes and can miss routed /v1/ endpoints.
+    # Client-provided X-Forwarded-Prefix/role/tenant headers are not route authority.
+    if get_route_path(request.scope).startswith("/v1/"):
         try:
             request.state.authenticated_principal = get_principal(
                 request, request.headers.get("authorization")
