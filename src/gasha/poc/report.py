@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from math import isclose, isfinite
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -24,6 +24,9 @@ from gasha.poc.incumbent import IncumbentComparison, compare_incumbent
 
 # A schema identifier, not an evidence authenticity or approval indicator.
 POC_REPORT_SCHEMA_VERSION: Literal["poc-report-2"] = "poc-report-2"
+
+# Count evidence is strict: never coerce true, numeric strings, or floats to integers.
+StrictCount = Annotated[int, Field(ge=0, strict=True)]
 
 
 def _same_rate(actual: float | None, expected: float | None) -> bool:
@@ -101,21 +104,55 @@ class ConfusionSummary(BaseModel):
 
 
 class LatencySummary(BaseModel):
-    mean_decision_latency_seconds: float | None = None
-    mean_detection_lead_time_seconds: float | None = None
-    mean_processing_latency_ms: float | None = None
-    median_processing_latency_ms: float | None = None
-    p95_processing_latency_ms: float | None = None
-    p99_processing_latency_ms: float | None = None
-    max_processing_latency_ms: float | None = None
+    # Unknown historical observation times are represented as null, not zero.
+    mean_decision_latency_seconds: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False, strict=True
+    )
+    mean_detection_lead_time_seconds: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False, strict=True
+    )
+    mean_processing_latency_ms: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False, strict=True
+    )
+    median_processing_latency_ms: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False, strict=True
+    )
+    p95_processing_latency_ms: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False, strict=True
+    )
+    p99_processing_latency_ms: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False, strict=True
+    )
+    max_processing_latency_ms: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False, strict=True
+    )
+
+    @model_validator(mode="after")
+    def verify_processing_percentiles(self) -> Self:
+        percentiles = (
+            self.median_processing_latency_ms,
+            self.p95_processing_latency_ms,
+            self.p99_processing_latency_ms,
+            self.max_processing_latency_ms,
+        )
+        known = [value for value in percentiles if value is not None]
+        if any(left > right for left, right in zip(known, known[1:], strict=True)):
+            raise ValueError("processing latency percentiles are not nondecreasing")
+        if (
+            self.mean_processing_latency_ms is not None
+            and self.max_processing_latency_ms is not None
+            and self.mean_processing_latency_ms > self.max_processing_latency_ms
+        ):
+            raise ValueError("mean processing latency exceeds maximum")
+        return self
 
 
 class SignalFamilySummary(BaseModel):
     family: str
-    alerts_influenced: int
-    driving_alerts: int
-    true_positives_influenced: int
-    false_positives_influenced: int
+    alerts_influenced: StrictCount
+    driving_alerts: StrictCount
+    true_positives_influenced: StrictCount
+    false_positives_influenced: StrictCount
     share_of_detected_fraud: float | None
     share_of_detected_fraud_evidence: RateEvidence
     mean_risk_contribution: float | None
@@ -151,10 +188,10 @@ class SignalFamilySummary(BaseModel):
 class AblationSummary(BaseModel):
     configuration_name: str
     removed_families: list[str]
-    true_positives: int
-    false_positives: int
-    true_negatives: int
-    false_negatives: int
+    true_positives: StrictCount
+    false_positives: StrictCount
+    true_negatives: StrictCount
+    false_negatives: StrictCount
     recall: float | None
     precision: float | None
     false_positive_rate: float | None
@@ -164,8 +201,8 @@ class AblationSummary(BaseModel):
     recall_delta: float | None
     incremental_recall_contribution: float | None
     recall_delta_undefined_reason: str | None
-    false_positive_delta: int
-    detections_lost: int
+    false_positive_delta: int = Field(strict=True)  # Signed delta; negative is valid.
+    detections_lost: StrictCount
 
     @model_validator(mode="after")
     def verify_confusion_rates(self) -> Self:
@@ -187,24 +224,24 @@ class AblationSummary(BaseModel):
 class UniqueDetectionSummary(BaseModel):
     family: str
     reason: str
-    detections: int
+    detections: StrictCount
     event_ids: list[str]
 
 
 class MultiSignalSummary(BaseModel):
-    detections: int
-    family_combination_counts: dict[str, int]
-    named_combination_detections: dict[str, int]
+    detections: StrictCount
+    family_combination_counts: dict[str, StrictCount]
+    named_combination_detections: dict[str, StrictCount]
 
 
 class IncumbentSummary(BaseModel):
-    evaluated_cases: int
-    missing_incumbent_outcomes: int
-    both_detected: int
-    gasha_only_detected: int
-    incumbent_only_detected: int
-    neither_detected: int
-    incremental_confirmed_detection: int
+    evaluated_cases: StrictCount
+    missing_incumbent_outcomes: StrictCount
+    both_detected: StrictCount
+    gasha_only_detected: StrictCount
+    incumbent_only_detected: StrictCount
+    neither_detected: StrictCount
+    incremental_confirmed_detection: StrictCount
     gasha: ConfusionSummary
     incumbent: ConfusionSummary
 
