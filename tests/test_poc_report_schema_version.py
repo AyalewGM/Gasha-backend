@@ -234,3 +234,133 @@ def test_v2_rejects_inconsistent_incumbent_partitions() -> None:
     payload["incumbent_comparison"]["both_detected"] = 1
     with pytest.raises(ValidationError, match="incumbent comparison population"):
         POCReport.model_validate(payload)
+
+
+# These tests cross the full installed POCReport JSON boundary rather than
+# validating isolated Pydantic count classes.
+_STRICT_COUNT_PATHS = [
+    "signal_attribution.0.alerts_influenced",
+    "signal_attribution.0.driving_alerts",
+    "signal_attribution.0.true_positives_influenced",
+    "signal_attribution.0.false_positives_influenced",
+    "ablation.0.true_positives",
+    "ablation.0.false_positives",
+    "ablation.0.true_negatives",
+    "ablation.0.false_negatives",
+    "ablation.0.detections_lost",
+    "unique_detections.0.detections",
+    "multi_signal.detections",
+    "multi_signal.family_combination_counts.synthetic",
+    "multi_signal.named_combination_detections.synthetic",
+]
+
+
+def _count_payload(path: str) -> dict[str, Any]:
+    payload = _with_empty_ablation() if path.startswith("ablation.") else _v2_payload()
+    if path.startswith("unique_detections."):
+        payload["unique_detections"] = [
+            {"family": "network", "reason": "synthetic", "detections": 0, "event_ids": []}
+        ]
+    if "family_combination_counts." in path:
+        payload["multi_signal"]["family_combination_counts"]["synthetic"] = 0
+    if "named_combination_detections." in path:
+        payload["multi_signal"]["named_combination_detections"]["synthetic"] = 0
+    return payload
+
+
+@pytest.mark.parametrize("path", _STRICT_COUNT_PATHS)
+@pytest.mark.parametrize("invalid", [True, "0", 0.0, -1])
+def test_v2_report_rejects_non_strict_count_payloads(
+    path: str, invalid: Any
+) -> None:
+    payload = _count_payload(path)
+    POCReport.model_validate_json(json.dumps(payload))
+    _change(payload, path, invalid)
+    with pytest.raises(ValidationError):
+        POCReport.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize("invalid", [True, "0", 0.0])
+def test_v2_report_rejects_non_strict_signed_delta(invalid: Any) -> None:
+    payload = _with_empty_ablation()
+    payload["ablation"][0]["false_positive_delta"] = invalid
+    with pytest.raises(ValidationError):
+        POCReport.model_validate_json(json.dumps(payload))
+
+
+def test_v2_report_allows_negative_signed_false_positive_delta() -> None:
+    payload = _with_empty_ablation()
+    payload["ablation"][0]["false_positive_delta"] = -1
+    assert (
+        POCReport.model_validate_json(json.dumps(payload))
+        .ablation[0].false_positive_delta == -1
+    )
+
+
+_LATENCY_FIELDS = [
+    "mean_decision_latency_seconds",
+    "mean_detection_lead_time_seconds",
+    "mean_processing_latency_ms",
+    "median_processing_latency_ms",
+    "p95_processing_latency_ms",
+    "p99_processing_latency_ms",
+    "max_processing_latency_ms",
+]
+
+
+@pytest.mark.parametrize("field", _LATENCY_FIELDS)
+@pytest.mark.parametrize(
+    "invalid", [-1.0, float("nan"), float("inf"), float("-inf"), "1", "NaN"]
+)
+def test_v2_report_rejects_invalid_latency_json(field: str, invalid: Any) -> None:
+    payload = _v2_payload()
+    payload["latency"][field] = invalid
+    with pytest.raises(ValidationError):
+        POCReport.model_validate_json(json.dumps(payload))
+
+
+def _measured_latency_payload() -> dict[str, Any]:
+    payload = _v2_payload()
+    payload["latency"].update({
+        "mean_processing_latency_ms": 2.0,
+        "median_processing_latency_ms": 1.0,
+        "p95_processing_latency_ms": 2.0,
+        "p99_processing_latency_ms": 3.0,
+        "max_processing_latency_ms": 4.0,
+    })
+    return payload
+
+
+def test_v2_report_accepts_finite_coherent_latency_and_unknown_timing() -> None:
+    payload = _measured_latency_payload()
+    validated = POCReport.model_validate_json(json.dumps(payload))
+    assert validated.latency.mean_decision_latency_seconds is None
+    assert validated.latency.mean_detection_lead_time_seconds is None
+    assert validated.latency.p95_processing_latency_ms == 2.0
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("median_processing_latency_ms", 2.5),
+        ("p95_processing_latency_ms", 0.5),
+        ("p99_processing_latency_ms", 1.5),
+        ("max_processing_latency_ms", 2.5),
+        ("mean_processing_latency_ms", 4.5),
+    ],
+)
+def test_v2_report_rejects_incoherent_processing_latencies(
+    field: str, invalid: float
+) -> None:
+    payload = _measured_latency_payload()
+    payload["latency"][field] = invalid
+    with pytest.raises(ValidationError, match="processing latency|mean processing"):
+        POCReport.model_validate_json(json.dumps(payload))
+
+
+def test_v2_report_rejects_nonadjacent_percentile_inversion() -> None:
+    payload = _measured_latency_payload()
+    payload["latency"]["p95_processing_latency_ms"] = None
+    payload["latency"]["p99_processing_latency_ms"] = 0.5
+    with pytest.raises(ValidationError, match="processing latency"):
+        POCReport.model_validate_json(json.dumps(payload))
