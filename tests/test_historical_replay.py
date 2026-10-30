@@ -325,3 +325,83 @@ def test_late_outcome_reconciliation_does_not_invent_lead_time() -> None:
     assert reconciled.results[0].decision_latency is None
     assert reconciled.metrics.mean_detection_lead_time_seconds is None
     assert reconciled.metrics.mean_decision_latency_seconds is None
+
+
+@pytest.mark.parametrize(
+    ("receipt_offset", "label_offset", "expected_message"),
+    [
+        (timedelta(microseconds=-1), None, "historical receipt precedes"),
+        (None, timedelta(microseconds=-1), "historical label confirmation precedes"),
+    ],
+)
+def test_historical_event_rejects_impossible_clock_order(
+    receipt_offset: timedelta | None,
+    label_offset: timedelta | None,
+    expected_message: str,
+) -> None:
+    with pytest.raises(ValueError, match=expected_message):
+        HistoricalTransactionEvent(
+            transaction=transaction(),
+            intelligence=IntelligenceSnapshot(),
+            received_at=(T0 + receipt_offset if receipt_offset is not None else None),
+            label=(
+                ConfirmedOutcomeLabel(
+                    is_fraud=True,
+                    label_source="synthetic",
+                    confirmed_at=T0 + label_offset,
+                )
+                if label_offset is not None
+                else None
+            ),
+        )
+
+
+@pytest.mark.parametrize("naive_field", ["event", "receipt", "label"])
+def test_historical_event_rejects_naive_recorded_timestamps(
+    naive_field: str,
+) -> None:
+    occurred = T0.replace(tzinfo=None) if naive_field == "event" else T0
+    received = T0.replace(tzinfo=None) if naive_field == "receipt" else T0
+    confirmed = T0.replace(tzinfo=None) if naive_field == "label" else T0
+    with pytest.raises(ValueError, match="timezone-aware"):
+        HistoricalTransactionEvent(
+            transaction=transaction(occurred_at=occurred),
+            intelligence=IntelligenceSnapshot(),
+            received_at=received,
+            label=ConfirmedOutcomeLabel(
+                is_fraud=True,
+                label_source="synthetic",
+                confirmed_at=confirmed,
+            ),
+        )
+
+
+def test_historical_event_accepts_equal_clocks_and_later_confirmation() -> None:
+    source = HistoricalTransactionEvent(
+        transaction=transaction(),
+        intelligence=IntelligenceSnapshot(network_risk=0.96),
+        received_at=T0,
+        label=ConfirmedOutcomeLabel(
+            is_fraud=True,
+            label_source="synthetic",
+            confirmed_at=T0 + timedelta(days=2),
+        ),
+    )
+    report = replay_historical((source,), {"tenant-a": policy()})
+    assert report.results[0].classification == ReplayClassification.TRUE_POSITIVE
+    assert report.results[0].decision_latency is None
+    assert report.results[0].detection_lead_time is None
+
+
+def test_missing_receipt_and_confirmation_remain_synthetic_unknowns() -> None:
+    source = HistoricalTransactionEvent(
+        transaction=transaction(),
+        intelligence=IntelligenceSnapshot(),
+        label=ConfirmedOutcomeLabel(
+            is_fraud=False,
+            label_source="synthetic",
+        ),
+    )
+    report = replay_historical((source,), {"tenant-a": policy()})
+    assert report.results[0].classification == ReplayClassification.TRUE_NEGATIVE
+    assert report.results[0].decision_latency is None
