@@ -216,3 +216,32 @@ def test_json_builder_joint_fraud_allocation_is_feasible(cohort: str) -> None:
         incumbent.neither_detected,
     )
     assert all(0 <= count <= size for count, size in zip(allocations, sizes, strict=True))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "evaluated_cases",
+        "missing_incumbent_outcomes",
+        "both_detected",
+        "gasha_only_detected",
+        "incumbent_only_detected",
+        "neither_detected",
+        "incremental_confirmed_detection",
+    ],
+)
+@pytest.mark.parametrize("invalid", [True, "1", 1.0, -1])
+def test_incumbent_report_rejects_non_strict_json_counts(
+    field: str, invalid: object
+) -> None:
+    payload = _payload("fraud")
+    comparison = payload["incumbent_comparison"]
+    assert isinstance(comparison, dict)
+    report.POCReport.model_validate_json(json.dumps(payload))
+    comparison[field] = invalid
+    with pytest.raises(ValidationError) as error:
+        report.POCReport.model_validate_json(json.dumps(payload))
+    assert any(
+        detail["loc"][:2] == ("incumbent_comparison", field)
+        for detail in error.value.errors()
+    )
