@@ -243,3 +243,70 @@ def test_report_reflects_reconciled_outcomes() -> None:
 
     assert poc.confusion.false_negatives == 1
     assert poc.fraud_prevalence == 1.0
+
+
+@pytest.mark.parametrize(
+    ("influenced", "driving", "true_positive", "false_positive"),
+    [
+        (0, 1, 0, 0),
+        (1, 2, 0, 0),
+        (2, 3, 1, 0),
+        (3, 4, 2, 1),
+        (4, 5, 1, 2),
+        (0, 0, 0, 1),
+        (1, 0, 1, 1),
+        (2, 1, 2, 1),
+        (3, 2, 1, 3),
+        (4, 4, 3, 2),
+    ],
+)
+def test_signal_family_rejects_impossible_subset_counts(
+    influenced: int, driving: int, true_positive: int, false_positive: int
+) -> None:
+    from pydantic import ValidationError
+
+    from gasha.poc.report import RateEvidence, SignalFamilySummary
+
+    assert (
+        driving > influenced
+        or true_positive + false_positive > influenced
+    )
+    with pytest.raises(ValidationError):
+        SignalFamilySummary(
+            family="network",
+            alerts_influenced=influenced,
+            driving_alerts=driving,
+            true_positives_influenced=true_positive,
+            false_positives_influenced=false_positive,
+            share_of_detected_fraud=(
+                true_positive / 10
+            ),
+            share_of_detected_fraud_evidence=RateEvidence(
+                numerator=true_positive,
+                denominator=10,
+                value=true_positive / 10,
+            ),
+            mean_risk_contribution=None,
+            max_risk_contribution=None,
+            reason_codes=[],
+        )
+
+
+def test_signal_family_accepts_valid_subset_counts() -> None:
+    from gasha.poc.report import RateEvidence, SignalFamilySummary
+
+    summary = SignalFamilySummary(
+        family="network",
+        alerts_influenced=5,
+        driving_alerts=3,
+        true_positives_influenced=2,
+        false_positives_influenced=2,
+        share_of_detected_fraud=0.5,
+        share_of_detected_fraud_evidence=RateEvidence(
+            numerator=2, denominator=4, value=0.5
+        ),
+        mean_risk_contribution=None,
+        max_risk_contribution=None,
+        reason_codes=[],
+    )
+    assert summary.driving_alerts == 3
