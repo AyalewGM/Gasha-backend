@@ -7,7 +7,7 @@ No header, JSON claim or frontend role is accepted as a principal by itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 from typing import Protocol
@@ -139,4 +139,4 @@ def tenant_audit_ref(tenant_id: str) -> str:
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
