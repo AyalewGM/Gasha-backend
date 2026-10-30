@@ -21,7 +21,6 @@ from gasha.poc.historical import (
 )
 from gasha.poc.incumbent import IncumbentComparison, compare_incumbent
 
-
 # A schema identifier, not an evidence authenticity or approval indicator.
 POC_REPORT_SCHEMA_VERSION: Literal["poc-report-2"] = "poc-report-2"
 
