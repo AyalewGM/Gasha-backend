@@ -49,3 +49,26 @@ recall deltas and incumbent comparison partitions. These are *arithmetic*
 invariants, not authentication, signatures or verified data provenance. A
 consistent but fabricated payload can still pass; #42/#49 trusted collection
 and independent verification remain mandatory before any bank-facing use.
+
+## Numeric evidence and timing integrity (bounded JSON consumer)
+
+Count-bearing report fields, including incumbent joint-alert partitions, signal
+attribution, ablation confusion counts, unique detections and multi-signal map
+values, are **strict nonnegative integers**. JSON booleans, numeric strings,
+fractional/float encodings and negative counts are rejected rather than
+coerced. The exception is `ablation.false_positive_delta`: it is a **strict
+signed integer**, because a negative difference is meaningful. Nullable
+ablation recall deltas are signed rates, separately checked against computed
+recall; they are not counts.
+
+All non-null decision, detection and processing *duration* fields must be
+finite, nonnegative numbers, not numeric strings, NaN or infinities. Processing
+summary statistics require `median <= p95 <= p99 <= max` and `mean <= max`
+where values exist. Missing original observation clocks produce `null`, not
+zero; replay-derived negative detection lead times are also treated as unknown
+rather than reported as observed elapsed time. This does not independently
+prove original bank event-time, feature or label provenance.
+
+These constraints are checked through `POCReport.model_validate_json` negative
+regressions; they do **not** verify bank identity, tenant authority, dataset
+fingerprints, reviewer approvals or the #49 evidence registry.
