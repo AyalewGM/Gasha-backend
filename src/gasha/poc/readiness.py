@@ -1,6 +1,8 @@
 """Conservative, bank-neutral POC stage readiness evaluation (issue #49).
 
-This module produces evidence reports; it never enables enforcement.
+Internal prototype only: categories and approval booleans are caller assertions,
+not verified evidence or authorization. Do not expose this evaluator as an
+authoritative bank-readiness gate. It never enables enforcement.
 """
 from dataclasses import dataclass
 from enum import StrEnum
@@ -83,9 +85,11 @@ def evaluate_poc_gate(request: POCGateRequest) -> POCGateReport:
         raise ValueError("tenant_id is required")
     missing = tuple(sorted(area.value for area in _REQUIRED[request.stage] - request.evidence))
     blockers: list[str] = []
-    if request.stage in (Stage.SHADOW, Stage.INLINE_PREPARATION):
-        if not request.historical_accepted:
-            blockers.append("historical_acceptance_missing")
+    if (
+        request.stage in (Stage.SHADOW, Stage.INLINE_PREPARATION)
+        and not request.historical_accepted
+    ):
+        blockers.append("historical_acceptance_missing")
     if request.stage is Stage.INLINE_PREPARATION:
         if not request.shadow_accepted:
             blockers.append("shadow_acceptance_missing")
@@ -105,3 +109,4 @@ def evaluate_poc_gate(request: POCGateRequest) -> POCGateReport:
         missing_evidence=missing,
         blockers=tuple(blockers),
     )
+
