@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -19,6 +20,10 @@ from gasha.poc.historical import (
     MissingTenantPolicyError,
 )
 from gasha.poc.incumbent import IncumbentComparison, compare_incumbent
+
+
+# A schema identifier, not an evidence authenticity or approval indicator.
+POC_REPORT_SCHEMA_VERSION: Literal["poc-report-2"] = "poc-report-2"
 
 
 class RateEvidence(BaseModel):
@@ -120,7 +125,7 @@ class POCReport(BaseModel):
     similar caveats supplied by the caller or derived here).
     """
 
-    report_version: str = Field(min_length=1)
+    report_version: Literal["poc-report-2"]
     tenant_id: str = Field(min_length=1)
     dataset_id: str = Field(min_length=1)
     evaluation_period_start: datetime | None
@@ -157,7 +162,7 @@ def build_poc_report(
     ablation: AblationReport | None = None,
     incumbent: IncumbentComparison | None = None,
     limitations: Sequence[str] = (),
-    report_version: str = "poc-report-1",
+    report_version: str = POC_REPORT_SCHEMA_VERSION,
     synthetic_dataset: bool = True,
 ) -> POCReport:
     """Assembles a tenant-scoped POC evidence report from replay outputs.
@@ -167,6 +172,12 @@ def build_poc_report(
     own tenant policy, and the incumbent comparison is only emitted when
     labeled incumbent outcomes exist.
     """
+
+    if report_version != POC_REPORT_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported POC report schema version {report_version!r}; "
+            f"expected {POC_REPORT_SCHEMA_VERSION!r}"
+        )
 
     for result in report.results:
         if result.decision.tenant_id != tenant_id:
@@ -260,7 +271,7 @@ def build_poc_report(
     )
 
     return POCReport(
-        report_version=report_version,
+        report_version=POC_REPORT_SCHEMA_VERSION,
         tenant_id=tenant_id,
         dataset_id=dataset_id,
         evaluation_period_start=occurred[0] if occurred else None,
