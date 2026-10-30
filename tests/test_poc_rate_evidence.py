@@ -1,9 +1,25 @@
 """Machine-readable POC rates must not turn absent populations into zero scores."""
 
+from datetime import UTC, datetime
+from decimal import Decimal
+from uuid import uuid4
+
 import pytest
 
+from gasha.domain.models import (
+    BeneficiaryType,
+    CanonicalTransaction,
+    DecisionPolicy,
+    IntelligenceSnapshot,
+)
+
 from gasha.poc.ablation import AblationComparison
-from gasha.poc.historical import HistoricalReplayMetrics, HistoricalReplayReport
+from gasha.poc.historical import (
+    HistoricalReplayMetrics,
+    HistoricalReplayReport,
+    HistoricalTransactionEvent,
+    replay_historical,
+)
 from gasha.poc.report import (
     _ablation_summary,
     _confusion_summary,
@@ -108,7 +124,7 @@ def test_empty_poc_report_serializes_nulls_and_reasons() -> None:
     assert payload["explainability_coverage"] is None
     assert payload["explainability_coverage_evidence"]["denominator"] == 0
     assert payload["explainability_coverage_evidence"]["undefined_reason"] == (
-        "no_labeled_alerts"
+        "no_alerts"
     )
     assert all(
         family["share_of_detected_fraud"] is None
@@ -145,3 +161,47 @@ def test_ablation_reports_undefined_recall_delta_not_zero() -> None:
     assert output["rate_evidence"]["f1"]["undefined_reason"] == (
         "no_positive_labels_or_alerts"
     )
+
+
+def test_unlabeled_alert_counts_in_explainability_denominator() -> None:
+    transaction = CanonicalTransaction(
+        tenant_id="tenant-synthetic",
+        event_id=uuid4(),
+        occurred_at=datetime(2026, 2, 10, tzinfo=UTC),
+        channel="mobile",
+        transaction_type="transfer",
+        amount=Decimal("2500.00"),
+        currency="ETB",
+        sender_customer_id="customer-synthetic",
+        sender_account_id="account-synthetic",
+        beneficiary_id="beneficiary-synthetic",
+        beneficiary_type=BeneficiaryType.EXTERNAL,
+        destination_institution_id="external-synthetic",
+        correlation_id="corr-synthetic",
+    )
+    event = HistoricalTransactionEvent(
+        transaction=transaction,
+        intelligence=IntelligenceSnapshot(network_risk=0.96),
+    )
+    policies = {
+        "tenant-synthetic": DecisionPolicy(
+            configuration_version="config-synthetic",
+            policy_version="policy-synthetic",
+            rule_version="rules-synthetic",
+        )
+    }
+    replay = replay_historical((event,), policies)
+    assert replay.metrics.labeled_cases == 0
+    assert replay.metrics.explained_alerts == 1
+
+    poc = build_poc_report(
+        tenant_id="tenant-synthetic",
+        dataset_id="unlabeled-alert-synthetic",
+        report=replay,
+        policies=policies,
+    )
+    assert poc.confusion.precision is None
+    assert poc.explainability_coverage == 1.0
+    assert poc.explainability_coverage_evidence.numerator == 1
+    assert poc.explainability_coverage_evidence.denominator == 1
+    assert poc.explainability_coverage_evidence.undefined_reason is None
