@@ -23,6 +23,7 @@ from gasha.poc.outcomes import (
     OutcomeRecord,
     OutcomeType,
 )
+from gasha.poc.incumbent import compare_incumbent
 from gasha.poc.report import build_poc_report
 
 T0 = datetime(2026, 2, 10, 9, 0, 0, tzinfo=UTC)
@@ -243,3 +244,110 @@ def test_report_reflects_reconciled_outcomes() -> None:
 
     assert poc.confusion.false_negatives == 1
     assert poc.fraud_prevalence == 1.0
+
+
+
+def test_incumbent_cohort_uses_late_reconciled_fraud_label() -> None:
+    policies = {"tenant-a": policy()}
+    pending = event(
+        "late-fraud",
+        IntelligenceSnapshot(network_risk=0.97),
+        None,
+        incumbent=IncumbentControlOutcome.NO_ALERT,
+    )
+    original = replay_historical((pending,), policies)
+    assert original.metrics.unlabeled_cases == 1
+    assert compare_incumbent(original.results).evaluated_cases == 0
+
+    confirmed = reconcile_outcomes(
+        original,
+        (
+            OutcomeRecord(
+                tenant_id="tenant-a",
+                event_id=pending.transaction.event_id,
+                outcome=OutcomeType.CONFIRMED_FRAUD,
+                outcome_source="synthetic-investigation",
+                outcome_version="outcomes-1",
+                confirmed_at=T0 + timedelta(days=3),
+            ),
+        ),
+    )
+    comparison = compare_incumbent(confirmed.results)
+    assert confirmed.metrics.true_positives == 1
+    assert confirmed.metrics.unlabeled_cases == 0
+    assert comparison.evaluated_cases == 1
+    assert comparison.missing_incumbent_outcomes == 0
+    assert comparison.gasha.true_positives == 1
+    assert comparison.incumbent.false_negatives == 1
+    assert comparison.incremental_confirmed_detection == 1
+
+    serialized = build_poc_report(
+        tenant_id="tenant-a",
+        dataset_id="synthetic-late-outcome",
+        report=confirmed,
+        policies=policies,
+    ).model_dump(mode="json")
+    assert serialized["confusion"]["true_positives"] == 1
+    assert serialized["incumbent_comparison"]["evaluated_cases"] == 1
+    assert serialized["incumbent_comparison"]["incremental_confirmed_detection"] == 1
+
+
+def test_incumbent_cohort_respects_latest_label_and_tenant_boundary() -> None:
+    policies = {"tenant-a": policy()}
+    corrected = event(
+        "corrected",
+        IntelligenceSnapshot(network_risk=0.96),
+        None,
+        incumbent=IncumbentControlOutcome.ALERT,
+    )
+    unresolved = event(
+        "unresolved",
+        IntelligenceSnapshot(),
+        None,
+        incumbent=IncumbentControlOutcome.NO_ALERT,
+    )
+    no_incumbent = event(
+        "no-incumbent",
+        IntelligenceSnapshot(),
+        False,
+    )
+    original = replay_historical((corrected, unresolved, no_incumbent), policies)
+    reconciled = reconcile_outcomes(
+        original,
+        (
+            OutcomeRecord(
+                tenant_id="tenant-b",
+                event_id=unresolved.transaction.event_id,
+                outcome=OutcomeType.CONFIRMED_FRAUD,
+                outcome_source="synthetic-investigation",
+                outcome_version="outcomes-1",
+                confirmed_at=T0 + timedelta(days=4),
+            ),
+            OutcomeRecord(
+                tenant_id="tenant-a",
+                event_id=corrected.transaction.event_id,
+                outcome=OutcomeType.CONFIRMED_FRAUD,
+                outcome_source="synthetic-investigation",
+                outcome_version="outcomes-1",
+                confirmed_at=T0 + timedelta(days=1),
+            ),
+            OutcomeRecord(
+                tenant_id="tenant-a",
+                event_id=corrected.transaction.event_id,
+                outcome=OutcomeType.CONFIRMED_LEGITIMATE,
+                outcome_source="synthetic-investigation",
+                outcome_version="outcomes-2",
+                confirmed_at=T0 + timedelta(days=2),
+            ),
+        ),
+    )
+    comparison = compare_incumbent(reconciled.results)
+    assert reconciled.metrics.false_positives == 1
+    assert reconciled.metrics.true_positives == 0
+    assert reconciled.metrics.unlabeled_cases == 1
+    assert len(reconciled.unmatched_outcomes) == 1
+    assert comparison.evaluated_cases == 1
+    assert comparison.missing_incumbent_outcomes == 1
+    assert comparison.gasha.false_positives == 1
+    assert comparison.incumbent.false_positives == 1
+    assert comparison.incremental_confirmed_detection == 0
