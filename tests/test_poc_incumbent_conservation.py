@@ -90,13 +90,13 @@ def _payload(cohort: str) -> dict[str, object]:
         )
     }
     replay = historical.replay_historical(tuple(events), policies)
-    report = report.build_poc_report(
+    poc_report = report.build_poc_report(
         tenant_id="tenant-synthetic",
         dataset_id=f"synthetic-{cohort}",
         report=replay,
         policies=policies,
     )
-    return report.model_dump(mode="json")
+    return poc_report.model_dump(mode="json")
 
 
 @pytest.mark.parametrize("cohort", ["fraud", "legitimate", "mixed", "missing"])
