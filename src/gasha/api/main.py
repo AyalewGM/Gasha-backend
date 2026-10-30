@@ -146,7 +146,16 @@ class TrustedDecisionRequest(BaseModel):
     transaction: CanonicalTransaction
 
 
-app = FastAPI(title="Gasha Protected Fraud Decision API", version="0.3.0")
+# Only /health/live and /health/ready are intentionally public. The default
+# FastAPI documentation/schema URLs otherwise expose non-health API metadata
+# without authentication; leave developer documentation to isolated tooling.
+app = FastAPI(
+    title="Gasha Protected Fraud Decision API",
+    version="0.3.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 # These are intentionally absent until bank-approved wiring is supplied.
 app.state.identity_verifier = None
 app.state.security_audit = None

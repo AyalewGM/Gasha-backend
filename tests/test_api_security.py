@@ -492,3 +492,11 @@ def test_ready_never_claims_legacy_outcome_store_is_transactional(wired) -> None
     response = client.get("/health/ready")
     assert response.status_code == 503
     assert response.json()["checks"]["outcome_atomic_commit"] is False
+
+@pytest.mark.parametrize(
+    "path", ["/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"]
+)
+def test_protected_app_disables_public_schema_routes(wired, path: str) -> None:
+    """Protected deployments expose no unauthenticated API metadata routes."""
+    client, _, _ = wired
+    assert client.get(path).status_code == 404

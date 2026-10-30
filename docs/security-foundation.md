@@ -14,7 +14,11 @@ entrypoint cannot import the synthetic ASGI application. CI builds the actual
 image and asserts that the synthetic module is unimportable while the
 protected `gasha.api.main:app` remains importable and unwired by default.
 Do not build a bank deployment from a different Dockerfile or the source
-checkout. Bank image signing, registry provenance and deployment approval
+checkout.
+The protected application disables FastAPI's otherwise public `/docs`,
+`/redoc`, `/openapi.json` and Swagger OAuth redirect routes. Only the narrowly
+scoped health routes intentionally remain unauthenticated; protected API
+metadata must not be exposed through the bank application. Bank image signing, registry provenance and deployment approval
 remain separately gated under #46/#49. A developer choosing the synthetic
 app explicitly is not an identity or authorization mechanism.
 
