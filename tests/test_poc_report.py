@@ -18,12 +18,12 @@ from gasha.poc.historical import (
     reconcile_outcomes,
     replay_historical,
 )
+from gasha.poc.incumbent import compare_incumbent
 from gasha.poc.outcomes import (
     IncumbentControlOutcome,
     OutcomeRecord,
     OutcomeType,
 )
-from gasha.poc.incumbent import compare_incumbent
 from gasha.poc.report import build_poc_report
 
 T0 = datetime(2026, 2, 10, 9, 0, 0, tzinfo=UTC)
