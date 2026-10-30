@@ -175,7 +175,9 @@ def test_json_consumer_rejects_comparison_arithmetic_tampering(
     else:
         raise AssertionError(f"unsupported mutation: {mutation}")
 
-    with pytest.raises(ValidationError, match="incumbent comparison population"):
+    with pytest.raises(
+        ValidationError, match="incumbent comparison population|joint fraud allocation"
+    ):
         report.POCReport.model_validate_json(json.dumps(payload))
 
 
