@@ -17,8 +17,11 @@ from gasha.poc.historical import (
     MissingTenantPolicyError,
     ReplayClassification,
     pseudonymize_transaction,
+    reconcile_outcomes,
     replay_historical,
 )
+
+from gasha.poc.outcomes import OutcomeRecord, OutcomeType
 
 T0 = datetime(2026, 1, 10, 9, 0, 0, tzinfo=UTC)
 
@@ -101,9 +104,11 @@ def test_replay_captures_decisions_versions_and_event_timestamps() -> None:
     assert result.event.transaction.occurred_at == occurred_at
     assert result.event.signal_policy_versions == ("graph-policy-2",)
     assert result.classification == ReplayClassification.TRUE_POSITIVE
-    assert result.decision_latency == result.decision.decided_at - occurred_at
+    assert result.decision_latency is None
     assert report.metrics.true_positives == 1
-    assert report.metrics.mean_decision_latency_seconds is not None
+    assert report.metrics.mean_decision_latency_seconds is None
+    assert result.processing_latency is not None
+    assert report.metrics.mean_processing_latency_ms is not None
 
 
 def test_replay_produces_confusion_matrix_inputs_for_poc_metrics() -> None:
@@ -156,8 +161,8 @@ def test_replay_produces_confusion_matrix_inputs_for_poc_metrics() -> None:
     assert metrics.explainability_coverage == 1.0
 
 
-def test_detection_lead_time_uses_confirmed_label_timestamp() -> None:
-    confirmed_at = datetime.now(UTC) + timedelta(hours=48)
+def test_confirmed_label_does_not_infer_replay_detection_lead_time() -> None:
+    confirmed_at = T0 + timedelta(hours=48)
     report = replay_historical(
         (
             event(
@@ -173,11 +178,9 @@ def test_detection_lead_time_uses_confirmed_label_timestamp() -> None:
     )
 
     result = report.results[0]
-    assert result.detection_lead_time == confirmed_at - result.decision.decided_at
-    assert result.detection_lead_time > timedelta(0)
-    assert report.metrics.mean_detection_lead_time_seconds == pytest.approx(
-        result.detection_lead_time.total_seconds()
-    )
+    assert result.classification == ReplayClassification.TRUE_POSITIVE
+    assert result.detection_lead_time is None
+    assert report.metrics.mean_detection_lead_time_seconds is None
 
 
 def test_detection_lead_time_is_none_when_timestamps_do_not_permit() -> None:
@@ -298,3 +301,28 @@ def test_pseudonymization_preserves_linkage_and_event_facts() -> None:
     other_salt = pseudonymize_transaction(original, salt="other-salt")
     assert repeat.sender_customer_id == sanitized.sender_customer_id
     assert other_salt.sender_customer_id != sanitized.sender_customer_id
+
+def test_late_outcome_reconciliation_does_not_invent_lead_time() -> None:
+    source = event(
+        intelligence=IntelligenceSnapshot(network_risk=0.96),
+        suffix="late-confirmation",
+    )
+    replayed = replay_historical((source,), {"tenant-a": policy()})
+    reconciled = reconcile_outcomes(
+        replayed,
+        (
+            OutcomeRecord(
+                tenant_id=source.transaction.tenant_id,
+                event_id=source.transaction.event_id,
+                outcome=OutcomeType.CONFIRMED_FRAUD,
+                outcome_source="synthetic-case-review",
+                outcome_version="labels-1",
+                confirmed_at=T0 + timedelta(days=3),
+            ),
+        ),
+    )
+    assert reconciled.results[0].classification == ReplayClassification.TRUE_POSITIVE
+    assert reconciled.results[0].detection_lead_time is None
+    assert reconciled.results[0].decision_latency is None
+    assert reconciled.metrics.mean_detection_lead_time_seconds is None
+    assert reconciled.metrics.mean_decision_latency_seconds is None
