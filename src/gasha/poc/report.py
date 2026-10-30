@@ -561,8 +561,13 @@ def build_poc_report(
         explainability_coverage_evidence=explainability,
         latency=LatencySummary(
             mean_decision_latency_seconds=metrics.mean_decision_latency_seconds,
+            # A replay-derived negative lead is not a measured duration;
+            # represent it as unknown rather than accepting false timing.
             mean_detection_lead_time_seconds=(
                 metrics.mean_detection_lead_time_seconds
+                if metrics.mean_detection_lead_time_seconds is not None
+                and metrics.mean_detection_lead_time_seconds >= 0
+                else None
             ),
             mean_processing_latency_ms=metrics.mean_processing_latency_ms,
             median_processing_latency_ms=metrics.median_processing_latency_ms,
