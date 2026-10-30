@@ -376,12 +376,11 @@ def submit_outcome(
     record: OutcomeRecord,
     request: Request,
     principal: Annotated[TrustedPrincipal, Depends(get_principal)],
-    service: Annotated[OutcomeIngestionService, Depends(get_outcome_ingestion)],
 ) -> OutcomeSubmission:
     action = Capability.OUTCOME_SUBMIT
     _require_action(request, principal, record.tenant_id, action, event_id=record.event_id)
     try:
-        result = service.submit(record)
+        result = get_outcome_ingestion(request).submit(record)
     except Exception as exc:
         _operation_audit(
             request, principal, record.tenant_id, record.event_id,
@@ -400,12 +399,11 @@ def submit_incumbent_outcome(
     record: IncumbentOutcomeRecord,
     request: Request,
     principal: Annotated[TrustedPrincipal, Depends(get_principal)],
-    service: Annotated[OutcomeIngestionService, Depends(get_outcome_ingestion)],
 ) -> OutcomeSubmission:
     action = Capability.INCUMBENT_OUTCOME_SUBMIT
     _require_action(request, principal, record.tenant_id, action, event_id=record.event_id)
     try:
-        result = service.submit_incumbent(record)
+        result = get_outcome_ingestion(request).submit_incumbent(record)
     except Exception as exc:
         _operation_audit(
             request, principal, record.tenant_id, record.event_id,
