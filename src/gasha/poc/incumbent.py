@@ -3,7 +3,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from gasha.poc.historical import ALERT_ACTIONS, ReplayedEventResult
+from gasha.poc.historical import (
+    ALERT_ACTIONS,
+    ReplayClassification,
+    ReplayedEventResult,
+)
 
 
 @dataclass(frozen=True)
@@ -57,9 +61,12 @@ def compare_incumbent(
 ) -> IncumbentComparison:
     """Compares replayed Gasha decisions with supplied incumbent outcomes.
 
-    Only labeled events carrying an ``incumbent_outcome`` are comparable;
-    labeled events without one are counted separately so missing coverage is
-    never silently treated as a non-alert.
+    Use each replay result's effective classification, including a later
+    reconciled outcome, instead of the original event label. This keeps Gasha
+    and incumbent on the same currently labeled cohort. Unlabeled results are
+    excluded; labeled results with no incumbent outcome are counted as
+    missing rather than silently treated as non-alerts. Label maturity and
+    provenance are separate bank-data acceptance requirements.
     """
 
     gasha_tp = gasha_fp = gasha_tn = gasha_fn = 0
@@ -69,8 +76,8 @@ def compare_incumbent(
     missing = 0
 
     for result in results:
-        label = result.event.label
-        if label is None:
+        classification = result.classification
+        if classification == ReplayClassification.UNLABELED:
             continue
         incumbent = result.event.incumbent_outcome
         if incumbent is None:
@@ -79,7 +86,10 @@ def compare_incumbent(
 
         gasha_alerted = result.decision.action in ALERT_ACTIONS
         incumbent_alerted = incumbent.alerted
-        is_fraud = label.is_fraud
+        is_fraud = classification in (
+            ReplayClassification.TRUE_POSITIVE,
+            ReplayClassification.FALSE_NEGATIVE,
+        )
 
         if gasha_alerted:
             if is_fraud:
