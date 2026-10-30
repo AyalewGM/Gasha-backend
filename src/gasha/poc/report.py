@@ -328,6 +328,14 @@ class POCReport(BaseModel):
                 or incumbent.evaluated_cases + incumbent.missing_incumbent_outcomes
                 > self.labeled_events
                 or incumbent.incremental_confirmed_detection > incumbent.gasha_only_detected
+                or incumbent.both_detected + incumbent.gasha_only_detected
+                != incumbent.gasha.true_positives + incumbent.gasha.false_positives
+                or incumbent.both_detected + incumbent.incumbent_only_detected
+                != incumbent.incumbent.true_positives + incumbent.incumbent.false_positives
+                or incumbent.gasha.true_positives + incumbent.gasha.false_negatives
+                != incumbent.incumbent.true_positives + incumbent.incumbent.false_negatives
+                or incumbent.incremental_confirmed_detection > incumbent.gasha.true_positives
+                or incumbent.incremental_confirmed_detection > incumbent.incumbent.false_negatives
             ):
                 raise ValueError("incumbent comparison population is inconsistent")
         return self
