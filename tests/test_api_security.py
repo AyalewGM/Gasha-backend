@@ -138,11 +138,19 @@ def test_trusted_decision_and_shadow_mode_never_execute_bank_action(wired) -> No
     assert decision.status_code == 200
     assert decision.json()["action"] == "block"
     assert decision.json()["policy_version"] == "synthetic-policy-1"
+    assert len(decision.headers["X-Gasha-Context-Ref"]) == 64
+    assert decision.headers["X-Gasha-Signal-Version"] == "synthetic-signal-v1"
+    assert decision.headers["X-Gasha-Source-Version"] == "synthetic-source-1"
     evaluation = client.post("/v1/evaluations", json=payload, headers=headers())
     assert evaluation.status_code == 200
     assert evaluation.json()["decision"]["action"] == "block"
     assert evaluation.json()["operating_mode"] == "shadow"
     assert evaluation.json()["effective_action"] == "no_action_shadow"
+    assert evaluation.headers["X-Gasha-Context-Ref"] == decision.headers["X-Gasha-Context-Ref"]
+    assert any(
+        e.context_ref == decision.headers["X-Gasha-Context-Ref"]
+        for e in audit.events if e.result == "succeeded"
+    )
     assert any(e.action == Capability.DECISION_SUBMIT.value for e in audit.events)
 
 
