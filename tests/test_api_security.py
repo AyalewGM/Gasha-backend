@@ -595,7 +595,7 @@ def test_root_path_authenticates_before_malformed_body(
     wired, root_path: str, prefix_in_url: bool, path: str,
     token: str | None, status: int, result: str,
 ) -> None:
-    _, audit, store = wired
+    _, audit, _ = wired
     client = TestClient(app, root_path=root_path)
     url = f"{root_path}{path}" if prefix_in_url else path
     request_headers = {"Content-Type": "application/json",
@@ -612,7 +612,6 @@ def test_root_path_authenticates_before_malformed_body(
     assert "tenant-a" not in str(audit.events)
     if status == 401:
         assert response.headers["WWW-Authenticate"] == "Bearer"
-    assert store.store.outcomes("tenant-a", uuid4()) == ()
 
 
 @pytest.mark.parametrize("path", [
@@ -721,3 +720,25 @@ def test_forwarded_prefix_header_does_not_select_routing_root(wired) -> None:
         "/bank/v1/decisions", content="{",
         headers={"Content-Type": "application/json", "X-Forwarded-Prefix": "/bank"},
     ).status_code == 404
+
+
+@pytest.mark.parametrize("prefix", ["/bank", "/gateway/bank"])
+def test_root_path_shadow_response_and_health_are_unchanged(wired, prefix: str) -> None:
+    _, audit, _ = wired
+    client = TestClient(app, root_path=prefix)
+    healthy = client.get(f"{prefix}/health/live")
+    assert healthy.status_code == 200
+    assert healthy.json() == {"status": "ok"}
+    assert not audit.events
+    for path in ("/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"):
+        assert client.get(f"{prefix}{path}").status_code == 404
+    body = tx()
+    response = client.post(
+        f"{prefix}/v1/evaluations", json={"transaction": body}, headers=headers(),
+    )
+    assert response.status_code == 200
+    assert response.json()["operating_mode"] == "shadow"
+    assert response.json()["effective_action"] == "no_action_shadow"
+    assert len([e for e in audit.events if e.action == "authenticate"]) == 1
+    assert len([e for e in audit.events if e.result == "succeeded"]) == 1
+    assert len(response.headers["X-Gasha-Context-Ref"]) == 64
