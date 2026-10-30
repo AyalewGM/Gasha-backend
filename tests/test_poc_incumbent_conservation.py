@@ -22,11 +22,7 @@ from gasha.poc.historical import (
     replay_historical,
 )
 from gasha.poc.outcomes import IncumbentControlOutcome
-from gasha.poc.report import (
-    POCReport,
-    _confusion_summary,
-    build_poc_report,
-)
+from gasha.poc.report import POCReport, build_poc_report
 
 
 Case = tuple[str, bool, bool, IncumbentControlOutcome | None]
@@ -149,7 +145,7 @@ def test_real_builder_comparator_round_trips_with_conserved_marginals(
         ("mixed", "gasha_marginal"),
         ("mixed", "incumbent_marginal"),
         ("missing", "incumbent_marginal"),
-        ("mixed", "label_population"),
+        ("fraud", "label_population"),
         ("incremental-gasha-bound", "incremental_gasha"),
         ("incremental-incumbent-bound", "incremental_incumbent"),
     ],
@@ -175,14 +171,9 @@ def test_json_consumer_rejects_comparison_arithmetic_tampering(
         comparison["incumbent_only_detected"] -= 1
         comparison["neither_detected"] += 1
     elif mutation == "label_population":
-        source = comparison["incumbent"]
-        assert source["true_positives"] >= 1
-        comparison["incumbent"] = _confusion_summary(
-            source["true_positives"] - 1,
-            source["false_positives"] + 1,
-            source["true_negatives"],
-            source["false_negatives"],
-        ).model_dump(mode="json")
+        reference = _payload("legitimate")["incumbent_comparison"]
+        assert isinstance(reference, dict)
+        comparison["incumbent"] = reference["incumbent"]
     elif mutation == "incremental_gasha":
         assert comparison["gasha_only_detected"] == 1
         assert comparison["gasha"]["true_positives"] == 0
