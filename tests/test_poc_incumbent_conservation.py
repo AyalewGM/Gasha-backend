@@ -22,7 +22,11 @@ from gasha.poc.historical import (
     replay_historical,
 )
 from gasha.poc.outcomes import IncumbentControlOutcome
-from gasha.poc.report import POCReport, _confusion_summary, build_poc_report
+from gasha.poc.report import (
+    POCReport,
+    _confusion_summary,
+    build_poc_report,
+)
 
 
 Case = tuple[str, bool, bool, IncumbentControlOutcome | None]
