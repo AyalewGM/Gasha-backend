@@ -15,6 +15,11 @@ image and asserts that the synthetic module is unimportable while the
 protected `gasha.api.main:app` remains importable and unwired by default.
 Do not build a bank deployment from a different Dockerfile or the source
 checkout.
+The protected application authenticates `/v1/` requests in ingress middleware
+before FastAPI parses any JSON. An invalid JSON body with no/invalid credential
+returns a redacted audited 401 (or 503 on identity/audit outage), not an
+unauthenticated 422 exposing validation details. Endpoint dependencies reuse
+the exact ingress principal; a dependency override cannot escalate it.
 The protected application disables FastAPI's otherwise public `/docs`,
 `/redoc`, `/openapi.json` and Swagger OAuth redirect routes. Only the narrowly
 scoped health routes intentionally remain unauthenticated; protected API

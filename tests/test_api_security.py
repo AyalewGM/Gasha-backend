@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from gasha.api.main import TrustedDecisionContext, app
+from gasha.api.main import TrustedDecisionContext, app, get_principal
 from gasha.domain.models import (
     BeneficiaryType,
     CanonicalTransaction,
@@ -500,3 +500,76 @@ def test_protected_app_disables_public_schema_routes(wired, path: str) -> None:
     """Protected deployments expose no unauthenticated API metadata routes."""
     client, _, _ = wired
     assert client.get(path).status_code == 404
+
+
+@pytest.mark.parametrize("path", [
+    "/v1/decisions", "/v1/evaluations",
+    "/v1/outcomes", "/v1/incumbent-outcomes",
+])
+@pytest.mark.parametrize(("token", "status", "audit_result"), [
+    (None, 401, "denied"),
+    ("bad", 401, "denied"),
+    ("expired", 401, "denied"),
+    ("outage", 503, "denied"),
+    ("valid", 422, "verified"),
+])
+def test_authentication_precedes_malformed_json(
+    wired, path: str, token: str | None, status: int, audit_result: str
+) -> None:
+    """Malformed JSON must never bypass ingress identity verification/auditing."""
+    client, audit, _ = wired
+    hdr = {"Content-Type": "application/json"}
+    if token is not None:
+        hdr.update(headers(token))
+    response = client.post(path, content="{", headers=hdr)
+    assert response.status_code == status
+    auth_events = [event for event in audit.events if event.action == "authenticate"]
+    assert len(auth_events) == 1
+    assert auth_events[0].result == audit_result
+    assert len(auth_events[0].attempt_ref) == 32
+    assert not any(event.action != "authenticate" for event in audit.events)
+    if status == 401:
+        assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
+def test_dependency_override_cannot_escalate_ingress_identity(wired) -> None:
+    """An endpoint dependency override cannot replace a verified low-privilege principal."""
+    client, audit, _ = wired
+    saved_overrides = dict(app.dependency_overrides)
+    app.dependency_overrides[get_principal] = lambda: identity()
+    try:
+        # No token must still fail at ingress, before the overridden dependency.
+        missing = client.post("/v1/decisions", json={"transaction": tx()})
+        assert missing.status_code == 401
+        # A low-privilege token cannot gain submit via a forged dependency principal.
+        denied = client.post(
+            "/v1/decisions", json={"transaction": tx()},
+            headers=headers("wrong-capability"),
+        )
+        assert denied.status_code == 403
+        assert any(e.reason == "principal_context_mismatch" for e in audit.events)
+        assert not any(e.result == "succeeded" for e in audit.events)
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(saved_overrides)
+
+
+@pytest.mark.parametrize("path", [
+    "/v1/decisions", "/v1/evaluations",
+    "/v1/outcomes", "/v1/incumbent-outcomes",
+])
+def test_malformed_json_with_audit_outage_returns_503(wired, path: str) -> None:
+    """Even before body parsing, a missing durable audit must fail closed."""
+    client, _, _ = wired
+
+    class OfflineAudit:
+        def append(self, event) -> None:
+            raise RuntimeError("synthetic audit outage")
+
+    app.state.security_audit = OfflineAudit()
+    response = client.post(
+        path, content="{",
+        headers={"Content-Type": "application/json", **headers()},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "security audit unavailable"

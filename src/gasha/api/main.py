@@ -170,6 +170,20 @@ async def assign_attempt_ref(
 ) -> Response:
     # Do not accept request-supplied correlation/role headers as audit authority.
     request.state.attempt_ref = uuid4().hex
+    # FastAPI parses malformed JSON before executing Depends(get_principal).
+    # Authenticate at ingress so bad JSON cannot skip credential verification
+    # or the redacted authentication audit on protected endpoints.
+    if request.url.path.startswith("/v1/"):
+        try:
+            request.state.authenticated_principal = get_principal(
+                request, request.headers.get("authorization")
+            )
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers=exc.headers,
+            )
     return await call_next(request)
 
 
@@ -216,6 +230,12 @@ def get_principal(
     request: Request,
     authorization: Annotated[str | None, Header()] = None,
 ) -> TrustedPrincipal:
+    # The ingress verifier runs before JSON parsing. Reuse its exact trusted
+    # principal in route dependencies; never verify twice or accept a forged
+    # principal returned from a dependency override.
+    ingress_principal = getattr(request.state, "authenticated_principal", None)
+    if isinstance(ingress_principal, TrustedPrincipal):
+        return ingress_principal
     verifier: CredentialVerifier | None = getattr(
         request.app.state, "identity_verifier", None
     )
@@ -243,6 +263,17 @@ def _require_action(
     *,
     event_id: UUID,
 ) -> None:
+    # Test/deployment dependency overrides must not replace the authenticated
+    # principal with a stronger caller-controlled identity after ingress.
+    ingress_principal = getattr(request.state, "authenticated_principal", None)
+    if not isinstance(ingress_principal, TrustedPrincipal) or principal is not ingress_principal:
+        _audit(
+            request, capability.value, "denied",
+            ingress_principal.audit_actor if isinstance(ingress_principal, TrustedPrincipal)
+            else "anonymous",
+            tenant_id, "principal_context_mismatch", event_id=event_id,
+        )
+        raise HTTPException(status_code=403, detail="not authorized")
     try:
         authorize(principal, tenant_id=tenant_id, capability=capability)
     except AuthorizationRejected as exc:
