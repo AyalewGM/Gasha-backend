@@ -573,3 +573,151 @@ def test_malformed_json_with_audit_outage_returns_503(wired, path: str) -> None:
     )
     assert response.status_code == 503
     assert response.json()["detail"] == "security audit unavailable"
+
+
+# A routed /v1 endpoint can have a URL with a server-configured root_path.
+# Authentication must run before FastAPI parses even malformed JSON in both forms.
+@pytest.mark.parametrize("root_path", ["/bank", "/gateway/bank"])
+@pytest.mark.parametrize("prefix_in_url", [True, False])
+@pytest.mark.parametrize("path", [
+    "/v1/decisions", "/v1/evaluations",
+    "/v1/outcomes", "/v1/incumbent-outcomes",
+])
+@pytest.mark.parametrize(("token", "status", "result"), [
+    (None, 401, "denied"),
+    ("bad", 401, "denied"),
+    ("revoked", 401, "denied"),
+    ("expired", 401, "denied"),
+    ("outage", 503, "denied"),
+    ("valid", 422, "verified"),
+])
+def test_root_path_authenticates_before_malformed_body(
+    wired, root_path: str, prefix_in_url: bool, path: str,
+    token: str | None, status: int, result: str,
+) -> None:
+    _, audit, store = wired
+    client = TestClient(app, root_path=root_path)
+    url = f"{root_path}{path}" if prefix_in_url else path
+    request_headers = {"Content-Type": "application/json",
+                       "X-Forwarded-Prefix": "/untrusted"}
+    if token is not None:
+        request_headers.update(headers(token))
+    response = client.post(url, content="{", headers=request_headers)
+    assert response.status_code == status
+    auth_events = [event for event in audit.events if event.action == "authenticate"]
+    assert len(auth_events) == 1
+    assert auth_events[0].result == result
+    assert len(auth_events[0].attempt_ref) == 32
+    assert not any(event.action != "authenticate" for event in audit.events)
+    assert "tenant-a" not in str(audit.events)
+    if status == 401:
+        assert response.headers["WWW-Authenticate"] == "Bearer"
+    assert store.store.outcomes("tenant-a", uuid4()) == ()
+
+
+@pytest.mark.parametrize("path", [
+    "/v1/decisions", "/v1/evaluations",
+    "/v1/outcomes", "/v1/incumbent-outcomes",
+])
+def test_root_path_malformed_body_audit_outage_returns_503(wired, path: str) -> None:
+    _, _, _ = wired
+
+    class FailingAudit:
+        def append(self, event) -> None:
+            raise RuntimeError("synthetic audit failure")
+
+    app.state.security_audit = FailingAudit()
+    response = TestClient(app, root_path="/bank").post(
+        f"/bank{path}", content="{",
+        headers={"Content-Type": "application/json", **headers()},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "security audit unavailable"
+
+
+@pytest.mark.parametrize("path", ["/v1/decisions", "/v1/evaluations"])
+def test_root_path_tenant_role_and_body_spoofing_fail_closed(wired, path: str) -> None:
+    _, audit, _ = wired
+    client = TestClient(app, root_path="/bank")
+    wrong_tenant = client.post(
+        f"/bank{path}", json={"transaction": tx("tenant-b")},
+        headers={**headers(), "X-Tenant-Id": "tenant-b", "X-Role": "admin"},
+    )
+    assert wrong_tenant.status_code == 404
+    wrong_role = client.post(
+        f"/bank{path}", json={"transaction": tx()},
+        headers=headers("wrong-capability"),
+    )
+    assert wrong_role.status_code == 403
+    forged_policy = client.post(
+        f"/bank{path}",
+        json={"transaction": tx(), "policy": {"policy_version": "forged"}},
+        headers=headers(),
+    )
+    assert forged_policy.status_code == 422
+    assert not any(event.result == "succeeded" for event in audit.events)
+    assert "tenant-b" not in str(audit.events)
+
+
+def test_root_path_dependency_override_cannot_raise_privilege(wired) -> None:
+    _, audit, _ = wired
+    client = TestClient(app, root_path="/bank")
+    original_overrides = dict(app.dependency_overrides)
+    app.dependency_overrides[get_principal] = lambda: identity()
+    try:
+        missing = client.post(
+            "/bank/v1/decisions", json={"transaction": tx()},
+        )
+        assert missing.status_code == 401
+        denied = client.post(
+            "/bank/v1/decisions", json={"transaction": tx()},
+            headers=headers("wrong-capability"),
+        )
+        assert denied.status_code == 403
+        assert any(e.reason == "principal_context_mismatch" for e in audit.events)
+        assert not any(e.result == "succeeded" for e in audit.events)
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(original_overrides)
+
+
+@pytest.mark.parametrize("incumbent", [False, True])
+def test_root_path_concurrent_outcome_attempts_never_mutate(wired, incumbent) -> None:
+    _, audit, store = wired
+    client = TestClient(app, root_path="/bank")
+    event_id = uuid4()
+    url = "/bank/v1/incumbent-outcomes" if incumbent else "/bank/v1/outcomes"
+    body = (
+        {"tenant_id": "tenant-a", "event_id": str(event_id),
+         "outcome": "review", "source_system": "synthetic-incumbent"}
+        if incumbent else
+        {"tenant_id": "tenant-a", "event_id": str(event_id),
+         "outcome": "confirmed_fraud", "outcome_source": "synthetic-review",
+         "outcome_version": "synthetic-v1", "confirmed_at": NOW.isoformat()}
+    )
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        responses = list(pool.map(
+            lambda _: client.post(url, json=body, headers=headers()), range(4),
+        ))
+    assert all(response.status_code == 503 for response in responses)
+    assert store.store.outcomes("tenant-a", event_id) == ()
+    assert store.store.incumbent_outcomes("tenant-a", event_id) == ()
+    assert len([e for e in audit.events if
+                e.reason == "transactional_outcome_unavailable"]) == 4
+
+
+def test_forwarded_prefix_header_does_not_select_routing_root(wired) -> None:
+    _, audit, _ = wired
+    client = TestClient(app)
+    # Untrusted X-Forwarded-Prefix cannot skip protected ingress auth.
+    response = client.post(
+        "/v1/decisions", content="{",
+        headers={"Content-Type": "application/json", "X-Forwarded-Prefix": "/bank"},
+    )
+    assert response.status_code == 401
+    assert len([e for e in audit.events if e.action == "authenticate"]) == 1
+    # An unconfigured prefix cannot cause the protected endpoint to be routed.
+    assert client.post(
+        "/bank/v1/decisions", content="{",
+        headers={"Content-Type": "application/json", "X-Forwarded-Prefix": "/bank"},
+    ).status_code == 404
