@@ -9,7 +9,7 @@ from math import ceil, floor
 from statistics import fmean
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from gasha.decision.service import DecisionService
 from gasha.domain.models import (
@@ -59,6 +59,33 @@ class HistoricalTransactionEvent(BaseModel):
     label: ConfirmedOutcomeLabel | None = None
     incumbent_outcome: IncumbentControlOutcome | None = None
     received_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_recorded_timestamps(self) -> HistoricalTransactionEvent:
+        """Reject impossible recorded clock order without asserting source trust.
+
+        Partial historical records may omit receipt and label times. Supplied
+        times must be timezone-aware and cannot precede the transaction event.
+        This does not establish point-in-time feature or label provenance.
+        """
+        occurred_at = self.transaction.occurred_at
+        received_at = self.received_at
+        confirmed_at = self.label.confirmed_at if self.label else None
+        if received_at is None and confirmed_at is None:
+            return self
+
+        for timestamp in (occurred_at, received_at, confirmed_at):
+            if timestamp is not None and timestamp.utcoffset() is None:
+                raise ValueError(
+                    "recorded historical timestamps must be timezone-aware"
+                )
+        if received_at is not None and received_at < occurred_at:
+            raise ValueError("historical receipt precedes transaction event")
+        if confirmed_at is not None and confirmed_at < occurred_at:
+            raise ValueError(
+                "historical label confirmation precedes transaction event"
+            )
+        return self
 
 
 class ReplayClassification(StrEnum):
