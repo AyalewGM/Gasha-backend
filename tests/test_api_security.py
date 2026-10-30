@@ -239,7 +239,9 @@ def test_unwired_bank_app_not_ready_and_cannot_evaluate(wired) -> None:
     client, _, _ = wired
     app.state.identity_verifier = None
     assert client.get("/health/live").json() == {"status": "ok"}
-    assert client.get("/health/ready").json()["status"] == "not_ready"
+    readiness = client.get("/health/ready")
+    assert readiness.status_code == 503
+    assert readiness.json()["status"] == "not_ready"
     assert client.post(
         "/v1/decisions", json={"transaction": tx()}, headers=headers(),
     ).status_code == 503
