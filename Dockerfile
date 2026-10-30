@@ -3,7 +3,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY pyproject.toml .
 COPY src ./src
-RUN pip install --no-cache-dir .
+# Bank-targeted image: the caller-controlled synthetic ASGI app must not be
+# importable even when an operator overrides the container command.
+RUN rm src/gasha/api/synthetic.py && pip install --no-cache-dir .
 RUN useradd --create-home gasha
 USER gasha
 EXPOSE 8000
