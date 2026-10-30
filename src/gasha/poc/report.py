@@ -6,17 +6,27 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 from gasha.domain.models import DecisionPolicy
-from gasha.poc.ablation import AblationReport
+from gasha.poc.ablation import AblationComparison, AblationReport
 from gasha.poc.attribution import (
     SignalAttributionReport,
     SignalFamily,
     attribute_signals,
 )
 from gasha.poc.historical import (
+    HistoricalReplayMetrics,
     HistoricalReplayReport,
     MissingTenantPolicyError,
 )
 from gasha.poc.incumbent import IncumbentComparison, compare_incumbent
+
+
+class RateEvidence(BaseModel):
+    """Rate with its measured population; zero denominators stay unknown."""
+
+    numerator: int = Field(ge=0)
+    denominator: int = Field(ge=0)
+    value: float | None
+    undefined_reason: str | None = None
 
 
 class ConfusionSummary(BaseModel):
@@ -24,9 +34,12 @@ class ConfusionSummary(BaseModel):
     false_positives: int
     true_negatives: int
     false_negatives: int
-    recall: float
-    precision: float
-    false_positive_rate: float
+    recall: float | None
+    precision: float | None
+    false_positive_rate: float | None
+    f1: float | None
+    false_negative_rate: float | None
+    rate_evidence: dict[str, RateEvidence]
 
 
 class LatencySummary(BaseModel):
@@ -45,7 +58,8 @@ class SignalFamilySummary(BaseModel):
     driving_alerts: int
     true_positives_influenced: int
     false_positives_influenced: int
-    share_of_detected_fraud: float
+    share_of_detected_fraud: float | None
+    share_of_detected_fraud_evidence: RateEvidence
     mean_risk_contribution: float | None
     max_risk_contribution: float | None
     reason_codes: list[str]
@@ -58,11 +72,15 @@ class AblationSummary(BaseModel):
     false_positives: int
     true_negatives: int
     false_negatives: int
-    recall: float
-    precision: float
-    false_positive_rate: float
-    recall_delta: float
-    incremental_recall_contribution: float
+    recall: float | None
+    precision: float | None
+    false_positive_rate: float | None
+    f1: float | None
+    false_negative_rate: float | None
+    rate_evidence: dict[str, RateEvidence]
+    recall_delta: float | None
+    incremental_recall_contribution: float | None
+    recall_delta_undefined_reason: str | None
     false_positive_delta: int
     detections_lost: int
 
@@ -116,7 +134,8 @@ class POCReport(BaseModel):
     unresolved_outcomes: int
     fraud_prevalence: float | None
     confusion: ConfusionSummary
-    explainability_coverage: float
+    explainability_coverage: float | None
+    explainability_coverage_evidence: RateEvidence
     latency: LatencySummary
     signal_attribution: list[SignalFamilySummary]
     ablation: list[AblationSummary]
@@ -161,6 +180,17 @@ def build_poc_report(
         )
 
     metrics = report.metrics
+    confusion = _confusion_summary(
+        metrics.true_positives,
+        metrics.false_positives,
+        metrics.true_negatives,
+        metrics.false_negatives,
+    )
+    explainability = _rate_evidence(
+        metrics.explained_alerts,
+        metrics.true_positives + metrics.false_positives,
+        "no_labeled_alerts",
+    )
     if attribution is None:
         attribution = attribute_signals(report.results, policies)
     if incumbent is None and any(
@@ -178,6 +208,19 @@ def build_poc_report(
     )
 
     derived_limitations: list[str] = list(limitations)
+    for name, rate in confusion.rate_evidence.items():
+        if rate.value is None:
+            derived_limitations.append(
+                f"{name} undefined: {rate.undefined_reason}"
+            )
+    if explainability.value is None:
+        derived_limitations.append(
+            "explainability coverage undefined: no labeled alerts"
+        )
+    if metrics.true_positives == 0:
+        derived_limitations.append(
+            "signal-family detected-fraud shares undefined: no detected fraud"
+        )
     if synthetic_dataset:
         derived_limitations.append(
             "dataset is synthetic or sanitized; results are not production "
@@ -248,16 +291,9 @@ def build_poc_report(
         labeled_events=metrics.labeled_cases,
         unresolved_outcomes=metrics.unlabeled_cases,
         fraud_prevalence=fraud_prevalence,
-        confusion=ConfusionSummary(
-            true_positives=metrics.true_positives,
-            false_positives=metrics.false_positives,
-            true_negatives=metrics.true_negatives,
-            false_negatives=metrics.false_negatives,
-            recall=metrics.recall,
-            precision=metrics.precision,
-            false_positive_rate=metrics.false_positive_rate,
-        ),
-        explainability_coverage=metrics.explainability_coverage,
+        confusion=confusion,
+        explainability_coverage=explainability.value,
+        explainability_coverage_evidence=explainability,
         latency=LatencySummary(
             mean_decision_latency_seconds=metrics.mean_decision_latency_seconds,
             mean_detection_lead_time_seconds=(
@@ -276,7 +312,16 @@ def build_poc_report(
                 driving_alerts=summary.driving_alerts,
                 true_positives_influenced=summary.true_positives_influenced,
                 false_positives_influenced=summary.false_positives_influenced,
-                share_of_detected_fraud=summary.share_of_detected_fraud,
+                share_of_detected_fraud=_rate_evidence(
+                    summary.true_positives_influenced,
+                    metrics.true_positives,
+                    "no_detected_fraud",
+                ).value,
+                share_of_detected_fraud_evidence=_rate_evidence(
+                    summary.true_positives_influenced,
+                    metrics.true_positives,
+                    "no_detected_fraud",
+                ),
                 mean_risk_contribution=summary.mean_risk_contribution,
                 max_risk_contribution=summary.max_risk_contribution,
                 reason_codes=sorted(summary.reason_codes),
@@ -284,25 +329,7 @@ def build_poc_report(
             for family, summary in attribution.families.items()
         ],
         ablation=[
-            AblationSummary(
-                configuration_name=comparison.configuration_name,
-                removed_families=[
-                    family.value for family in comparison.removed_families
-                ],
-                true_positives=comparison.true_positives,
-                false_positives=comparison.false_positives,
-                true_negatives=comparison.true_negatives,
-                false_negatives=comparison.false_negatives,
-                recall=comparison.recall,
-                precision=comparison.precision,
-                false_positive_rate=comparison.false_positive_rate,
-                recall_delta=comparison.recall_delta,
-                incremental_recall_contribution=(
-                    comparison.incremental_recall_contribution
-                ),
-                false_positive_delta=comparison.false_positive_delta,
-                detections_lost=comparison.detections_lost,
-            )
+            _ablation_summary(comparison, metrics)
             for comparison in (ablation.comparisons if ablation else ())
         ],
         unique_detections=_unique_detection_summary(ablation),
@@ -331,23 +358,17 @@ def build_poc_report(
                 incremental_confirmed_detection=(
                     incumbent.incremental_confirmed_detection
                 ),
-                gasha=ConfusionSummary(
-                    true_positives=incumbent.gasha.true_positives,
-                    false_positives=incumbent.gasha.false_positives,
-                    true_negatives=incumbent.gasha.true_negatives,
-                    false_negatives=incumbent.gasha.false_negatives,
-                    recall=incumbent.gasha.recall,
-                    precision=incumbent.gasha.precision,
-                    false_positive_rate=incumbent.gasha.false_positive_rate,
+                gasha=_confusion_summary(
+                    incumbent.gasha.true_positives,
+                    incumbent.gasha.false_positives,
+                    incumbent.gasha.true_negatives,
+                    incumbent.gasha.false_negatives,
                 ),
-                incumbent=ConfusionSummary(
-                    true_positives=incumbent.incumbent.true_positives,
-                    false_positives=incumbent.incumbent.false_positives,
-                    true_negatives=incumbent.incumbent.true_negatives,
-                    false_negatives=incumbent.incumbent.false_negatives,
-                    recall=incumbent.incumbent.recall,
-                    precision=incumbent.incumbent.precision,
-                    false_positive_rate=incumbent.incumbent.false_positive_rate,
+                incumbent=_confusion_summary(
+                    incumbent.incumbent.true_positives,
+                    incumbent.incumbent.false_positives,
+                    incumbent.incumbent.true_negatives,
+                    incumbent.incumbent.false_negatives,
                 ),
             )
             if incumbent
@@ -355,6 +376,102 @@ def build_poc_report(
         ),
         unmatched_outcomes=len(report.unmatched_outcomes),
         limitations=derived_limitations,
+    )
+
+
+def _rate_evidence(
+    numerator: int, denominator: int, undefined_reason: str
+) -> RateEvidence:
+    if numerator < 0 or denominator < 0 or numerator > denominator:
+        raise ValueError("inconsistent POC rate numerator/denominator")
+    return RateEvidence(
+        numerator=numerator,
+        denominator=denominator,
+        value=numerator / denominator if denominator else None,
+        undefined_reason=undefined_reason if denominator == 0 else None,
+    )
+
+
+def _confusion_summary(
+    true_positives: int,
+    false_positives: int,
+    true_negatives: int,
+    false_negatives: int,
+) -> ConfusionSummary:
+    tp, fp, tn, fn = (
+        true_positives,
+        false_positives,
+        true_negatives,
+        false_negatives,
+    )
+    rates = {
+        "recall": _rate_evidence(tp, tp + fn, "no_confirmed_fraud"),
+        "precision": _rate_evidence(tp, tp + fp, "no_labeled_alerts"),
+        "f1": _rate_evidence(
+            2 * tp, 2 * tp + fp + fn, "no_positive_labels_or_alerts"
+        ),
+        "false_positive_rate": _rate_evidence(
+            fp, fp + tn, "no_confirmed_legitimate"
+        ),
+        "false_negative_rate": _rate_evidence(
+            fn, tp + fn, "no_confirmed_fraud"
+        ),
+    }
+    return ConfusionSummary(
+        true_positives=tp,
+        false_positives=fp,
+        true_negatives=tn,
+        false_negatives=fn,
+        recall=rates["recall"].value,
+        precision=rates["precision"].value,
+        false_positive_rate=rates["false_positive_rate"].value,
+        f1=rates["f1"].value,
+        false_negative_rate=rates["false_negative_rate"].value,
+        rate_evidence=rates,
+    )
+
+
+def _ablation_summary(
+    comparison: AblationComparison, full: HistoricalReplayMetrics
+) -> AblationSummary:
+    ablated = _confusion_summary(
+        comparison.true_positives,
+        comparison.false_positives,
+        comparison.true_negatives,
+        comparison.false_negatives,
+    )
+    full_recall = _rate_evidence(
+        full.true_positives,
+        full.true_positives + full.false_negatives,
+        "no_confirmed_fraud",
+    ).value
+    recall_delta = (
+        ablated.recall - full_recall
+        if ablated.recall is not None and full_recall is not None
+        else None
+    )
+    return AblationSummary(
+        configuration_name=comparison.configuration_name,
+        removed_families=[family.value for family in comparison.removed_families],
+        true_positives=comparison.true_positives,
+        false_positives=comparison.false_positives,
+        true_negatives=comparison.true_negatives,
+        false_negatives=comparison.false_negatives,
+        recall=ablated.recall,
+        precision=ablated.precision,
+        false_positive_rate=ablated.false_positive_rate,
+        f1=ablated.f1,
+        false_negative_rate=ablated.false_negative_rate,
+        rate_evidence=ablated.rate_evidence,
+        recall_delta=recall_delta,
+        incremental_recall_contribution=(
+            -recall_delta if recall_delta is not None else None
+        ),
+        recall_delta_undefined_reason=(
+            "no_confirmed_fraud" if recall_delta is None else None
+        ),
+        false_positive_delta=comparison.false_positive_delta,
+        detections_lost=comparison.detections_lost,
     )
 
 
