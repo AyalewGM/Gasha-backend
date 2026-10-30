@@ -304,6 +304,29 @@ class POCReport(BaseModel):
                 incumbent.neither_detected,
                 incumbent.incremental_confirmed_detection,
             )
+            # A shared fraud cohort must admit a feasible allocation across
+            # the four joint alert cells. Bounds on x alone are insufficient.
+            fraud = incumbent.gasha.true_positives + incumbent.gasha.false_negatives
+            gasha_tp = incumbent.gasha.true_positives
+            incumbent_tp = incumbent.incumbent.true_positives
+            incremental = incumbent.incremental_confirmed_detection
+            fraud_allocations = (
+                gasha_tp - incremental,
+                incremental,
+                incumbent_tp - gasha_tp + incremental,
+                fraud - incumbent_tp - incremental,
+            )
+            joint_cells = (
+                incumbent.both_detected,
+                incumbent.gasha_only_detected,
+                incumbent.incumbent_only_detected,
+                incumbent.neither_detected,
+            )
+            if any(
+                allocated < 0 or allocated > size
+                for allocated, size in zip(fraud_allocations, joint_cells, strict=True)
+            ):
+                raise ValueError("incremental detection violates joint fraud allocation")
             if (
                 min(counts) < 0
                 or incumbent.evaluated_cases
