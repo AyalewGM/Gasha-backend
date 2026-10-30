@@ -131,6 +131,13 @@ class SignalFamilySummary(BaseModel):
             self.false_positives_influenced,
         ) < 0:
             raise ValueError("signal-family counts cannot be negative")
+        if self.driving_alerts > self.alerts_influenced:
+            raise ValueError("driving alerts exceed influenced alerts")
+        if (
+            self.true_positives_influenced + self.false_positives_influenced
+            > self.alerts_influenced
+        ):
+            raise ValueError("classified influenced alerts exceed influenced alerts")
         rate = self.share_of_detected_fraud_evidence
         if (
             rate.numerator != self.true_positives_influenced
