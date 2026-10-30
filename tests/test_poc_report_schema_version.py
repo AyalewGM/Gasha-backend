@@ -180,7 +180,7 @@ def test_rate_consumer_rejects_invalid_rate_arithmetic(
     [
         ("precision", 0.99),
         ("rate_evidence.precision.value", 0.99),
-        ("rate_evidence.recall.numerator", 2),
+        ("rate_evidence.recall.numerator", 1),
         ("rate_evidence.false_positive_rate.denominator", 100),
     ],
 )
