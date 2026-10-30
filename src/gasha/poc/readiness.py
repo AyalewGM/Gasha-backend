@@ -81,6 +81,7 @@ _REQUIRED: dict[Stage, frozenset[EvidenceArea]] = {
 
 def evaluate_poc_gate(request: POCGateRequest) -> POCGateReport:
     """Missing evidence or approval blocks progression; no implicit stage promotion."""
+    _validate_request(request)
     if not request.tenant_id.strip():
         raise ValueError("tenant_id is required")
     missing = tuple(sorted(area.value for area in _REQUIRED[request.stage] - request.evidence))
@@ -109,4 +110,36 @@ def evaluate_poc_gate(request: POCGateRequest) -> POCGateReport:
         missing_evidence=missing,
         blockers=tuple(blockers),
     )
+
+
+def _validate_request(request: POCGateRequest) -> None:
+    """Reject malformed internal assertions; type annotations do not validate at runtime.
+
+    In particular, StrEnum strings compare equal in sets/dicts but do not satisfy
+    enum identity checks. Reject them instead of silently skipping stage vetoes.
+    This validates shape only, not evidence provenance or approval authority.
+    """
+    if not isinstance(request.tenant_id, str):
+        raise TypeError("tenant_id must be a string")
+    if not isinstance(request.stage, Stage):
+        raise TypeError("stage must be a Stage enum")
+    if not isinstance(request.evidence, frozenset) or any(
+        not isinstance(area, EvidenceArea) for area in request.evidence
+    ):
+        raise TypeError("evidence must be a frozenset of EvidenceArea enums")
+    for name in (
+        "historical_accepted", "shadow_accepted", "bank_inline_approved", "tenant_inline_enabled",
+    ):
+        if type(getattr(request, name)) is not bool:
+            raise TypeError(f"{name} must be a bool")
+    if not isinstance(request.findings, tuple):
+        raise TypeError("findings must be a tuple")
+    for finding in request.findings:
+        if not isinstance(finding, SecurityFinding):
+            raise TypeError("findings must contain SecurityFinding records")
+        if not isinstance(finding.severity, FindingSeverity):
+            raise TypeError("severity must be a FindingSeverity enum")
+        if type(finding.resolved) is not bool or type(finding.gasha_attributable) is not bool:
+            raise TypeError("finding status and attribution must be bools")
+
 

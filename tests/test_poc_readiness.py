@@ -1,6 +1,7 @@
 """Fail-closed POC progression tests; no real bank data or inline activation."""
 
 from dataclasses import replace
+from typing import Any
 
 import pytest
 
@@ -149,3 +150,47 @@ def test_complete_packet_never_activates_or_mutates_request(stage: Stage) -> Non
     assert packet == before
     assert evaluate_poc_gate(packet) == first
 
+
+
+
+@pytest.mark.parametrize("stage", ["historical", "shadow", "inline_preparation", "unknown", None])
+def test_runtime_stage_strings_cannot_skip_approval_checks(stage: Any) -> None:
+    packet = replace(request(Stage.INLINE_PREPARATION), stage=stage, historical_accepted=True)
+    with pytest.raises(TypeError, match="stage"):
+        evaluate_poc_gate(packet)
+
+
+@pytest.mark.parametrize("field", [
+    "historical_accepted", "shadow_accepted", "bank_inline_approved", "tenant_inline_enabled",
+])
+@pytest.mark.parametrize("value", ["false", "true", 1, 0, None])
+def test_runtime_approvals_require_actual_booleans(field: str, value: Any) -> None:
+    with pytest.raises(TypeError, match=field):
+        evaluate_poc_gate(replace(request(Stage.INLINE_PREPARATION), **{field: value}))
+
+
+@pytest.mark.parametrize("evidence", [frozenset(area.value for area in EvidenceArea),
+                                      set(EvidenceArea), frozenset({"unknown"}), None])
+def test_runtime_evidence_requires_typed_immutable_areas(evidence: Any) -> None:
+    with pytest.raises(TypeError, match="evidence"):
+        evaluate_poc_gate(replace(request(Stage.HISTORICAL), evidence=evidence))
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("severity", "critical"), ("severity", "unknown"),
+    ("resolved", "false"), ("resolved", 1),
+    ("gasha_attributable", "false"), ("gasha_attributable", 0),
+])
+def test_malformed_findings_cannot_skip_critical_veto(field: str, value: Any) -> None:
+    finding = SecurityFinding("synthetic-critical", FindingSeverity.CRITICAL, "security", False)
+    packet = replace(request(Stage.INLINE_PREPARATION), historical_accepted=True,
+                     shadow_accepted=True, bank_inline_approved=True, tenant_inline_enabled=True,
+                     findings=(replace(finding, **{field: value}),))
+    with pytest.raises(TypeError):
+        evaluate_poc_gate(packet)
+
+
+@pytest.mark.parametrize("findings", [None, [], ({"severity": "critical"},)])
+def test_malformed_finding_collections_are_rejected(findings: Any) -> None:
+    with pytest.raises(TypeError, match="findings"):
+        evaluate_poc_gate(replace(request(Stage.HISTORICAL), findings=findings))
