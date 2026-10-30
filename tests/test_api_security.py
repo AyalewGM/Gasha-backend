@@ -49,6 +49,11 @@ class ContextProvider:
         assert transaction.tenant_id in principal.tenant_ids
         return TrustedDecisionContext(
             tenant_id=transaction.tenant_id,
+            event_id=transaction.event_id,
+            signal_source_version="synthetic-source-1",
+            signal_version="synthetic-signal-v1",
+            collected_at=NOW,
+            expires_at=NOW + timedelta(minutes=30),
             policy=DecisionPolicy(
                 configuration_version="synthetic-config-1",
                 policy_version="synthetic-policy-1",
@@ -245,3 +250,129 @@ def test_unwired_bank_app_not_ready_and_cannot_evaluate(wired) -> None:
     assert client.post(
         "/v1/decisions", json={"transaction": tx()}, headers=headers(),
     ).status_code == 503
+
+
+def test_audit_attempt_correlates_authorization_terminal_result_and_event(wired) -> None:
+    client, audit, _ = wired
+    body = tx()
+    response = client.post("/v1/evaluations", json={"transaction": body}, headers=headers())
+    assert response.status_code == 200
+    records = [e for e in audit.events if e.action == Capability.DECISION_SUBMIT.value]
+    assert [e.result for e in records] == ["authorized", "succeeded"]
+    assert len({e.attempt_ref for e in records}) == 1
+    assert len(records[0].attempt_ref) == 32
+    assert len(records[0].event_ref) == 64
+    assert records[0].event_ref == records[1].event_ref
+    assert len(records[1].context_ref) == 64
+    assert str(body["event_id"]) not in str(records)
+    assert "synthetic-customer" not in str(records)
+
+
+def test_failed_context_is_correlated_and_records_terminal_failure(wired) -> None:
+    client, audit, _ = wired
+
+    class FailingProvider:
+        def resolve(self, transaction, principal):
+            raise RuntimeError("synthetic upstream unavailable")
+
+    app.state.decision_context_provider = FailingProvider()
+    response = client.post("/v1/decisions", json={"transaction": tx()}, headers=headers())
+    assert response.status_code == 503
+    events = [e for e in audit.events if e.action == Capability.DECISION_SUBMIT.value]
+    assert [e.result for e in events] == ["authorized", "failed"]
+    assert events[0].attempt_ref == events[1].attempt_ref
+    assert events[0].event_ref == events[1].event_ref
+    assert "synthetic upstream" not in str(events)
+
+
+@pytest.mark.parametrize("kind", ["wrong_event", "wrong_tenant", "stale", "future"])
+def test_unbound_or_stale_server_context_fails_closed(wired, kind) -> None:
+    client, audit, _ = wired
+
+    class BadProvider:
+        def resolve(self, transaction, principal):
+            return TrustedDecisionContext(
+                tenant_id="tenant-b" if kind == "wrong_tenant" else transaction.tenant_id,
+                event_id=uuid4() if kind == "wrong_event" else transaction.event_id,
+                policy=DecisionPolicy(
+                    configuration_version="synthetic-c1",
+                    policy_version="synthetic-p1",
+                    rule_version="synthetic-r1",
+                ),
+                intelligence=IntelligenceSnapshot(network_risk=0.99),
+                signal_source_version="synthetic-source-v1",
+                signal_version="synthetic-signal-v1",
+                collected_at=NOW + timedelta(days=1) if kind == "future" else (
+                    NOW - timedelta(days=2) if kind == "stale" else NOW
+                ),
+                expires_at=NOW + timedelta(days=2) if kind == "future" else (
+                    NOW - timedelta(days=1) if kind == "stale" else NOW + timedelta(hours=1)
+                ),
+            )
+
+    app.state.decision_context_provider = BadProvider()
+    response = client.post("/v1/decisions", json={"transaction": tx()}, headers=headers())
+    assert response.status_code == 503
+    events = [e for e in audit.events if e.action == Capability.DECISION_SUBMIT.value]
+    assert [e.result for e in events] == ["authorized", "failed"]
+
+
+def test_context_snapshot_cannot_be_modified_via_mutable_input_or_getter() -> None:
+    policy = DecisionPolicy(
+        configuration_version="synthetic-c1",
+        policy_version="synthetic-p1",
+        rule_version="synthetic-r1",
+    )
+    intelligence = IntelligenceSnapshot(network_risk=0.97)
+    context = TrustedDecisionContext(
+        tenant_id="tenant-a", event_id=uuid4(),
+        policy=policy, intelligence=intelligence,
+        signal_source_version="synthetic-source-v1",
+        signal_version="synthetic-signal-v1",
+        collected_at=NOW, expires_at=NOW + timedelta(minutes=20),
+    )
+    original_ref = context.context_ref
+    policy.block_threshold = 0.99
+    intelligence.network_risk = 0.0
+    fetched_policy = context.policy
+    fetched_signals = context.intelligence
+    fetched_policy.block_threshold = 0.99
+    fetched_signals.network_risk = 0.0
+    assert context.policy.block_threshold == 0.95
+    assert context.intelligence.network_risk == 0.97
+    assert context.context_ref == original_ref
+
+
+def test_audit_failure_before_outcome_mutation_blocks_write(wired) -> None:
+    client, _, store = wired
+
+    class OfflineAudit:
+        def append(self, event) -> None:
+            raise RuntimeError("synthetic audit unavailable")
+
+    app.state.security_audit = OfflineAudit()
+    event_id = uuid4()
+    body = {
+        "tenant_id": "tenant-a", "event_id": str(event_id),
+        "outcome": "confirmed_fraud", "outcome_source": "synthetic-review",
+        "outcome_version": "synthetic-v1", "confirmed_at": NOW.isoformat(),
+    }
+    response = client.post("/v1/outcomes", json=body, headers=headers())
+    assert response.status_code == 503
+    assert store.store.outcomes("tenant-a", event_id) == ()
+
+
+def test_missing_outcome_store_records_terminal_failure(wired) -> None:
+    client, audit, _ = wired
+    app.state.outcome_ingestion = None
+    body = {
+        "tenant_id": "tenant-a", "event_id": str(uuid4()),
+        "outcome": "confirmed_fraud", "outcome_source": "synthetic-review",
+        "outcome_version": "synthetic-v1", "confirmed_at": NOW.isoformat(),
+    }
+    response = client.post("/v1/outcomes", json=body, headers=headers())
+    assert response.status_code == 503
+    events = [e for e in audit.events if e.action == Capability.OUTCOME_SUBMIT.value]
+    assert [e.result for e in events] == ["authorized", "failed"]
+    assert events[0].attempt_ref == events[1].attempt_ref
+    assert events[0].event_ref == events[1].event_ref
