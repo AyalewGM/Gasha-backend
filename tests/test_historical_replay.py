@@ -405,3 +405,44 @@ def test_missing_receipt_and_confirmation_remain_synthetic_unknowns() -> None:
     report = replay_historical((source,), {"tenant-a": policy()})
     assert report.results[0].classification == ReplayClassification.TRUE_NEGATIVE
     assert report.results[0].decision_latency is None
+
+
+@pytest.mark.parametrize("include_label", [False, True])
+def test_event_only_naive_clock_is_rejected(include_label: bool) -> None:
+    """The required event clock is mandatory even without optional times."""
+    label = (
+        ConfirmedOutcomeLabel(is_fraud=False, label_source="synthetic")
+        if include_label
+        else None
+    )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        event(
+            occurred_at=T0.replace(tzinfo=None),
+            label=label,
+            suffix="naive-no-optional-times",
+        )
+
+
+def test_mixed_clock_batch_rejects_before_sort_or_partial_replay() -> None:
+    """Even an unchecked model copy must not provoke sort TypeError or decisions."""
+    valid = event(suffix="valid")
+    unchecked = event(suffix="unchecked").model_copy(
+        update={
+            "transaction": transaction(
+                occurred_at=T0.replace(tzinfo=None), suffix="unchecked"
+            )
+        }
+    )
+    clock_calls: list[datetime] = []
+
+    def clock() -> datetime:
+        clock_calls.append(T0)
+        return T0
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        replay_historical(
+            (valid, unchecked),
+            {"tenant-a": policy()},
+            clock=clock,
+        )
+    assert clock_calls == []
