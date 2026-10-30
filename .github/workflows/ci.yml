@@ -28,9 +28,14 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: gasha-backend:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Assert bank image excludes synthetic entrypoint
+        run: |
+          docker run --rm gasha-backend:ci python -c 'from importlib.util import find_spec; assert find_spec("gasha.api.synthetic") is None, "synthetic app present in bank image"'
+          docker run --rm gasha-backend:ci python -c 'from gasha.api.main import app; assert app.state.identity_verifier is None; assert app.state.security_audit is None'
 
   postgres-integration:
     runs-on: ubuntu-latest
