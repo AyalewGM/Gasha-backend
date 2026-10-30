@@ -10,62 +10,51 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from gasha.domain.models import (
-    BeneficiaryType,
-    CanonicalTransaction,
-    DecisionPolicy,
-    IntelligenceSnapshot,
-)
-from gasha.poc.historical import (
-    ConfirmedOutcomeLabel,
-    HistoricalTransactionEvent,
-    replay_historical,
-)
-from gasha.poc.outcomes import IncumbentControlOutcome
-from gasha.poc.report import POCReport, build_poc_report
+from gasha.domain import models
+from gasha.poc import historical, outcomes, report
 
 
-Case = tuple[str, bool, bool, IncumbentControlOutcome | None]
+Case = tuple[str, bool, bool, outcomes.IncumbentControlOutcome | None]
 
 _COHORTS: dict[str, tuple[Case, ...]] = {
     "fraud": (
-        ("fraud-gasha", True, True, IncumbentControlOutcome.NO_ALERT),
-        ("fraud-incumbent", True, False, IncumbentControlOutcome.ALERT),
+        ("fraud-gasha", True, True, outcomes.IncumbentControlOutcome.NO_ALERT),
+        ("fraud-incumbent", True, False, outcomes.IncumbentControlOutcome.ALERT),
     ),
     "legitimate": (
-        ("legitimate-both", False, True, IncumbentControlOutcome.ALERT),
-        ("legitimate-neither", False, False, IncumbentControlOutcome.NO_ALERT),
+        ("legitimate-both", False, True, outcomes.IncumbentControlOutcome.ALERT),
+        ("legitimate-neither", False, False, outcomes.IncumbentControlOutcome.NO_ALERT),
     ),
     "mixed": (
-        ("fraud-both", True, True, IncumbentControlOutcome.ALERT),
-        ("fraud-gasha", True, True, IncumbentControlOutcome.NO_ALERT),
-        ("legitimate-incumbent", False, False, IncumbentControlOutcome.ALERT),
-        ("legitimate-neither", False, False, IncumbentControlOutcome.NO_ALERT),
+        ("fraud-both", True, True, outcomes.IncumbentControlOutcome.ALERT),
+        ("fraud-gasha", True, True, outcomes.IncumbentControlOutcome.NO_ALERT),
+        ("legitimate-incumbent", False, False, outcomes.IncumbentControlOutcome.ALERT),
+        ("legitimate-neither", False, False, outcomes.IncumbentControlOutcome.NO_ALERT),
     ),
     "missing": (
-        ("fraud-gasha", True, True, IncumbentControlOutcome.NO_ALERT),
+        ("fraud-gasha", True, True, outcomes.IncumbentControlOutcome.NO_ALERT),
         ("legitimate-missing", False, False, None),
-        ("fraud-incumbent", True, False, IncumbentControlOutcome.ALERT),
+        ("fraud-incumbent", True, False, outcomes.IncumbentControlOutcome.ALERT),
     ),
     "legitimate-no-alert": (
-        ("legitimate-neither", False, False, IncumbentControlOutcome.NO_ALERT),
+        ("legitimate-neither", False, False, outcomes.IncumbentControlOutcome.NO_ALERT),
     ),
     "incremental-gasha-bound": (
-        ("legitimate-gasha", False, True, IncumbentControlOutcome.NO_ALERT),
-        ("fraud-neither", True, False, IncumbentControlOutcome.NO_ALERT),
+        ("legitimate-gasha", False, True, outcomes.IncumbentControlOutcome.NO_ALERT),
+        ("fraud-neither", True, False, outcomes.IncumbentControlOutcome.NO_ALERT),
     ),
     "incremental-incumbent-bound": (
-        ("fraud-gasha", True, True, IncumbentControlOutcome.NO_ALERT),
-        ("fraud-both", True, True, IncumbentControlOutcome.ALERT),
-        ("legitimate-gasha", False, True, IncumbentControlOutcome.NO_ALERT),
+        ("fraud-gasha", True, True, outcomes.IncumbentControlOutcome.NO_ALERT),
+        ("fraud-both", True, True, outcomes.IncumbentControlOutcome.ALERT),
+        ("legitimate-gasha", False, True, outcomes.IncumbentControlOutcome.NO_ALERT),
     ),
 }
 
 
 def _payload(cohort: str) -> dict[str, object]:
-    events: list[HistoricalTransactionEvent] = []
+    events: list[historical.HistoricalTransactionEvent] = []
     for suffix, fraud, gasha_alert, incumbent in _COHORTS[cohort]:
-        transaction = CanonicalTransaction(
+        transaction = models.CanonicalTransaction(
             tenant_id="tenant-synthetic",
             event_id=uuid4(),
             occurred_at=datetime(2026, 2, 10, tzinfo=UTC),
@@ -76,17 +65,17 @@ def _payload(cohort: str) -> dict[str, object]:
             sender_customer_id=f"sender-{suffix}",
             sender_account_id=f"account-{suffix}",
             beneficiary_id=f"beneficiary-{suffix}",
-            beneficiary_type=BeneficiaryType.EXTERNAL,
+            beneficiary_type=models.BeneficiaryType.EXTERNAL,
             destination_institution_id="synthetic-institution",
             correlation_id=f"corr-{suffix}",
         )
         events.append(
-            HistoricalTransactionEvent(
+            historical.HistoricalTransactionEvent(
                 transaction=transaction,
-                intelligence=IntelligenceSnapshot(
+                intelligence=models.IntelligenceSnapshot(
                     network_risk=0.99 if gasha_alert else 0.0
                 ),
-                label=ConfirmedOutcomeLabel(
+                label=historical.ConfirmedOutcomeLabel(
                     is_fraud=fraud, label_source="synthetic"
                 ),
                 incumbent_outcome=incumbent,
@@ -94,14 +83,14 @@ def _payload(cohort: str) -> dict[str, object]:
         )
 
     policies = {
-        "tenant-synthetic": DecisionPolicy(
+        "tenant-synthetic": models.DecisionPolicy(
             configuration_version="config-synthetic",
             policy_version="policy-synthetic",
             rule_version="rules-synthetic",
         )
     }
-    replay = replay_historical(tuple(events), policies)
-    report = build_poc_report(
+    replay = historical.replay_historical(tuple(events), policies)
+    report = report.build_poc_report(
         tenant_id="tenant-synthetic",
         dataset_id=f"synthetic-{cohort}",
         report=replay,
@@ -115,7 +104,7 @@ def test_real_builder_comparator_round_trips_with_conserved_marginals(
     cohort: str,
 ) -> None:
     payload = _payload(cohort)
-    validated = POCReport.model_validate_json(json.dumps(payload))
+    validated = report.POCReport.model_validate_json(json.dumps(payload))
     comparison = validated.incumbent_comparison
     assert comparison is not None
     assert comparison.evaluated_cases > 0
@@ -156,7 +145,7 @@ def test_json_consumer_rejects_comparison_arithmetic_tampering(
     payload = _payload(cohort)
     comparison = payload["incumbent_comparison"]
     assert isinstance(comparison, dict)
-    assert POCReport.model_validate_json(json.dumps(payload)).incumbent_comparison
+    assert report.POCReport.model_validate_json(json.dumps(payload)).incumbent_comparison
 
     if mutation == "fabricated_both":
         assert comparison["neither_detected"] == 1
@@ -188,4 +177,4 @@ def test_json_consumer_rejects_comparison_arithmetic_tampering(
         raise AssertionError(f"unsupported mutation: {mutation}")
 
     with pytest.raises(ValidationError, match="incumbent comparison population"):
-        POCReport.model_validate_json(json.dumps(payload))
+        report.POCReport.model_validate_json(json.dumps(payload))
