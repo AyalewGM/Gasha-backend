@@ -20,7 +20,6 @@ from gasha.poc.historical import (
     reconcile_outcomes,
     replay_historical,
 )
-
 from gasha.poc.outcomes import OutcomeRecord, OutcomeType
 
 T0 = datetime(2026, 1, 10, 9, 0, 0, tzinfo=UTC)
