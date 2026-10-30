@@ -18,6 +18,7 @@ from gasha.poc.historical import (
     reconcile_outcomes,
     replay_historical,
 )
+from gasha.poc.incumbent import compare_incumbent
 from gasha.poc.outcomes import (
     IncumbentControlOutcome,
     OutcomeRecord,
@@ -150,6 +151,10 @@ def test_poc_report_assembles_machine_readable_evidence() -> None:
     assert poc.incumbent_comparison.both_detected == 1
     assert poc.incumbent_comparison.incumbent_only_detected == 1
     assert poc.limitations
+    assert poc.latency.mean_decision_latency_seconds is None
+    assert poc.latency.mean_detection_lead_time_seconds is None
+    assert poc.latency.mean_processing_latency_ms is not None
+    assert any("historical decision latency" in item for item in poc.limitations)
 
     serialized = poc.model_dump(mode="json")
     assert serialized["confusion"]["true_positives"] == 2
@@ -310,3 +315,148 @@ def test_signal_family_accepts_valid_subset_counts() -> None:
         reason_codes=[],
     )
     assert summary.driving_alerts == 3
+
+def test_incumbent_cohort_uses_late_reconciled_fraud_label() -> None:
+    policies = {"tenant-a": policy()}
+    pending = event(
+        "late-fraud",
+        IntelligenceSnapshot(network_risk=0.97),
+        None,
+        incumbent=IncumbentControlOutcome.NO_ALERT,
+    )
+    original = replay_historical((pending,), policies)
+    assert original.metrics.unlabeled_cases == 1
+    assert compare_incumbent(original.results).evaluated_cases == 0
+
+    confirmed = reconcile_outcomes(
+        original,
+        (
+            OutcomeRecord(
+                tenant_id="tenant-a",
+                event_id=pending.transaction.event_id,
+                outcome=OutcomeType.CONFIRMED_FRAUD,
+                outcome_source="synthetic-investigation",
+                outcome_version="outcomes-1",
+                confirmed_at=T0 + timedelta(days=3),
+            ),
+        ),
+    )
+    comparison = compare_incumbent(confirmed.results)
+    assert confirmed.metrics.true_positives == 1
+    assert confirmed.metrics.unlabeled_cases == 0
+    assert comparison.evaluated_cases == 1
+    assert comparison.missing_incumbent_outcomes == 0
+    assert comparison.gasha.true_positives == 1
+    assert comparison.incumbent.false_negatives == 1
+    assert comparison.incremental_confirmed_detection == 1
+
+    serialized = build_poc_report(
+        tenant_id="tenant-a",
+        dataset_id="synthetic-late-outcome",
+        report=confirmed,
+        policies=policies,
+    ).model_dump(mode="json")
+    assert serialized["confusion"]["true_positives"] == 1
+    assert serialized["incumbent_comparison"]["evaluated_cases"] == 1
+    assert serialized["incumbent_comparison"]["incremental_confirmed_detection"] == 1
+
+
+def test_incumbent_cohort_respects_latest_label_and_tenant_boundary() -> None:
+    policies = {"tenant-a": policy()}
+    corrected = event(
+        "corrected",
+        IntelligenceSnapshot(network_risk=0.96),
+        None,
+        incumbent=IncumbentControlOutcome.ALERT,
+    )
+    unresolved = event(
+        "unresolved",
+        IntelligenceSnapshot(),
+        None,
+        incumbent=IncumbentControlOutcome.NO_ALERT,
+    )
+    no_incumbent = event(
+        "no-incumbent",
+        IntelligenceSnapshot(),
+        False,
+    )
+    original = replay_historical((corrected, unresolved, no_incumbent), policies)
+    reconciled = reconcile_outcomes(
+        original,
+        (
+            OutcomeRecord(
+                tenant_id="tenant-b",
+                event_id=unresolved.transaction.event_id,
+                outcome=OutcomeType.CONFIRMED_FRAUD,
+                outcome_source="synthetic-investigation",
+                outcome_version="outcomes-1",
+                confirmed_at=T0 + timedelta(days=4),
+            ),
+            OutcomeRecord(
+                tenant_id="tenant-a",
+                event_id=corrected.transaction.event_id,
+                outcome=OutcomeType.CONFIRMED_FRAUD,
+                outcome_source="synthetic-investigation",
+                outcome_version="outcomes-1",
+                confirmed_at=T0 + timedelta(days=1),
+            ),
+            OutcomeRecord(
+                tenant_id="tenant-a",
+                event_id=corrected.transaction.event_id,
+                outcome=OutcomeType.CONFIRMED_LEGITIMATE,
+                outcome_source="synthetic-investigation",
+                outcome_version="outcomes-2",
+                confirmed_at=T0 + timedelta(days=2),
+            ),
+        ),
+    )
+    comparison = compare_incumbent(reconciled.results)
+    assert reconciled.metrics.false_positives == 1
+    assert reconciled.metrics.true_positives == 0
+    assert reconciled.metrics.unlabeled_cases == 1
+    assert len(reconciled.unmatched_outcomes) == 1
+    assert comparison.evaluated_cases == 1
+    assert comparison.missing_incumbent_outcomes == 1
+    assert comparison.gasha.false_positives == 1
+    assert comparison.incumbent.false_positives == 1
+    assert comparison.incremental_confirmed_detection == 0
+
+def test_combined_historical_reconciliation_and_report_v2() -> None:
+    """Issue #48: timing, reconciled cohort and nullable report rates together."""
+    policies = {"tenant-a": policy()}
+    pending = event(
+        "combined-fraud",
+        IntelligenceSnapshot(network_risk=0.97),
+        None,
+        incumbent=IncumbentControlOutcome.NO_ALERT,
+    )
+    original = replay_historical((pending,), policies)
+    reconciled = reconcile_outcomes(
+        original,
+        (
+            OutcomeRecord(
+                tenant_id="tenant-a",
+                event_id=pending.transaction.event_id,
+                outcome=OutcomeType.CONFIRMED_FRAUD,
+                outcome_source="synthetic-investigation",
+                outcome_version="outcomes-1",
+                confirmed_at=T0 + timedelta(days=3),
+            ),
+        ),
+    )
+    poc = build_poc_report(
+        tenant_id="tenant-a",
+        dataset_id="synthetic-combined-issue-48",
+        report=reconciled,
+        policies=policies,
+    )
+    payload = poc.model_dump(mode="json")
+    assert payload["report_version"] == "poc-report-2"
+    assert payload["latency"]["mean_decision_latency_seconds"] is None
+    assert payload["latency"]["mean_detection_lead_time_seconds"] is None
+    assert payload["confusion"]["true_positives"] == 1
+    assert payload["confusion"]["rate_evidence"]["false_positive_rate"]["value"] is None
+    assert payload["confusion"]["rate_evidence"]["false_positive_rate"]["undefined_reason"] == "no_confirmed_legitimate"
+    assert payload["incumbent_comparison"]["evaluated_cases"] == 1
+    assert payload["incumbent_comparison"]["incremental_confirmed_detection"] == 1
+    assert any("historical decision latency" in note for note in payload["limitations"])

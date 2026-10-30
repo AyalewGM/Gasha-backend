@@ -111,9 +111,8 @@ def test_reconcile_attaches_late_outcome_without_mutating_decision() -> None:
         OutcomeType.INVESTIGATOR_CONFIRMED_FRAUD
     )
     assert result.decision == original.decision
-    assert result.detection_lead_time == (
-        T0 + timedelta(days=2) - result.decision.decided_at
-    )
+    assert result.detection_lead_time is None
+    assert reconciled.metrics.mean_detection_lead_time_seconds is None
 
 
 def test_reconcile_reclassifies_bank_confirmed_false_positive() -> None:
@@ -163,7 +162,7 @@ def test_outcome_cannot_attach_across_tenants() -> None:
     assert reconciled.unmatched_outcomes == (foreign,)
 
 
-def test_latency_is_measured_with_injected_clock() -> None:
+def test_replay_processing_latency_is_measured_with_injected_clock() -> None:
     ticks = [T0]
 
     def clock() -> datetime:
@@ -183,12 +182,11 @@ def test_latency_is_measured_with_injected_clock() -> None:
     first, second = report.results
     assert first.processing_latency == timedelta(milliseconds=6)
     assert first.evaluation_started_at == T0
-    assert first.decision_latency == (
-        first.decision.decided_at - T0
-    )
+    assert first.decision_latency is None
     assert second.evaluation_started_at == T0 + timedelta(milliseconds=12)
 
     metrics = report.metrics
+    assert metrics.mean_decision_latency_seconds is None
     assert metrics.mean_processing_latency_ms == 6.0
     assert metrics.median_processing_latency_ms == 6.0
     assert metrics.p95_processing_latency_ms is not None

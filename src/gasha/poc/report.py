@@ -451,6 +451,12 @@ def build_poc_report(
         "claims about other fraud platforms"
     )
 
+    derived_limitations.append(
+        "historical decision latency and detection lead time are unavailable: "
+        "replay execution timestamps are not original bank decision or alert "
+        "timestamps; only replay processing latency is measured"
+    )
+
     return POCReport(
         report_version=POC_REPORT_SCHEMA_VERSION,
         tenant_id=tenant_id,
