@@ -450,7 +450,6 @@ def build_poc_report(
         "metrics are measurements on this dataset, not causal or comparative "
         "claims about other fraud platforms"
     )
-
     derived_limitations.append(
         "historical decision latency and detection lead time are unavailable: "
         "replay execution timestamps are not original bank decision or alert "
