@@ -30,7 +30,12 @@ serve decision or outcome mutations without deliberate wiring:
   append authentication/authorization evidence rejects the request.
 - `decision_context_provider`: server-selected tenant-bound
   `TrustedDecisionContextProvider` supplying versioned policy and authoritative
-  intelligence signals, not caller-selected thresholds.
+  intelligence signals, not caller-selected thresholds. Contexts are tied to
+  the exact tenant/event, carry signal source and signal version, an immutable
+  serialized policy/signal snapshot and SHA-256 context reference, plus a
+  provider-declared collection/expiry window checked against service time.
+  Provider trust/attestation and actual bank signal ingestion remain separate
+  integration controls.
 - `outcome_ingestion`: explicitly provisioned `OutcomeIngestionService`
   with a bank-approved durable and tenant-scoped store. The old in-memory
   default is not silently mounted in the protected app.
@@ -58,6 +63,14 @@ All missing or invalid credentials, mismatched tenants, insufficient
 capabilities, identity-provider outages, missing context and audit
 write failures are denied. Audit actor and tenant references are hashed;
 tokens, request bodies, raw PII and secrets are never included in audit events.
+Each protected request receives a server-generated attempt reference; action
+authorization and terminal outcome use distinct result labels and share a
+hashed tenant/event reference. Successful evaluations include a server-chosen
+policy/signal context digest. Provider/store errors append a redacted terminal
+failure event before HTTP 503; an unavailable audit sink fails closed before
+mutation. These are interface-level controls. Durable audit/outcome atomicity
+must be established with a production transactional adapter under full #42;
+an audit failure after an outcome write is not claimed to roll back that write.
 
 ## Remaining acceptance gates
 
