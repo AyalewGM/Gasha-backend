@@ -71,9 +71,8 @@ class HistoricalTransactionEvent(BaseModel):
         occurred_at = self.transaction.occurred_at
         received_at = self.received_at
         confirmed_at = self.label.confirmed_at if self.label else None
-        if received_at is None and confirmed_at is None:
-            return self
-
+        # The required event clock must be checked even when optional clocks
+        # are absent; otherwise naive event times enter chronological sorting.
         for timestamp in (occurred_at, received_at, confirmed_at):
             if timestamp is not None and timestamp.utcoffset() is None:
                 raise ValueError(
@@ -179,6 +178,12 @@ def replay_historical(
     services: dict[str, DecisionService] = {}
     results: list[ReplayedEventResult] = []
     now = clock or (lambda: datetime.now(UTC))
+
+    # Pydantic models may have been modified after construction or copied with
+    # unchecked updates. Validate the full batch before sorting or deciding,
+    # so mixed naive/aware clocks fail closed without partial replay evidence.
+    for event in events:
+        event.validate_recorded_timestamps()
 
     for event in sorted(events, key=lambda item: item.transaction.occurred_at):
         tenant_id = event.transaction.tenant_id
