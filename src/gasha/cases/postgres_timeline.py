@@ -111,18 +111,31 @@ class PostgresCaseTimelineService:
     def __init__(self, connection: Connection) -> None:
         self._connection = connection
 
-    def history(self, *, tenant_id: str, case_id: UUID) -> tuple[CaseEvent, ...]:
-        """Internal use only; protected callers must check case.read first."""
-        with self._connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT event_json FROM analyst_case_events "
-                "WHERE tenant_id = %s AND case_id = %s ORDER BY revision",
-                (tenant_id, case_id),
-            )
-            rows = cursor.fetchall()
-        # End the SELECT transaction as well: callers cannot accidentally carry
-        # a stale snapshot or implicit locks into the next case operation.
-        self._connection.rollback()
+    def history(
+        self, *, principal: TrustedPrincipal, tenant_id: str,
+        case_id: UUID, at: datetime,
+    ) -> tuple[CaseEvent, ...]:
+        """Authorize the internal read; no unguarded history-reader shortcut."""
+        if not isinstance(principal, TrustedPrincipal):
+            raise AuthorizationRejected("trusted authenticated principal required")
+        if not isinstance(at, datetime) or at.utcoffset() is None:
+            raise CaseRejected("trusted aware clock required")
+        if principal.expires_at <= at:
+            raise AuthorizationRejected("expired principal")
+        authorize(principal, tenant_id=tenant_id, capability=Capability.CASE_READ)
+        if not isinstance(case_id, UUID):
+            raise CaseRejected("typed case ID required")
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT event_json FROM analyst_case_events "
+                    "WHERE tenant_id = %s AND case_id = %s ORDER BY revision",
+                    (tenant_id, case_id),
+                )
+                rows = cursor.fetchall()
+        finally:
+            # Terminate the read transaction even after SQL failure.
+            self._connection.rollback()
         return tuple(_deserialize(row["event_json"]) for row in rows)
 
     def apply(
