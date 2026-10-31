@@ -82,8 +82,6 @@ _REQUIRED: dict[Stage, frozenset[EvidenceArea]] = {
 def evaluate_poc_gate(request: POCGateRequest) -> POCGateReport:
     """Missing evidence or approval blocks progression; no implicit stage promotion."""
     _validate_request(request)
-    if not request.tenant_id.strip():
-        raise ValueError("tenant_id is required")
     missing = tuple(sorted(area.value for area in _REQUIRED[request.stage] - request.evidence))
     blockers: list[str] = []
     if (
@@ -119,8 +117,14 @@ def _validate_request(request: POCGateRequest) -> None:
     enum identity checks. Reject them instead of silently skipping stage vetoes.
     This validates shape only, not evidence provenance or approval authority.
     """
-    if not isinstance(request.tenant_id, str):
+    if type(request.tenant_id) is not str:
         raise TypeError("tenant_id must be a string")
+    if (
+        not request.tenant_id
+        or not request.tenant_id.isprintable()
+        or request.tenant_id != request.tenant_id.strip()
+    ):
+        raise ValueError("tenant_id must be nonblank canonical printable text")
     if not isinstance(request.stage, Stage):
         raise TypeError("stage must be a Stage enum")
     if not isinstance(request.evidence, frozenset) or any(
