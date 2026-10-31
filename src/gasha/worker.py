@@ -117,6 +117,31 @@ def _postgres_connection(dsn: str) -> Connection:
     )
 
 
+def _require_durable_tenant_scope(tenant_ids: list[str] | None) -> tuple[str, ...]:
+    """Reject ambiguous worker tenant configuration before opening PostgreSQL.
+
+    This is configuration shape validation, not proof of Bank authorization
+    or matching database/broker identity privileges.
+    """
+    if not tenant_ids:
+        raise ValueError(
+            "GASHA_TENANT_IDS is required when GASHA_POSTGRES_DSN is set"
+        )
+    if any(
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or not value.isprintable()
+        for value in tenant_ids
+    ):
+        raise ValueError(
+            "GASHA_TENANT_IDS must contain nonblank canonical printable tenant IDs"
+        )
+    if len(set(tenant_ids)) != len(tenant_ids):
+        raise ValueError("GASHA_TENANT_IDS must not contain duplicate tenant IDs")
+    return tuple(tenant_ids)
+
+
 def build_stores(
     settings: WorkerSettings,
 ) -> tuple[
@@ -150,18 +175,10 @@ def build_stores(
             None,  # in-memory dev mode keeps the sequential save path
         )
 
-    if not settings.tenant_ids:
-        # Fail closed before touching the database: a durable worker
-        # must never run with an unrestricted tenant scope   any event
-        # on its topic would be processed, evaluated and persisted.
-        raise ValueError(
-            "GASHA_TENANT_IDS is required when GASHA_POSTGRES_DSN is "
-            "set: a durable worker must declare its authorized tenant "
-            "scope (list every tenant it may process, including "
-            "single-tenant deployments)."
-        )
+    # Reject malformed deployment scopes before opening any database connection.
+    # These configured names do not attest to Bank authorization or DB/Kafka ACLs.
+    tenant_ids = _require_durable_tenant_scope(settings.tenant_ids)
     connection = _postgres_connection(settings.postgres_dsn)
-    tenant_ids = tuple(settings.tenant_ids)
     return (
         PostgresIngestionStore(connection, tenant_ids=tenant_ids),
         PostgresDeadLetterSink(connection, tenant_ids=tenant_ids),

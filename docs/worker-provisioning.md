@@ -2,6 +2,13 @@
 
 Bank-facing deployment is **blocked** until the bank's authorized infrastructure/security owner and Gasha PO/Architecture approve a provisioning record for the exact deployment. A tenant list in an environment variable is configuration, not proof of bank authorization. The development compose stack and its credentials are synthetic local development only.
 
+In durable PostgreSQL mode, `GASHA_TENANT_IDS` must be a JSON list of
+**unique, nonblank, printable tenant identifiers without surrounding
+whitespace**. Empty/missing lists, duplicates, control/invisible-character
+entries, and padded identifiers fail startup before opening a database
+connection. This is configuration shape validation, **not Bank approval** of
+the named tenants or proof of matching DB/Kafka privileges.
+
 The approved record must identify:
 
 - The service identity, authorized tenant IDs, environment, Kafka topic/group and database role; record the approver and approval/change reference.

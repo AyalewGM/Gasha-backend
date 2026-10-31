@@ -131,6 +131,51 @@ class TestBuildStores:
             build_stores(settings)
 
 
+@pytest.mark.parametrize(
+    "scope",
+    [
+        [""],
+        ["  "],
+        ["tenant-a "],
+        [" tenant-a"],
+        ["tenant-a\n"],
+        ["tenant-a\x00"],
+        ["tenant-a\u200b"],
+        ["tenant-a", "tenant-a"],
+    ],
+)
+def test_durable_worker_rejects_noncanonical_tenant_scope_before_connection(
+    scope: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "gasha.worker._postgres_connection",
+        lambda dsn: pytest.fail("connected with malformed tenant scope"),
+    )
+    settings = WorkerSettings(
+        postgres_dsn="postgresql://example/db", tenant_ids=scope
+    )
+    with pytest.raises(ValueError, match="GASHA_TENANT_IDS"):
+        build_stores(settings)
+
+
+@pytest.mark.parametrize("scope", [["tenant-a"], ["tenant-a", "tenant-b"]])
+def test_durable_worker_preserves_valid_explicit_scope(
+    scope: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from uuid import uuid4
+
+    # Adapter constructors store the connection and tenant restriction only.
+    monkeypatch.setattr("gasha.worker._postgres_connection", lambda dsn: object())
+    ingestion, dead_letters, audit, evaluations, pending, persistence = build_stores(
+        WorkerSettings(postgres_dsn="postgresql://example/db", tenant_ids=scope)
+    )
+    for store in (ingestion, dead_letters, audit, evaluations, pending, persistence):
+        assert store is not None
+        assert store._tenant_ids == tuple(scope)
+    with pytest.raises(PermissionError, match="outside authorized"):
+        ingestion.get("tenant-outside", uuid4())
+
+
 class _FakeError:
     def __init__(self, fatal: bool) -> None:
         self._fatal = fatal
