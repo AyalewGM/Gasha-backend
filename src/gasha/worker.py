@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from math import isfinite
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
@@ -142,6 +143,24 @@ def _require_durable_tenant_scope(tenant_ids: list[str] | None) -> tuple[str, ..
     return tuple(tenant_ids)
 
 
+def _require_positive_lease_ttl(seconds: float) -> timedelta:
+    """Validate the effective lease duration before opening a durable connection.
+
+    Sub-microsecond values round to zero in timedelta, making new claims
+    immediately stale even when the configured floating-point value is > 0.
+    """
+    reason = "GASHA_LEASE_TTL_S must be finite and produce a positive lease"
+    if not isfinite(seconds):
+        raise ValueError(reason)
+    try:
+        duration = timedelta(seconds=seconds)
+    except OverflowError as exc:
+        raise ValueError(reason) from exc
+    if duration <= timedelta(0):
+        raise ValueError(reason)
+    return duration
+
+
 def build_stores(
     settings: WorkerSettings,
 ) -> tuple[
@@ -153,6 +172,7 @@ def build_stores(
     EvaluationPersistence | None,
 ]:
     """Durable stores when a DSN is configured, in-memory otherwise."""
+    lease_ttl = _require_positive_lease_ttl(settings.lease_ttl_s)
     if settings.postgres_dsn is None:
         logger.warning(
             "GASHA_POSTGRES_DSN unset   using in-memory stores "
@@ -170,7 +190,7 @@ def build_stores(
                     else None
                 ),
                 worker_id=settings.worker_id,
-                lease_ttl=timedelta(seconds=settings.lease_ttl_s),
+                lease_ttl=lease_ttl,
             ),
             None,  # in-memory dev mode keeps the sequential save path
         )
@@ -188,7 +208,7 @@ def build_stores(
             connection,
             tenant_ids=tenant_ids,
             worker_id=settings.worker_id,
-            lease_ttl=timedelta(seconds=settings.lease_ttl_s),
+            lease_ttl=lease_ttl,
         ),
         PostgresEvaluationPersistence(connection, tenant_ids=tenant_ids, require_lease=True),
     )
