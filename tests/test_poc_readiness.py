@@ -194,3 +194,70 @@ def test_malformed_findings_cannot_skip_critical_veto(field: str, value: Any) ->
 def test_malformed_finding_collections_are_rejected(findings: Any) -> None:
     with pytest.raises(TypeError, match="findings"):
         evaluate_poc_gate(replace(request(Stage.HISTORICAL), findings=findings))
+
+
+@pytest.mark.parametrize("field", ("finding_id", "owner"))
+@pytest.mark.parametrize(
+    "invalid_value",
+    (None, "", " ", "\t", 0, True, [], " leading", "trailing ", "embedded\nnewline", b"bytes"),
+)
+@pytest.mark.parametrize("severity", (FindingSeverity.HIGH, FindingSeverity.CRITICAL))
+@pytest.mark.parametrize("resolved", (False, True))
+def test_finding_identity_and_owner_must_be_canonical(
+    field: str, invalid_value: Any, severity: FindingSeverity, resolved: bool
+) -> None:
+    finding = SecurityFinding("finding-1", severity, "security-team", resolved)
+    malformed = replace(finding, **{field: invalid_value})
+    packet = replace(
+        request(Stage.INLINE_PREPARATION),
+        historical_accepted=True,
+        shadow_accepted=True,
+        bank_inline_approved=True,
+        tenant_inline_enabled=True,
+        findings=(malformed,),
+    )
+    # Rejected before a ready result even for resolved or HIGH findings.
+    with pytest.raises((TypeError, ValueError), match=field):
+        evaluate_poc_gate(packet)
+
+
+@pytest.mark.parametrize("stage", list(Stage))
+def test_finding_shape_validation_precedes_all_stage_readiness(stage: Stage) -> None:
+    finding = SecurityFinding("valid-id", FindingSeverity.HIGH, "", True)
+    packet = replace(
+        request(stage),
+        historical_accepted=True,
+        shadow_accepted=True,
+        bank_inline_approved=True,
+        tenant_inline_enabled=True,
+        findings=(finding,),
+    )
+    with pytest.raises(ValueError, match="owner"):
+        evaluate_poc_gate(packet)
+
+
+@pytest.mark.parametrize(
+    ("severity", "resolved", "should_be_ready"),
+    [
+        (FindingSeverity.HIGH, False, True),
+        (FindingSeverity.HIGH, True, True),
+        (FindingSeverity.CRITICAL, False, False),
+        (FindingSeverity.CRITICAL, True, True),
+    ],
+)
+def test_canonical_finding_keeps_existing_critical_only_veto(
+    severity: FindingSeverity, resolved: bool, should_be_ready: bool
+) -> None:
+    finding = SecurityFinding("synthetic-id", severity, "security-team", resolved)
+    packet = replace(
+        request(Stage.INLINE_PREPARATION),
+        historical_accepted=True,
+        shadow_accepted=True,
+        bank_inline_approved=True,
+        tenant_inline_enabled=True,
+        findings=(finding,),
+    )
+    result = evaluate_poc_gate(packet)
+    assert result.ready is should_be_ready
+    assert result.to_dict()["enforcement_activated"] is False
+    assert ("unresolved_critical_security_finding" in result.blockers) is not should_be_ready
