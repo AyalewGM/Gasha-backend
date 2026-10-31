@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Self
 from datetime import UTC, datetime
 
 import pytest
@@ -26,7 +27,7 @@ class CursorSpy:
     def __init__(self, connection: ConnectionSpy) -> None:
         self.connection = connection
 
-    def __enter__(self) -> CursorSpy:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: object) -> None:
