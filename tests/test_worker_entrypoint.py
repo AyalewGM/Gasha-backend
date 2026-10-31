@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import pytest
+from pydantic import ValidationError
 
 from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.kafka_confluent import ConfluentKafkaConsumer
@@ -41,6 +43,70 @@ class TestWorkerSettings:
         )
         settings = WorkerSettings()
         assert settings.adapter_map == {"core-banking": "reference-json"}
+
+    @pytest.mark.parametrize("batch_size", [0, -1, -100])
+    def test_nonpositive_worker_batch_fails_at_configuration(self, batch_size: int) -> None:
+        with pytest.raises(ValidationError, match="batch_size"):
+            WorkerSettings(batch_size=batch_size)
+
+    @pytest.mark.parametrize(
+        "poll_timeout_s", [-0.001, -1.0, float("nan"), float("inf"), -float("inf")]
+    )
+    def test_invalid_poll_timeout_fails_at_configuration(
+        self, poll_timeout_s: float
+    ) -> None:
+        with pytest.raises(ValidationError, match="poll_timeout_s"):
+            WorkerSettings(poll_timeout_s=poll_timeout_s)
+
+    def test_valid_worker_poll_configuration_is_preserved(self) -> None:
+        settings = WorkerSettings(batch_size=1, poll_timeout_s=0.0)
+        assert settings.batch_size == 1
+        assert settings.poll_timeout_s == 0.0
+
+    def test_invalid_batch_environment_fails_before_worker_startup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GASHA_BATCH_SIZE", "0")
+        with pytest.raises(ValidationError, match="batch_size"):
+            WorkerSettings()
+
+    @pytest.mark.parametrize(
+        ("field_name", "value"),
+        [("batch_size", True), ("poll_timeout_s", True), ("poll_timeout_s", False)],
+    )
+    def test_boolean_worker_numeric_settings_rejected_before_startup(
+        self, field_name: str, value: bool
+    ) -> None:
+        with pytest.raises(ValidationError, match=field_name):
+            WorkerSettings(**{field_name: value})
+
+    @pytest.mark.parametrize(
+        ("field_name", "value"),
+        [
+            ("batch_size", 0),
+            ("batch_size", True),
+            ("poll_timeout_s", -1.0),
+            ("poll_timeout_s", False),
+        ],
+    )
+    def test_poll_settings_cannot_be_reassigned_after_validation(
+        self, field_name: str, value: object
+    ) -> None:
+        settings = WorkerSettings()
+        with pytest.raises(ValidationError) as error:
+            setattr(settings, field_name, value)
+        assert error.value.errors()[0]["type"] == "frozen_instance"
+        assert settings.batch_size == 50
+        assert settings.poll_timeout_s == 1.0
+
+    def test_valid_poll_environment_strings_still_parse(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GASHA_BATCH_SIZE", "17")
+        monkeypatch.setenv("GASHA_POLL_TIMEOUT_S", "0")
+        settings = WorkerSettings()
+        assert settings.batch_size == 17
+        assert settings.poll_timeout_s == 0.0
 
 
 class TestLoadPolicies:
@@ -129,6 +195,80 @@ class TestBuildStores:
         )
         with pytest.raises(ValueError, match="GASHA_TENANT_IDS"):
             build_stores(settings)
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        [""],
+        ["  "],
+        ["tenant-a "],
+        [" tenant-a"],
+        ["tenant-a\n"],
+        ["tenant-a\x00"],
+        ["tenant-a\u200b"],
+        ["tenant-a", "tenant-a"],
+    ],
+)
+def test_durable_worker_rejects_noncanonical_tenant_scope_before_connection(
+    scope: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "gasha.worker._postgres_connection",
+        lambda dsn: pytest.fail("connected with malformed tenant scope"),
+    )
+    settings = WorkerSettings(
+        postgres_dsn="postgresql://example/db", tenant_ids=scope
+    )
+    with pytest.raises(ValueError, match="GASHA_TENANT_IDS"):
+        build_stores(settings)
+
+
+@pytest.mark.parametrize("scope", [["tenant-a"], ["tenant-a", "tenant-b"]])
+def test_durable_worker_preserves_valid_explicit_scope(
+    scope: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from uuid import uuid4
+
+    # Adapter constructors store the connection and tenant restriction only.
+    monkeypatch.setattr("gasha.worker._postgres_connection", lambda dsn: object())
+    ingestion, dead_letters, audit, evaluations, pending, persistence = build_stores(
+        WorkerSettings(postgres_dsn="postgresql://example/db", tenant_ids=scope)
+    )
+    for store in (ingestion, dead_letters, audit, evaluations, pending, persistence):
+        assert store is not None
+        assert store._tenant_ids == tuple(scope)
+    with pytest.raises(PermissionError, match="outside authorized"):
+        ingestion.get("tenant-outside", uuid4())
+
+
+@pytest.mark.parametrize(
+    "lease_ttl_s",
+    [0.0, -1.0, -0.0, float("nan"), float("inf"), -float("inf"), 1e-12, 1e100],
+)
+@pytest.mark.parametrize("durable", [False, True])
+def test_worker_rejects_invalid_lease_before_opening_database(
+    lease_ttl_s: float, durable: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zero/negative/ineffective lease silently stalls evaluation and recovery."""
+    monkeypatch.setattr(
+        "gasha.worker._postgres_connection",
+        lambda dsn: pytest.fail("connected with an invalid pending lease"),
+    )
+    settings = WorkerSettings(
+        lease_ttl_s=lease_ttl_s,
+        postgres_dsn="postgresql://example/db" if durable else None,
+        tenant_ids=["tenant-a"] if durable else None,
+    )
+    with pytest.raises(ValueError, match="GASHA_LEASE_TTL_S"):
+        build_stores(settings)
+
+
+@pytest.mark.parametrize("lease_ttl_s", [1e-6, 0.001, 300.0])
+def test_worker_preserves_effective_positive_lease(lease_ttl_s: float) -> None:
+    _, _, _, _, pending, _ = build_stores(WorkerSettings(lease_ttl_s=lease_ttl_s))
+    assert isinstance(pending, InMemoryPendingEvaluationStore)
+    assert pending._lease_ttl == timedelta(seconds=lease_ttl_s)
 
 
 class _FakeError:

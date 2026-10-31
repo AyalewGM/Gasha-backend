@@ -4,10 +4,11 @@ import json
 import logging
 from collections.abc import Callable
 from datetime import timedelta
+from math import isfinite
 from pathlib import Path
 from typing import cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gasha.decision.audit import (
@@ -61,13 +62,17 @@ ADAPTER_TYPES: dict[str, Callable[[], BankEventAdapter]] = {
 class WorkerSettings(BaseSettings):
     """Composition config for the ingestion worker (``GASHA_*`` env vars)."""
 
-    model_config = SettingsConfigDict(env_prefix="GASHA_")
+    # Prevent post-validation assignment of worker polling/lease configuration.
+    # Mutable nested adapter/scope containers are not bank authorization.
+    model_config = SettingsConfigDict(env_prefix="GASHA_", frozen=True)
 
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_topic: str = "gasha.fraud-events"
     kafka_group_id: str = "gasha-ingestion-worker"
-    poll_timeout_s: float = 1.0
-    batch_size: int = 50
+    # Nonpositive batches can stop transport progress; invalid timeouts fail late
+    # in the broker client. Validate before PostgreSQL/Kafka initialization.
+    poll_timeout_s: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
+    batch_size: int = Field(default=50, ge=1)
 
     # {"<source_system>": "<adapter_type>"}   adapter_type in ADAPTER_TYPES.
     adapter_map: dict[str, str] = {"reference-json": "reference-json"}
@@ -91,6 +96,15 @@ class WorkerSettings(BaseSettings):
     # Seconds a claimed pending evaluation stays leased to this worker
     # before another worker may take it over (crash recovery window).
     lease_ttl_s: float = 300.0
+
+    @field_validator("batch_size", "poll_timeout_s", mode="before")
+    @classmethod
+    def _reject_boolean_worker_numeric_settings(cls, value: object) -> object:
+        """Constructor booleans must not silently become 0/1; env strings still parse."""
+        if isinstance(value, bool):
+            # Pydantic wraps ValueError as ValidationError; TypeError escapes unwrapped.
+            raise ValueError("worker batch size and poll timeout must not be booleans")  # noqa: TRY004
+        return value
 
 
 class PolicyFile(BaseModel):
@@ -117,6 +131,49 @@ def _postgres_connection(dsn: str) -> Connection:
     )
 
 
+def _require_durable_tenant_scope(tenant_ids: list[str] | None) -> tuple[str, ...]:
+    """Reject ambiguous worker tenant configuration before opening PostgreSQL.
+
+    This is configuration shape validation, not proof of Bank authorization
+    or matching database/broker identity privileges.
+    """
+    if not tenant_ids:
+        raise ValueError(
+            "GASHA_TENANT_IDS is required when GASHA_POSTGRES_DSN is set"
+        )
+    if any(
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or not value.isprintable()
+        for value in tenant_ids
+    ):
+        raise ValueError(
+            "GASHA_TENANT_IDS must contain nonblank canonical printable tenant IDs"
+        )
+    if len(set(tenant_ids)) != len(tenant_ids):
+        raise ValueError("GASHA_TENANT_IDS must not contain duplicate tenant IDs")
+    return tuple(tenant_ids)
+
+
+def _require_positive_lease_ttl(seconds: float) -> timedelta:
+    """Validate the effective lease duration before opening a durable connection.
+
+    Sub-microsecond values round to zero in timedelta, making new claims
+    immediately stale even when the configured floating-point value is > 0.
+    """
+    reason = "GASHA_LEASE_TTL_S must be finite and produce a positive lease"
+    if not isfinite(seconds):
+        raise ValueError(reason)
+    try:
+        duration = timedelta(seconds=seconds)
+    except OverflowError as exc:
+        raise ValueError(reason) from exc
+    if duration <= timedelta(0):
+        raise ValueError(reason)
+    return duration
+
+
 def build_stores(
     settings: WorkerSettings,
 ) -> tuple[
@@ -128,6 +185,7 @@ def build_stores(
     EvaluationPersistence | None,
 ]:
     """Durable stores when a DSN is configured, in-memory otherwise."""
+    lease_ttl = _require_positive_lease_ttl(settings.lease_ttl_s)
     if settings.postgres_dsn is None:
         logger.warning(
             "GASHA_POSTGRES_DSN unset   using in-memory stores "
@@ -145,23 +203,15 @@ def build_stores(
                     else None
                 ),
                 worker_id=settings.worker_id,
-                lease_ttl=timedelta(seconds=settings.lease_ttl_s),
+                lease_ttl=lease_ttl,
             ),
             None,  # in-memory dev mode keeps the sequential save path
         )
 
-    if not settings.tenant_ids:
-        # Fail closed before touching the database: a durable worker
-        # must never run with an unrestricted tenant scope   any event
-        # on its topic would be processed, evaluated and persisted.
-        raise ValueError(
-            "GASHA_TENANT_IDS is required when GASHA_POSTGRES_DSN is "
-            "set: a durable worker must declare its authorized tenant "
-            "scope (list every tenant it may process, including "
-            "single-tenant deployments)."
-        )
+    # Reject malformed deployment scopes before opening any database connection.
+    # These configured names do not attest to Bank authorization or DB/Kafka ACLs.
+    tenant_ids = _require_durable_tenant_scope(settings.tenant_ids)
     connection = _postgres_connection(settings.postgres_dsn)
-    tenant_ids = tuple(settings.tenant_ids)
     return (
         PostgresIngestionStore(connection, tenant_ids=tenant_ids),
         PostgresDeadLetterSink(connection, tenant_ids=tenant_ids),
@@ -171,7 +221,7 @@ def build_stores(
             connection,
             tenant_ids=tenant_ids,
             worker_id=settings.worker_id,
-            lease_ttl=timedelta(seconds=settings.lease_ttl_s),
+            lease_ttl=lease_ttl,
         ),
         PostgresEvaluationPersistence(connection, tenant_ids=tenant_ids, require_lease=True),
     )
