@@ -19,6 +19,14 @@ enough for actual evaluation persistence and recovery, verified under the
 Bank-approved workload. This startup check is **not** proof of those
 performance or failure-recovery budgets.
 
+The worker also validates its polling configuration before initializing any
+PostgreSQL or Kafka dependency: `GASHA_BATCH_SIZE` must be a positive integer,
+and `GASHA_POLL_TIMEOUT_S` must be finite and nonnegative. A zero-size batch
+cannot make event-ingestion progress; negative or nonfinite broker polling
+timeouts are invalid. A zero timeout is permitted for deliberate nonblocking
+polling but requires a workload/resource review. These shape checks do not
+establish bank-approved concurrency, latency or timeout budgets.
+
 The approved record must identify:
 
 - The service identity, authorized tenant IDs, environment, Kafka topic/group and database role; record the approver and approval/change reference.

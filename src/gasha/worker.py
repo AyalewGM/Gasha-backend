@@ -8,7 +8,7 @@ from math import isfinite
 from pathlib import Path
 from typing import cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gasha.decision.audit import (
@@ -67,8 +67,10 @@ class WorkerSettings(BaseSettings):
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_topic: str = "gasha.fraud-events"
     kafka_group_id: str = "gasha-ingestion-worker"
-    poll_timeout_s: float = 1.0
-    batch_size: int = 50
+    # Nonpositive batches can stop transport progress; invalid timeouts fail late
+    # in the broker client. Validate before PostgreSQL/Kafka initialization.
+    poll_timeout_s: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
+    batch_size: int = Field(default=50, ge=1)
 
     # {"<source_system>": "<adapter_type>"}   adapter_type in ADAPTER_TYPES.
     adapter_map: dict[str, str] = {"reference-json": "reference-json"}

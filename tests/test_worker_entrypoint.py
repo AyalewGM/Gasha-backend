@@ -4,6 +4,7 @@ import json
 from datetime import timedelta
 
 import pytest
+from pydantic import ValidationError
 
 from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.kafka_confluent import ConfluentKafkaConsumer
@@ -42,6 +43,32 @@ class TestWorkerSettings:
         )
         settings = WorkerSettings()
         assert settings.adapter_map == {"core-banking": "reference-json"}
+
+    @pytest.mark.parametrize("batch_size", [0, -1, -100])
+    def test_nonpositive_worker_batch_fails_at_configuration(self, batch_size: int) -> None:
+        with pytest.raises(ValidationError, match="batch_size"):
+            WorkerSettings(batch_size=batch_size)
+
+    @pytest.mark.parametrize(
+        "poll_timeout_s", [-0.001, -1.0, float("nan"), float("inf"), -float("inf")]
+    )
+    def test_invalid_poll_timeout_fails_at_configuration(
+        self, poll_timeout_s: float
+    ) -> None:
+        with pytest.raises(ValidationError, match="poll_timeout_s"):
+            WorkerSettings(poll_timeout_s=poll_timeout_s)
+
+    def test_valid_worker_poll_configuration_is_preserved(self) -> None:
+        settings = WorkerSettings(batch_size=1, poll_timeout_s=0.0)
+        assert settings.batch_size == 1
+        assert settings.poll_timeout_s == 0.0
+
+    def test_invalid_batch_environment_fails_before_worker_startup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GASHA_BATCH_SIZE", "0")
+        with pytest.raises(ValidationError, match="batch_size"):
+            WorkerSettings()
 
 
 class TestLoadPolicies:
