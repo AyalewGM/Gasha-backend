@@ -8,7 +8,7 @@ from math import isfinite
 from pathlib import Path
 from typing import cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gasha.decision.audit import (
@@ -62,7 +62,9 @@ ADAPTER_TYPES: dict[str, Callable[[], BankEventAdapter]] = {
 class WorkerSettings(BaseSettings):
     """Composition config for the ingestion worker (``GASHA_*`` env vars)."""
 
-    model_config = SettingsConfigDict(env_prefix="GASHA_")
+    # Prevent post-validation assignment of worker polling/lease configuration.
+    # Mutable nested adapter/scope containers are not bank authorization.
+    model_config = SettingsConfigDict(env_prefix="GASHA_", frozen=True)
 
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_topic: str = "gasha.fraud-events"
@@ -94,6 +96,14 @@ class WorkerSettings(BaseSettings):
     # Seconds a claimed pending evaluation stays leased to this worker
     # before another worker may take it over (crash recovery window).
     lease_ttl_s: float = 300.0
+
+    @field_validator("batch_size", "poll_timeout_s", mode="before")
+    @classmethod
+    def _reject_boolean_worker_numeric_settings(cls, value: object) -> object:
+        """Constructor booleans must not silently become 0/1; env strings still parse."""
+        if isinstance(value, bool):
+            raise ValueError("worker batch size and poll timeout must not be booleans")
+        return value
 
 
 class PolicyFile(BaseModel):

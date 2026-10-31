@@ -70,6 +70,44 @@ class TestWorkerSettings:
         with pytest.raises(ValidationError, match="batch_size"):
             WorkerSettings()
 
+    @pytest.mark.parametrize(
+        ("field_name", "value"),
+        [("batch_size", True), ("poll_timeout_s", True), ("poll_timeout_s", False)],
+    )
+    def test_boolean_worker_numeric_settings_rejected_before_startup(
+        self, field_name: str, value: bool
+    ) -> None:
+        with pytest.raises(ValidationError, match=field_name):
+            WorkerSettings(**{field_name: value})
+
+    @pytest.mark.parametrize(
+        ("field_name", "value"),
+        [
+            ("batch_size", 0),
+            ("batch_size", True),
+            ("poll_timeout_s", -1.0),
+            ("poll_timeout_s", False),
+        ],
+    )
+    def test_poll_settings_cannot_be_reassigned_after_validation(
+        self, field_name: str, value: object
+    ) -> None:
+        settings = WorkerSettings()
+        with pytest.raises(ValidationError) as error:
+            setattr(settings, field_name, value)
+        assert error.value.errors()[0]["type"] == "frozen_instance"
+        assert settings.batch_size == 50
+        assert settings.poll_timeout_s == 1.0
+
+    def test_valid_poll_environment_strings_still_parse(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GASHA_BATCH_SIZE", "17")
+        monkeypatch.setenv("GASHA_POLL_TIMEOUT_S", "0")
+        settings = WorkerSettings()
+        assert settings.batch_size == 17
+        assert settings.poll_timeout_s == 0.0
+
 
 class TestLoadPolicies:
     def test_loads_tenant_policy_map(self, tmp_path) -> None:

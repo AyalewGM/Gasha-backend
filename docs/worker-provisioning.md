@@ -26,6 +26,12 @@ cannot make event-ingestion progress; negative or nonfinite broker polling
 timeouts are invalid. A zero timeout is permitted for deliberate nonblocking
 polling but requires a workload/resource review. These shape checks do not
 establish bank-approved concurrency, latency or timeout budgets.
+Constructor booleans for these two settings are explicitly rejected rather
+than silently coerced to 0/1; ordinary numeric environment strings remain
+supported. Validated setting attributes cannot be reassigned after startup
+configuration is constructed. This does not deep-freeze nested adapter/tenant
+containers or grant Bank-authorized tenant access: deployment configuration,
+identity and ACLs remain separately controlled and verified.
 
 The approved record must identify:
 
