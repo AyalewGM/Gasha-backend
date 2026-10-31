@@ -6,6 +6,7 @@ by this app. This is a bounded #42 foundation, not bank deployment approval.
 """
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -48,6 +49,19 @@ from gasha.security.access import (
 )
 
 
+def _safe_version_metadata(value: object) -> bool:
+    """Require printable ASCII before server provenance reaches HTTP headers.
+
+    This is a transport-safety check, not a provider identity or attestation.
+    Reject control bytes, DEL, non-ASCII and empty/whitespace-only values.
+    """
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and all(0x20 <= ord(char) <= 0x7e for char in value)
+    )
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class TrustedDecisionContext:
     """Immutable server-selected, event-bound policy and signal snapshot.
@@ -84,10 +98,8 @@ class TrustedDecisionContext:
             or not isinstance(event_id, UUID)
             or not isinstance(policy, DecisionPolicy)
             or not isinstance(intelligence, IntelligenceSnapshot)
-            or not isinstance(signal_source_version, str)
-            or not signal_source_version.strip()
-            or not isinstance(signal_version, str)
-            or not signal_version.strip()
+            or not _safe_version_metadata(signal_source_version)
+            or not _safe_version_metadata(signal_version)
             or not isinstance(collected_at, datetime)
             or collected_at.utcoffset() is None
             or not isinstance(expires_at, datetime)
@@ -119,19 +131,25 @@ class TrustedDecisionContext:
 
     @property
     def context_ref(self) -> str:
-        """Digest of event, policy, signals and validity window (not attestation)."""
+        """Field-tagged, unambiguous internal provenance digest (not attestation)."""
+        # NUL-joining arbitrary provider strings lets distinct (source, version)
+        # tuples have identical preimages. Canonical JSON binds names and types,
+        # with a domain/schema tag and normalized UTC instants.
+        preimage = {
+            "schema": "gasha-context-ref-v2",
+            "tenant_id": self.tenant_id,
+            "event_id": str(self.event_id),
+            "signal_source_version": self.signal_source_version,
+            "signal_version": self.signal_version,
+            "collected_at": self.collected_at.astimezone(UTC).isoformat(),
+            "expires_at": self.expires_at.astimezone(UTC).isoformat(),
+            "signal_sha256": self._signal_digest,
+            "policy_json": self._policy_snapshot,
+        }
         return sha256(
-            ("\0".join((
-                self.tenant_id,
-                str(self.event_id),
-                self.signal_source_version,
-                self.signal_version,
-                # Normalize aware times so equivalent instants have one reference.
-                self.collected_at.astimezone(UTC).isoformat(),
-                self.expires_at.astimezone(UTC).isoformat(),
-                self._signal_digest,
-                self._policy_snapshot,
-            ))).encode()
+            json.dumps(
+                preimage, sort_keys=True, ensure_ascii=True, separators=(",", ":")
+            ).encode("utf-8")
         ).hexdigest()
 
 
@@ -326,6 +344,8 @@ def _trusted_context(
         not isinstance(context, TrustedDecisionContext)
         or context.tenant_id != tx.tenant_id
         or context.event_id != tx.event_id
+        or not _safe_version_metadata(context.signal_source_version)
+        or not _safe_version_metadata(context.signal_version)
         or context.collected_at > now
         or context.expires_at <= now
     ):
