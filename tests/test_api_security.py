@@ -2,7 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -861,11 +861,15 @@ def test_protected_routes_reject_unsafe_provider_metadata_before_success_audit(
             return result
 
     app.state.decision_context_provider = MalformedProvider()
+    payload = tx()
     response = TestClient(app, root_path=root_path).post(
-        f"{root_path}{path}", json={"transaction": tx()}, headers=headers(),
+        f"{root_path}{path}", json={"transaction": payload}, headers=headers(),
     )
     assert response.status_code == 503
-    assert response.json() == {"detail": "decision unavailable"}
+    assert response.json() == {
+        "detail": "decision unavailable" if path.endswith("decisions")
+        else "evaluation unavailable"
+    }
     assert "X-Gasha-Context-Ref" not in response.headers
     assert "X-Gasha-Source-Version" not in response.headers
     assert "X-Gasha-Signal-Version" not in response.headers
@@ -885,4 +889,4 @@ def test_protected_routes_reject_unsafe_provider_metadata_before_success_audit(
     assert actions[1].context_ref == ""
     assert "synthetic" not in str(actions)
     assert not any(event.result == "succeeded" for event in audit.events)
-    assert store.store.outcomes("tenant-a", uuid4()) == ()
+    assert store.store.outcomes("tenant-a", UUID(str(payload["event_id"]))) == ()
