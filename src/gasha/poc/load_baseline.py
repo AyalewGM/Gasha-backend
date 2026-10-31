@@ -108,6 +108,22 @@ class SyntheticLoadReport:
             for value in self.event_latencies_ms
         ):
             raise ValueError("latency samples must be finite and nonnegative")
+        # Finite inputs can still overflow statistics.fmean while building
+        # derived metrics. Reject such inputs here, before any JSON report.
+        if self.event_latencies_ms:
+            try:
+                mean = fmean(sorted(self.event_latencies_ms))
+            except OverflowError as exc:
+                raise ValueError("latency mean must be finite and representable") from exc
+            if not isfinite(mean):
+                raise ValueError("latency mean must be finite and representable")
+        try:
+            json.dumps(
+                (self.config.measured_iterations, self.config.warmup_iterations),
+                allow_nan=False,
+            )
+        except (ValueError, OverflowError) as exc:
+            raise ValueError("configuration counters must be JSON serializable") from exc
         object.__setattr__(self, "failure_types", MappingProxyType(dict(self.failure_types)))
 
     def to_dict(self) -> dict[str, object]:
