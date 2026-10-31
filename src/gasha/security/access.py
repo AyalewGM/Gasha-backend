@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
+from json import dumps
 from typing import Protocol
 
 
@@ -55,8 +56,23 @@ class TrustedPrincipal:
 
     @property
     def audit_actor(self) -> str:
-        """Non-reversible reference; never records a token or raw subject."""
-        return sha256(f"{self.issuer}\0{self.subject}".encode()).hexdigest()
+        """Pseudonymous, schema-tagged identity reference (never raw audit PII).
+
+        Issuer and subject are independent typed fields: NUL-delimited strings
+        can alias for distinct identities that a provider-neutral verifier may
+        legitimately return. Credential rotation must not change attribution.
+        """
+        preimage = dumps(
+            {
+                "domain": "gasha-audit-actor-v2",
+                "issuer": self.issuer,
+                "subject": self.subject,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return sha256(preimage.encode("utf-8")).hexdigest()
 
 
 class CredentialRejected(Exception):
