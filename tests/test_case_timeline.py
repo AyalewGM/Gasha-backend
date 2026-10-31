@@ -245,3 +245,25 @@ def test_regressing_or_naive_clock_rejected():
         step(history, command(CaseOperation.TRIAGE, 1), at=NOW - timedelta(seconds=1))
     with pytest.raises(CaseRejected):
         step(history, command(CaseOperation.TRIAGE, 1), at=datetime(2026, 10, 31))
+@pytest.mark.parametrize(("disposition", "reason"), [
+    (CaseDisposition.FRAUD, CaseReason.FRAUD_EVIDENCE),
+    (CaseDisposition.LEGITIMATE, CaseReason.LEGITIMATE_EVIDENCE),
+    (CaseDisposition.UNRESOLVED, CaseReason.NEEDS_REVIEW),
+])
+def test_all_normalized_dispositions_preserve_unknown_bank_execution(disposition, reason):
+    history = lifecycle()[:3]
+    cmd = replace(command(CaseOperation.DISPOSE, 3, disposition=disposition),
+                  reason_code=reason)
+    appended, event = step(history, cmd)
+    assert appended[-1] == event
+    assert len(appended) == 4
+    assert event.disposition is disposition
+    assert event.bank_execution is BankExecution.UNKNOWN
+    assert appended[:3] == history
+
+
+def test_mismatched_disposition_and_reason_code_is_rejected():
+    history = lifecycle()[:3]
+    with pytest.raises(CaseRejected):
+        step(history, command(CaseOperation.DISPOSE, 3,
+                              disposition=CaseDisposition.LEGITIMATE))
