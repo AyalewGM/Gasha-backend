@@ -192,11 +192,13 @@ def test_stale_revision_and_tenant_permission_denied_without_write(schema):
 
 
 def test_missing_audit_table_fails_closed_with_no_case_mutation(schema):
+    import psycopg
+
     with connect(schema) as connection:
         service = PostgresCaseTimelineService(connection)
         connection.execute("DROP TABLE security_audit_events")
         connection.commit()
-        with pytest.raises(Exception):
+        with pytest.raises(psycopg.errors.UndefinedTable):
             apply(service, cmd(CaseOperation.CREATE, uuid4(), uuid4(), 0))
         assert counts_without_audit(connection) == 0
 
