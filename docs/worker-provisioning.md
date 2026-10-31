@@ -9,6 +9,16 @@ entries, and padded identifiers fail startup before opening a database
 connection. This is configuration shape validation, **not Bank approval** of
 the named tenants or proof of matching DB/Kafka privileges.
 
+The worker also rejects an invalid `GASHA_LEASE_TTL_S` (nonfinite, zero,
+negative, sub-microsecond values that round to a zero `timedelta`, or
+unrepresentably large values) before opening PostgreSQL. This setting
+controls the pending-evaluation ownership lease; an ineffective lease
+prevents the accepted worker from evaluating or recovering pending events.
+Syntactically valid values still require an operator-selected lease long
+enough for actual evaluation persistence and recovery, verified under the
+Bank-approved workload. This startup check is **not** proof of those
+performance or failure-recovery budgets.
+
 The approved record must identify:
 
 - The service identity, authorized tenant IDs, environment, Kafka topic/group and database role; record the approver and approval/change reference.
