@@ -152,20 +152,26 @@ def test_distinct_migrator_insert_only_runtime_and_cross_environment_denial() ->
                     )
                 runtime_connection.rollback()
 
-            with connect_as(outsider, primary_schema) as outsider_connection:
-                with pytest.raises(psycopg.errors.InsufficientPrivilege):
-                    PostgresSecurityAuditSink(outsider_connection).append(event)
+            with (
+                connect_as(outsider, primary_schema) as outsider_connection,
+                pytest.raises(psycopg.errors.InsufficientPrivilege),
+            ):
+                PostgresSecurityAuditSink(outsider_connection).append(event)
 
             # A valid role pointed at a second installed environment has no
             # schema/table grants there; it cannot silently write elsewhere.
-            with connect_as(runtime, foreign_schema) as wrong_connection:
-                with pytest.raises(psycopg.Error):
-                    PostgresSecurityAuditSink(wrong_connection).append(event)
+            with (
+                connect_as(runtime, foreign_schema) as wrong_connection,
+                pytest.raises(psycopg.Error),
+            ):
+                PostgresSecurityAuditSink(wrong_connection).append(event)
 
             # A missing/unprovisioned namespace must fail too.
-            with connect_as(runtime, f"gasha_absent_{suffix}") as missing_connection:
-                with pytest.raises(psycopg.Error):
-                    PostgresSecurityAuditSink(missing_connection).append(event)
+            with (
+                connect_as(runtime, f"gasha_absent_{suffix}") as missing_connection,
+                pytest.raises(psycopg.Error),
+            ):
+                PostgresSecurityAuditSink(missing_connection).append(event)
 
             with connect_as(migrator, primary_schema) as verify_connection:
                 assert verify_connection.execute(
