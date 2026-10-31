@@ -137,6 +137,14 @@ def _validate_request(request: POCGateRequest) -> None:
     for finding in request.findings:
         if not isinstance(finding, SecurityFinding):
             raise TypeError("findings must contain SecurityFinding records")
+        # Finding IDs and owners must be unambiguous traceability references.
+        # Reject malformed runtime input rather than trimming or guessing IDs.
+        for name in ("finding_id", "owner"):
+            value = getattr(finding, name)
+            if type(value) is not str:
+                raise TypeError(f"{name} must be a string")
+            if not value or not value.isprintable() or value != value.strip():
+                raise ValueError(f"{name} must be nonblank canonical printable text")
         if not isinstance(finding.severity, FindingSeverity):
             raise TypeError("severity must be a FindingSeverity enum")
         if type(finding.resolved) is not bool or type(finding.gasha_attributable) is not bool:
