@@ -51,11 +51,19 @@ atomic outcome-and-terminal-audit persistence adapter is independently accepted:
   the exact tenant/event, carry signal source and signal version, an immutable
   serialized policy/signal snapshot and SHA-256 context reference, plus a
   provider-declared collection/expiry window checked against service time.
-  The reference now binds both timestamps as canonical UTC instants: a
-  collection/expiry claim change produces a different reference even if the
-  event, policy and signals are identical. This closes an internal lineage
-  ambiguity but **does not** authenticate or attest the provider's timestamps,
-  satisfy historical point-in-time feature validation, or authorize bank evidence.
+  The internal SHA-256 reference uses canonical, sorted, field-tagged JSON
+  with a domain/schema tag (`gasha-context-ref-v2`). It binds tenant, event,
+  source and signal versions, policy snapshot, signal digest, and collected/expiry
+  instants normalized to UTC. The previous NUL-delimited string preimage could
+  alias distinct source/version tuples. Version metadata must be nonblank
+  printable ASCII (no NUL, CR/LF, DEL or non-ASCII) before reaching response
+  headers; the protected context boundary revalidates metadata even when a
+  provider returns an improperly mutated context. Malformed context returns
+  HTTP 503 with a correlated redacted terminal failure audit when the sink is
+  available; no success audit or response provenance headers are emitted.
+  This closes internal encoding/response-serialization defects but **does not**
+  authenticate or attest the provider's timestamps, establish source origin,
+  satisfy historical point-in-time feature validation or authorize bank evidence.
   Provider trust/attestation and actual bank signal ingestion remain separate
   integration controls.
 - The legacy `outcome_ingestion` field is deliberately ignored by protected
