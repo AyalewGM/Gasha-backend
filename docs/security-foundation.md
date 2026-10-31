@@ -96,6 +96,17 @@ All missing or invalid credentials, mismatched tenants, insufficient
 capabilities, identity-provider outages, missing context and audit
 write failures are denied. Audit actor and tenant references are hashed;
 tokens, request bodies, raw PII and secrets are never included in audit events.
+The redacted audit actor is a **versioned pseudonymous reference**:
+`gasha-audit-actor-v2` hashes canonical field-tagged JSON containing only the
+trusted verifier's issuer and subject. Separate keys prevent NUL-delimiter
+shifts from causing two distinct accepted identity tuples to share a preimage.
+The credential reference, tenant scope, capabilities and expiry are omitted so
+token rotation and scope updates do not change actor correlation. Existing
+legacy actor digests are **not** interchangeable with v2; any external
+append-only audit consumer must version its interpretation/migration before
+bank rollout. A digest is neither an IdP attestation nor protection against
+offline guessing of low-entropy identifiers. No raw issuer/subject is emitted
+in audit events; access control to the audit store remains mandatory.
 Each protected request receives a server-generated attempt reference; action
 authorization and terminal outcome use distinct result labels and share a
 hashed tenant/event reference. Successful evaluations include a server-chosen
