@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
-from math import isfinite
 from collections.abc import Callable
 from datetime import timedelta
+from math import isfinite
 from pathlib import Path
 from typing import cast
 
