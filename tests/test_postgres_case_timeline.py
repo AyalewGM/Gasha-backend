@@ -23,6 +23,7 @@ from gasha.cases.timeline import (
     CaseDisposition,
     CaseOperation,
     CaseReason,
+    CaseRejected,
     VerifiedEvaluation,
 )
 from gasha.security.access import AuthorizationRejected, Capability, TrustedPrincipal
@@ -282,3 +283,100 @@ def test_case_history_read_requires_separate_tenant_scoped_capability(schema):
         assert len(history) == 1
         assert history[0].bank_execution is BankExecution.UNKNOWN
         assert counts(connection) == (1, 1)
+
+
+# Install-time corruption is deliberately injected using the test administrator;
+# no application role is allowed to edit existing case rows.
+@pytest.mark.parametrize(("change_sql", "params"), [
+    ("event_json = jsonb_set(event_json, '{tenant_id}', to_jsonb(%s::text))",
+     ("tenant-b",)),
+    ("event_json = jsonb_set(event_json, '{case_id}', to_jsonb(%s::text))",
+     (str(uuid4()),)),
+    ("event_json = jsonb_set(event_json, '{revision}', 'true'::jsonb)", ()),
+    ("event_json = jsonb_set(event_json, '{previous_revision}', '0'::jsonb)", ()),
+    ("event_json = jsonb_set(event_json, '{source_event_id}', to_jsonb(%s::text))",
+     (str(uuid4()),)),
+    ("event_json = jsonb_set(event_json, '{source_context_ref}', to_jsonb(%s::text))",
+     ("b" * 64,)),
+    ("event_json = jsonb_set(event_json, '{actor_ref}', to_jsonb(%s::text))",
+     ("b" * 64,)),
+    ("event_json = jsonb_set(event_json, '{recorded_at}', to_jsonb(%s::text))",
+     ((AT + timedelta(minutes=2)).isoformat(),)),
+    ("event_json = jsonb_set(event_json, '{idempotency_ref}', to_jsonb(%s::text))",
+     ("b" * 64,)),
+    ("event_json = jsonb_set(event_json, '{command_ref}', to_jsonb(%s::text))",
+     ("b" * 64,)),
+    ("event_json = jsonb_set(event_json, '{bank_execution}', to_jsonb(%s::text))",
+     ("executed",)),
+    ("event_json = jsonb_set(event_json, '{operation}', to_jsonb(%s::text))",
+     ("assign",)),
+    ("event_json = event_json - 'actor_ref'", ()),
+    ("source_event_id = %s", (uuid4(),)),
+    ("source_context_ref = %s", ("b" * 64,)),
+    ("actor_ref = %s", ("b" * 64,)),
+    ("occurred_at = occurred_at + interval '1 second'", ()),
+    ("idempotency_ref = %s", ("b" * 64,)),
+    ("command_ref = %s", ("b" * 64,)),
+])
+def test_corrupt_row_or_json_blocks_history_and_append_without_audit(
+    schema, change_sql, params,
+):
+    with connect(schema) as connection:
+        service = PostgresCaseTimelineService(connection)
+        case_id, event_id = uuid4(), uuid4()
+        apply(service, cmd(CaseOperation.CREATE, case_id, event_id, 0))
+        connection.execute(
+            "UPDATE analyst_case_events SET " + change_sql
+            + " WHERE tenant_id = %s AND case_id = %s",
+            (*params, "tenant-a", case_id),
+        )
+        connection.commit()
+        with pytest.raises(CaseRejected):
+            service.history(
+                principal=principal(capabilities=frozenset({Capability.CASE_READ})),
+                tenant_id="tenant-a", case_id=case_id, at=AT,
+            )
+        with pytest.raises(CaseRejected):
+            apply(service, cmd(CaseOperation.TRIAGE, case_id, event_id, 1))
+        assert counts(connection) == (1, 1)
+
+
+def test_missing_first_revision_fails_closed_without_cross_tenant_leak(schema):
+    with connect(schema) as connection:
+        service = PostgresCaseTimelineService(connection)
+        case_id, event_id = uuid4(), uuid4()
+        apply(service, cmd(CaseOperation.CREATE, case_id, event_id, 0))
+        apply(service, cmd(CaseOperation.TRIAGE, case_id, event_id, 1))
+        connection.execute(
+            "DELETE FROM analyst_case_events WHERE tenant_id = %s "
+            "AND case_id = %s AND revision = 1", ("tenant-a", case_id),
+        )
+        connection.commit()
+        reader = principal(capabilities=frozenset({Capability.CASE_READ}))
+        with pytest.raises(CaseRejected):
+            service.history(principal=reader, tenant_id="tenant-a",
+                            case_id=case_id, at=AT)
+        with pytest.raises(CaseRejected):
+            apply(service, cmd(CaseOperation.ASSIGN, case_id, event_id, 2,
+                               assignee=AuthorizedAssignee("tenant-a", "a" * 64)))
+        assert counts(connection) == (1, 2)
+        # No accidental tenant-wide or global query fallback on a nonexistent case.
+        assert service.history(
+            principal=principal(tenant="tenant-b",
+                                capabilities=frozenset({Capability.CASE_READ})),
+            tenant_id="tenant-b", case_id=case_id, at=AT,
+        ) == ()
+
+
+def test_uncertain_commit_reply_retry_from_second_connection_is_idempotent(schema):
+    case_id, event_id = uuid4(), uuid4()
+    command = cmd(CaseOperation.CREATE, case_id, event_id, 0)
+    with connect(schema) as first_connection:
+        committed = apply(PostgresCaseTimelineService(first_connection), command)
+    # Simulate a lost response AFTER commit; the caller has no acknowledgment.
+    with connect(schema) as retry_connection:
+        service = PostgresCaseTimelineService(retry_connection)
+        assert apply(service, command, at=AT + timedelta(seconds=2)) == committed
+        with pytest.raises(CaseConflict):
+            apply(service, replace(command, case_id=uuid4()))
+        assert counts(retry_connection) == (1, 1)
