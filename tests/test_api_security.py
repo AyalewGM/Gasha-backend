@@ -850,7 +850,7 @@ def test_context_constructor_rejects_unsafe_provider_metadata(
 def test_protected_routes_reject_unsafe_provider_metadata_before_success_audit(
     wired, path: str, root_path: str, field: str, bad: str,
 ) -> None:
-    client, audit, store = wired
+    _, audit, store = wired
 
     class MalformedProvider(ContextProvider):
         def resolve(self, transaction, principal):
