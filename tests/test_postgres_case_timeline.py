@@ -247,3 +247,36 @@ def test_concurrent_stale_create_has_one_winner_and_one_atomic_audit(schema):
     assert outcomes == ["conflict", "created"]
     with connect(schema) as connection:
         assert counts(connection) == (1, 1)
+
+
+def test_case_history_read_requires_separate_tenant_scoped_capability(schema):
+    with connect(schema) as connection:
+        service = PostgresCaseTimelineService(connection)
+        case_id, event_id = uuid4(), uuid4()
+        apply(service, cmd(CaseOperation.CREATE, case_id, event_id, 0))
+        with pytest.raises(AuthorizationRejected):
+            service.history(
+                principal=principal(), tenant_id="tenant-a",
+                case_id=case_id, at=AT,
+            )
+        with pytest.raises(AuthorizationRejected):
+            service.history(
+                principal=principal(
+                    capabilities=frozenset({Capability.CASE_READ}),
+                    tenant="tenant-b",
+                ),
+                tenant_id="tenant-a", case_id=case_id, at=AT,
+            )
+        with pytest.raises(AuthorizationRejected):
+            service.history(
+                principal=principal(capabilities=frozenset({Capability.CASE_READ})),
+                tenant_id="tenant-a", case_id=case_id,
+                at=AT + timedelta(hours=2),
+            )
+        history = service.history(
+            principal=principal(capabilities=frozenset({Capability.CASE_READ})),
+            tenant_id="tenant-a", case_id=case_id, at=AT,
+        )
+        assert len(history) == 1
+        assert history[0].bank_execution is BankExecution.UNKNOWN
+        assert counts(connection) == (1, 1)
