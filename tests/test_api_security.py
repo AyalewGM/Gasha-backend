@@ -890,3 +890,68 @@ def test_protected_routes_reject_unsafe_provider_metadata_before_success_audit(
     assert "synthetic" not in str(actions)
     assert not any(event.result == "succeeded" for event in audit.events)
     assert store.store.outcomes("tenant-a", UUID(str(payload["event_id"]))) == ()
+
+
+
+@pytest.mark.parametrize("path", ["/v1/decisions", "/v1/evaluations"])
+@pytest.mark.parametrize("root_path", ["", "/bank"])
+@pytest.mark.parametrize("permitted", [True, False])
+def test_protected_http_audit_actor_distinguishes_delimiter_shifted_identities(
+    wired, path: str, root_path: str, permitted: bool,
+) -> None:
+    _, audit, store = wired
+    capabilities = (
+        frozenset({Capability.DECISION_SUBMIT})
+        if permitted else frozenset({Capability.DECISION_READ})
+    )
+    first = TrustedPrincipal(
+        subject="user",
+        issuer="bank\x00app",
+        credential_ref="synthetic-rotation-a",
+        tenant_ids=frozenset({"tenant-a"}),
+        capabilities=capabilities,
+        expires_at=NOW + timedelta(hours=1),
+    )
+    second = TrustedPrincipal(
+        subject="app\x00user",
+        issuer="bank",
+        credential_ref="synthetic-rotation-b",
+        tenant_ids=frozenset({"tenant-a"}),
+        capabilities=capabilities,
+        expires_at=NOW + timedelta(hours=1),
+    )
+    assert first.audit_actor != second.audit_actor
+    app.state.identity_verifier = Verifier({"actor-a": first, "actor-b": second})
+
+    client = TestClient(app, root_path=root_path)
+    for credential in ("actor-a", "actor-b"):
+        payload = tx()
+        result = client.post(
+            f"{root_path}{path}",
+            json={"transaction": payload},
+            headers=headers(credential),
+        )
+        assert result.status_code == (200 if permitted else 403)
+        if permitted and path.endswith("/evaluations"):
+            assert result.json()["operating_mode"] == "shadow"
+            assert result.json()["effective_action"] == "no_action_shadow"
+        assert store.store.outcomes("tenant-a", UUID(str(payload["event_id"]))) == ()
+
+    verified = [
+        event for event in audit.events
+        if event.action == "authenticate" and event.result == "verified"
+    ]
+    assert [event.actor_ref for event in verified] == [
+        first.audit_actor, second.audit_actor,
+    ]
+    action = [
+        event for event in audit.events
+        if event.action == Capability.DECISION_SUBMIT.value
+        and event.result == ("authorized" if permitted else "denied")
+    ]
+    assert [event.actor_ref for event in action] == [
+        first.audit_actor, second.audit_actor,
+    ]
+    assert all(len(event.actor_ref) == 64 for event in verified + action)
+    assert "bank\x00app" not in str(audit.events)
+    assert "app\x00user" not in str(audit.events)
