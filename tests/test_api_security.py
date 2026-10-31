@@ -778,3 +778,111 @@ def test_context_digest_binds_signal_validity_window() -> None:
     assert baseline.context_ref != context(
         collected_at, expires_at + timedelta(seconds=1)
     ).context_ref
+
+
+
+def test_context_ref_has_unambiguous_field_tagged_provenance() -> None:
+    """Distinct source/version tuples cannot alias by shifting a NUL delimiter."""
+    event_id = uuid4()
+
+    def context(source: str, version: str) -> TrustedDecisionContext:
+        return TrustedDecisionContext(
+            tenant_id="tenant-a", event_id=event_id,
+            policy=DecisionPolicy(
+                configuration_version="synthetic-config",
+                policy_version="synthetic-policy",
+                rule_version="synthetic-rules",
+            ),
+            intelligence=IntelligenceSnapshot(network_risk=0.91),
+            signal_source_version=source, signal_version=version,
+            collected_at=NOW - timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=15),
+        )
+
+    left, right = context("source", "scope"), context("source", "scope")
+    assert left.context_ref == right.context_ref
+    # The constructor rejects these invalid HTTP metadata tokens. Force them
+    # into separate instances *only* to regression-test injectivity of the
+    # canonical digest under the previously colliding serialized preimages.
+    object.__setattr__(left, "signal_source_version", "source\x00version")
+    object.__setattr__(left, "signal_version", "scope")
+    object.__setattr__(right, "signal_source_version", "source")
+    object.__setattr__(right, "signal_version", "version\x00scope")
+    assert left.context_ref != right.context_ref
+    assert len(left.context_ref) == len(right.context_ref) == 64
+    assert context("source", "scope").context_ref != context(
+        "source", "scope-v2"
+    ).context_ref
+    assert context("source", "scope").context_ref != context(
+        "source-v2", "scope"
+    ).context_ref
+
+
+@pytest.mark.parametrize("field", ["signal_source_version", "signal_version"])
+@pytest.mark.parametrize("bad", ["\x00", "\r", "\n", "\x7f", "\u2603"])
+def test_context_constructor_rejects_unsafe_provider_metadata(
+    field: str, bad: str,
+) -> None:
+    values = {
+        "signal_source_version": "synthetic-source",
+        "signal_version": "synthetic-signal",
+    }
+    values[field] = f"synthetic{bad}version"
+    with pytest.raises(ValueError, match="trusted event-bound decision provenance"):
+        TrustedDecisionContext(
+            tenant_id="tenant-a", event_id=uuid4(),
+            policy=DecisionPolicy(
+                configuration_version="synthetic-config",
+                policy_version="synthetic-policy",
+                rule_version="synthetic-rules",
+            ),
+            intelligence=IntelligenceSnapshot(network_risk=0.93),
+            collected_at=NOW - timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=15),
+            **values,
+        )
+
+
+@pytest.mark.parametrize("path", ["/v1/decisions", "/v1/evaluations"])
+@pytest.mark.parametrize("root_path", ["", "/bank", "/gateway/bank"])
+@pytest.mark.parametrize("field", ["signal_source_version", "signal_version"])
+@pytest.mark.parametrize("bad", ["\x00", "\r\n", "\x7f", "\u2603"])
+def test_protected_routes_reject_unsafe_provider_metadata_before_success_audit(
+    wired, path: str, root_path: str, field: str, bad: str,
+) -> None:
+    client, audit, store = wired
+
+    class MalformedProvider(ContextProvider):
+        def resolve(self, transaction, principal):
+            result = super().resolve(transaction, principal)
+            # An adapter bug can bypass constructor checks on a frozen object.
+            # The bank trust boundary must independently recheck the versions.
+            object.__setattr__(result, field, f"synthetic{bad}metadata")
+            return result
+
+    app.state.decision_context_provider = MalformedProvider()
+    response = TestClient(app, root_path=root_path).post(
+        f"{root_path}{path}", json={"transaction": tx()}, headers=headers(),
+    )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "decision unavailable"}
+    assert "X-Gasha-Context-Ref" not in response.headers
+    assert "X-Gasha-Source-Version" not in response.headers
+    assert "X-Gasha-Signal-Version" not in response.headers
+    auth = [event for event in audit.events if event.action == "authenticate"]
+    actions = [
+        event for event in audit.events
+        if event.action == Capability.DECISION_SUBMIT.value
+    ]
+    assert len(auth) == 1 and auth[0].result == "verified"
+    assert [event.result for event in actions] == ["authorized", "failed"]
+    assert [event.reason for event in actions] == [
+        "allowed",
+        "decision_unavailable" if path.endswith("decisions") else "evaluation_unavailable",
+    ]
+    assert actions[0].attempt_ref == actions[1].attempt_ref
+    assert actions[0].event_ref == actions[1].event_ref
+    assert actions[1].context_ref == ""
+    assert "synthetic" not in str(actions)
+    assert not any(event.result == "succeeded" for event in audit.events)
+    assert store.store.outcomes("tenant-a", uuid4()) == ()
