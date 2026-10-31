@@ -1,8 +1,8 @@
 # Issue #42: optional PostgreSQL security-audit port (internal POC)
 
 `PostgresSecurityAuditSink` is an **inert, opt-in implementation** of the
-existing `SecurityAuditSink` contract from draft protected API PR #55.
-It is not configured by `gasha.api.main:app` or any bank deployment.
+existing `SecurityAuditSink` contract integrated through PR #55.
+It is not configured by `gasha.api.main:app` or any bank deployment; protected API state remains explicitly unwired by default. Merely installing this adapter or configuring a DSN must never grant a banking service audit authority.
 It inserts redacted action/result/reason codes, pseudonymous actor and tenant
 references, a server-generated attempt reference, optional event/context
 hashes and a timezone-aware timestamp. No raw token, issuer, subject,
