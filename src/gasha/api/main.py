@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Annotated, NoReturn, Protocol
 from uuid import UUID, uuid4
@@ -119,13 +119,16 @@ class TrustedDecisionContext:
 
     @property
     def context_ref(self) -> str:
-        """Stable digest of server-provided signal and policy provenance."""
+        """Digest of event, policy, signals and validity window (not attestation)."""
         return sha256(
             ("\0".join((
                 self.tenant_id,
                 str(self.event_id),
                 self.signal_source_version,
                 self.signal_version,
+                # Normalize aware times so equivalent instants have one reference.
+                self.collected_at.astimezone(UTC).isoformat(),
+                self.expires_at.astimezone(UTC).isoformat(),
                 self._signal_digest,
                 self._policy_snapshot,
             ))).encode()
