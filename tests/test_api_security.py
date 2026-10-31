@@ -1,6 +1,6 @@
 """#42 HTTP-level negative and positive tests, using only synthetic credentials."""
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import uuid4
 
@@ -742,3 +742,39 @@ def test_root_path_shadow_response_and_health_are_unchanged(wired, prefix: str) 
     assert len([e for e in audit.events if e.action == "authenticate"]) == 1
     assert len([e for e in audit.events if e.result == "succeeded"]) == 1
     assert len(response.headers["X-Gasha-Context-Ref"]) == 64
+
+
+def test_context_digest_binds_signal_validity_window() -> None:
+    # Different collection/expiry claims must not share the same lineage ref.
+    event_id = uuid4()
+    policy = DecisionPolicy(
+        configuration_version="synthetic-c1",
+        policy_version="synthetic-p1",
+        rule_version="synthetic-r1",
+    )
+    signals = IntelligenceSnapshot(network_risk=0.93)
+
+    def context(collected_at: datetime, expires_at: datetime) -> TrustedDecisionContext:
+        return TrustedDecisionContext(
+            tenant_id="tenant-a", event_id=event_id,
+            policy=policy, intelligence=signals,
+            signal_source_version="synthetic-source-1",
+            signal_version="synthetic-signals-1",
+            collected_at=collected_at, expires_at=expires_at,
+        )
+
+    collected_at = NOW - timedelta(minutes=10)
+    expires_at = NOW + timedelta(minutes=30)
+    baseline = context(collected_at, expires_at)
+    same_instants = context(
+        collected_at.astimezone(timezone(timedelta(hours=3))),
+        expires_at.astimezone(timezone(timedelta(hours=3))),
+    )
+    assert baseline.context_ref == same_instants.context_ref
+    assert len(baseline.context_ref) == 64
+    assert baseline.context_ref != context(
+        collected_at + timedelta(seconds=1), expires_at
+    ).context_ref
+    assert baseline.context_ref != context(
+        collected_at, expires_at + timedelta(seconds=1)
+    ).context_ref
