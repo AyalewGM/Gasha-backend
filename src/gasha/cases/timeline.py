@@ -172,6 +172,14 @@ def _check_command(command: CaseCommand) -> None:
             raise CaseRejected("typed disposition required")
     elif command.disposition is not None:
         raise CaseRejected("disposition allowed only for disposition/correction")
+    if command.operation is CaseOperation.DISPOSE:
+        required_reason = {
+            CaseDisposition.FRAUD: CaseReason.FRAUD_EVIDENCE,
+            CaseDisposition.LEGITIMATE: CaseReason.LEGITIMATE_EVIDENCE,
+            CaseDisposition.UNRESOLVED: CaseReason.NEEDS_REVIEW,
+        }
+        if command.reason_code is not required_reason[command.disposition]:
+            raise CaseRejected("disposition/reason mismatch")
     if command.operation is CaseOperation.ASSIGN:
         if (not isinstance(command.assignee, AuthorizedAssignee)
                 or command.assignee.tenant_id != command.tenant_id
