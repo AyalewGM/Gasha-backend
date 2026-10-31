@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Self
 from datetime import UTC, datetime
+from typing import Self
 
 import pytest
 
