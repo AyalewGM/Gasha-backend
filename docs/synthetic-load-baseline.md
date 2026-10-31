@@ -57,3 +57,15 @@ measurement windows that yield nonfinite rates serialize throughput as null.
 The report schema, synthetic-only scope and hard BLOCKED bank acceptance remain
 unchanged. No evidence provenance, Bank KPI approval or production failure
 isolation is established by these local arithmetic checks.
+
+
+## Strict machine-report closure (Issue #47 scoped correction)
+
+A synthetically accepted report must serialize using strict JSON
+(`json.dumps(..., allow_nan=False)`). Finite inputs whose aggregate latency
+mean cannot be represented are rejected at construction before publishing any
+report; finite individual P95/P99/max samples retain their original values.
+Unserializable extremely large configuration counters are also rejected.
+The measured producer records only bounded exception class names, not exception
+messages, payloads, stack traces or synthetic customer/account references.
+These safeguards do not make the sequential baseline a bank performance test.
