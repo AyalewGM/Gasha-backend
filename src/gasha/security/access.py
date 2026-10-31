@@ -25,6 +25,13 @@ class Capability(StrEnum):
     EVIDENCE_VERIFY = "evidence.verify"
     EVIDENCE_APPROVE = "evidence.approve"
     EVIDENCE_REVOKE = "evidence.revoke"
+    CASE_READ = "case.read"
+    CASE_CREATE = "case.create"
+    CASE_TRIAGE = "case.triage"
+    CASE_ASSIGN = "case.assign"
+    CASE_DISPOSITION = "case.disposition"
+    CASE_CORRECT = "case.correct"
+    CASE_FEEDBACK = "case.feedback"
 
 
 @dataclass(frozen=True, slots=True)
