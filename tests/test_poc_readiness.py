@@ -82,6 +82,44 @@ def test_tenant_identity_required() -> None:
         evaluate_poc_gate(replace(request(Stage.HISTORICAL), tenant_id="   "))
 
 
+@pytest.mark.parametrize("stage", list(Stage))
+@pytest.mark.parametrize(
+    "tenant_id",
+    [
+        "", " ", "\\t", "\\n", " leading", "trailing ", "embedded\\nnewline",
+        "nul\\x00injection", "zero\\u200bwidth", "bidi\\u202ereversal",
+    ],
+)
+def test_tenant_identity_must_be_canonical_printable_text(
+    stage: Stage, tenant_id: str
+) -> None:
+    # Reject ambiguous report attribution at every stage, even if approvals
+    # would otherwise be satisfied; this is shape validation, not tenant auth.
+    packet = replace(
+        request(stage),
+        tenant_id=tenant_id,
+        historical_accepted=True,
+        shadow_accepted=True,
+        bank_inline_approved=True,
+        tenant_inline_enabled=True,
+    )
+    with pytest.raises(ValueError, match="tenant_id"):
+        evaluate_poc_gate(packet)
+
+
+@pytest.mark.parametrize("tenant_id", [None, 1, b"tenant", True])
+def test_tenant_identity_requires_actual_string(tenant_id: Any) -> None:
+    with pytest.raises(TypeError, match="tenant_id"):
+        evaluate_poc_gate(replace(request(Stage.HISTORICAL), tenant_id=tenant_id))
+
+
+def test_valid_canonical_tenant_identifier_preserved_in_report() -> None:
+    report = evaluate_poc_gate(request(Stage.HISTORICAL))
+    assert report.ready
+    assert report.tenant_id == "synthetic-tenant"
+    assert report.to_dict()["enforcement_activated"] is False
+
+
 @pytest.mark.parametrize(
     ("stage", "area"),
     [
