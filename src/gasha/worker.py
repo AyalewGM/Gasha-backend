@@ -102,7 +102,8 @@ class WorkerSettings(BaseSettings):
     def _reject_boolean_worker_numeric_settings(cls, value: object) -> object:
         """Constructor booleans must not silently become 0/1; env strings still parse."""
         if isinstance(value, bool):
-            raise ValueError("worker batch size and poll timeout must not be booleans")
+            # Pydantic wraps ValueError as ValidationError; TypeError escapes unwrapped.
+            raise ValueError("worker batch size and poll timeout must not be booleans")  # noqa: TRY004
         return value
 
 
