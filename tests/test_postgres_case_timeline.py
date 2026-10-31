@@ -380,3 +380,164 @@ def test_uncertain_commit_reply_retry_from_second_connection_is_idempotent(schem
         with pytest.raises(CaseConflict):
             apply(service, replace(command, case_id=uuid4()))
         assert counts(retry_connection) == (1, 1)
+
+
+def test_case_runtime_reader_and_audit_roles_are_separate():
+    """Real PG role boundary; does NOT establish bank grants or same-schema RLS."""
+    import psycopg
+    from psycopg import sql
+    from psycopg.rows import dict_row
+
+    suffix = uuid4().hex[:12]
+    schema_a = "gasha_case_acl_a_" + suffix
+    schema_b = "gasha_case_acl_b_" + suffix
+    migrator, writer, reader, auditor, outsider = (
+        "gasha_cm_" + suffix, "gasha_cw_" + suffix,
+        "gasha_cr_" + suffix, "gasha_ca_" + suffix,
+        "gasha_co_" + suffix,
+    )
+    password = "synthetic_case_acl_ci_only"
+    roles = (migrator, writer, reader, auditor, outsider)
+    schemas = (schema_a, schema_b)
+
+    def table(schema_name, name):
+        return sql.SQL("{}.{}").format(sql.Identifier(schema_name), sql.Identifier(name))
+
+    def as_role(role, schema_name):
+        connection = psycopg.connect(
+            DSN, user=role, password=password, row_factory=dict_row,
+        )
+        connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name)))
+        connection.commit()
+        return connection
+
+    with psycopg.connect(DSN, autocommit=True) as admin:
+        made_roles = []
+        made_schemas = []
+        try:
+            for role in roles:
+                admin.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                    sql.Identifier(role), sql.Literal(password),
+                ))
+                made_roles.append(role)
+                assert admin.execute(
+                    "SELECT rolsuper, rolcreaterole FROM pg_roles WHERE rolname = %s",
+                    (role,),
+                ).fetchone() == (False, False)
+            for location in schemas:
+                admin.execute(sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(
+                    sql.Identifier(location), sql.Identifier(migrator),
+                ))
+                made_schemas.append(location)
+                with as_role(migrator, location) as connection:
+                    for migration in (
+                        "010_security_audit_events.sql", "011_analyst_case_events.sql",
+                    ):
+                        connection.execute((MIGRATIONS / migration).read_text())
+                    connection.commit()
+
+            for role in (writer, reader, auditor):
+                admin.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                    sql.Identifier(schema_a), sql.Identifier(role),
+                ))
+            admin.execute(sql.SQL("GRANT SELECT, INSERT ON TABLE {} TO {}").format(
+                table(schema_a, "analyst_case_events"), sql.Identifier(writer),
+            ))
+            admin.execute(sql.SQL("GRANT INSERT ON TABLE {} TO {}").format(
+                table(schema_a, "security_audit_events"), sql.Identifier(writer),
+            ))
+            admin.execute(sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(
+                table(schema_a, "analyst_case_events"), sql.Identifier(reader),
+            ))
+            admin.execute(sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(
+                table(schema_a, "security_audit_events"), sql.Identifier(auditor),
+            ))
+
+            case_id, event_id = uuid4(), uuid4()
+            with as_role(writer, schema_a) as connection:
+                assert connection.execute("SELECT current_user").fetchone()["current_user"] == writer
+                assert apply(
+                    PostgresCaseTimelineService(connection),
+                    cmd(CaseOperation.CREATE, case_id, event_id, 0),
+                ).revision == 1
+                forbidden = (
+                    sql.SQL("SELECT * FROM {}").format(
+                        table(schema_a, "security_audit_events")),
+                    sql.SQL("UPDATE {} SET actor_ref = actor_ref").format(
+                        table(schema_a, "analyst_case_events")),
+                    sql.SQL("DELETE FROM {}").format(
+                        table(schema_a, "analyst_case_events")),
+                    sql.SQL("TRUNCATE {}").format(
+                        table(schema_a, "analyst_case_events")),
+                    sql.SQL("ALTER TABLE {} ADD COLUMN denied TEXT").format(
+                        table(schema_a, "analyst_case_events")),
+                    sql.SQL("DROP TABLE {}").format(
+                        table(schema_a, "analyst_case_events")),
+                    sql.SQL("CREATE TABLE {} (id INT)").format(
+                        table(schema_a, "denied_table")),
+                    sql.SQL("CREATE INDEX {} ON {} (revision)").format(
+                        sql.Identifier("case_denied_index"),
+                        table(schema_a, "analyst_case_events")),
+                    sql.SQL("SET ROLE {}").format(sql.Identifier(migrator)),
+                )
+                for statement in forbidden:
+                    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                        connection.execute(statement)
+                    connection.rollback()
+
+            with as_role(reader, schema_a) as connection:
+                events = PostgresCaseTimelineService(connection).history(
+                    principal=principal(capabilities=frozenset({Capability.CASE_READ})),
+                    tenant_id="tenant-a", case_id=case_id, at=AT,
+                )
+                assert len(events) == 1
+                for statement in (
+                    sql.SQL("SELECT * FROM {}").format(
+                        table(schema_a, "security_audit_events")),
+                    sql.SQL("DELETE FROM {}").format(
+                        table(schema_a, "analyst_case_events")),
+                    sql.SQL("INSERT INTO {} (tenant_id) VALUES ('tenant-a')").format(
+                        table(schema_a, "analyst_case_events")),
+                ):
+                    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                        connection.execute(statement)
+                    connection.rollback()
+
+            with as_role(auditor, schema_a) as connection:
+                assert connection.execute(sql.SQL("SELECT count(*) AS n FROM {}").format(
+                    table(schema_a, "security_audit_events"),
+                )).fetchone()["n"] == 1
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    connection.execute(sql.SQL("SELECT * FROM {}").format(
+                        table(schema_a, "analyst_case_events"),
+                    ))
+                connection.rollback()
+
+            with as_role(outsider, schema_a) as connection:
+                with pytest.raises(psycopg.Error):
+                    connection.execute("SELECT * FROM analyst_case_events")
+                connection.rollback()
+            with as_role(writer, schema_b) as connection:
+                with pytest.raises(psycopg.Error):
+                    connection.execute("SELECT * FROM analyst_case_events")
+                connection.rollback()
+            with as_role(migrator, schema_a) as connection:
+                assert connection.execute(sql.SQL("SELECT count(*) AS n FROM {}").format(
+                    table(schema_a, "analyst_case_events"),
+                )).fetchone()["n"] == 1
+                assert connection.execute(sql.SQL("SELECT count(*) AS n FROM {}").format(
+                    table(schema_b, "analyst_case_events"),
+                )).fetchone()["n"] == 0
+            print(
+                "Case PostgreSQL role matrix: 5 synthetic non-superuser roles, "
+                "2 isolated schemas, 1 atomic case/audit append, "
+                "9 writer + 3 reader forbidden operations, auditor read-only, "
+                "outsider and wrong-environment reads denied"
+            )
+        finally:
+            for location in reversed(made_schemas):
+                admin.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(location),
+                ))
+            for role in reversed(made_roles):
+                admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
