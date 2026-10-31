@@ -42,3 +42,18 @@ record resource/error/latency tails and reconcile all terminal/pending
 outcomes, pinned to the exact SHA/image/config/dependencies. Nothing in this
 baseline authorizes HOLD/BLOCK execution, protected API deployment, evidence
 registry approval or a merge.
+
+## Measured-population integrity (internal evidence only)
+
+A report is rejected before serialization unless event outcomes, failure-class
+counts and latency samples reconcile to the same attempted-event population.
+All counters must be nonnegative integers (not booleans); elapsed time and
+per-attempt latency must be finite and nonnegative. Failure categories must be
+short ASCII exception class names, never arbitrary exception messages or raw
+identifiers. The failure-type snapshot cannot be mutated after validation.
+All attempted events, including failed attempts, contribute a latency sample;
+this is **not** a successful-transaction-only P95/P99 measure. Extremely small
+measurement windows that yield nonfinite rates serialize throughput as null.
+The report schema, synthetic-only scope and hard BLOCKED bank acceptance remain
+unchanged. No evidence provenance, Bank KPI approval or production failure
+isolation is established by these local arithmetic checks.

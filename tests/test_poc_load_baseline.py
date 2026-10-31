@@ -114,3 +114,85 @@ def test_zero_successful_samples_have_null_metrics_and_reason() -> None:
         "undefined_reason": "no_completed_event_samples",
     }
     assert payload["observed_events_per_second"] is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"config": None},
+        {"attempted_events": True},
+        {"attempted_events": -1},
+        {"evaluated_payments": 2},
+        {"failed_events": 0},
+        {"failure_types": {}},
+        {"failure_types": {"TimeoutError": 0}},
+        {"failure_types": {"TimeoutError": True}},
+        {"failure_types": {"customer-123": 1}},
+        {"failure_types": {"TïmeoutError": 1}},
+        {"failure_types": {"TimeoutError": 2}},
+        {"failure_types": ["TimeoutError"]},
+        {"elapsed_seconds": -1.0},
+        {"elapsed_seconds": True},
+        {"elapsed_seconds": float("nan")},
+        {"elapsed_seconds": float("inf")},
+        {"event_latencies_ms": [1.0, 2.0]},
+        {"event_latencies_ms": (1.0,)},
+        {"event_latencies_ms": (-1.0, 2.0)},
+        {"event_latencies_ms": (float("nan"), 2.0)},
+        {"event_latencies_ms": (float("inf"), 2.0)},
+        {"event_latencies_ms": (True, 2.0)},
+    ],
+)
+def test_synthetic_report_rejects_unreconciled_or_unsafe_evidence(overrides) -> None:
+    candidate = {
+        "config": SyntheticLoadConfig(),
+        "attempted_events": 2,
+        "evaluated_payments": 1,
+        "accepted_journey_events": 0,
+        "duplicate_events": 0,
+        "failed_events": 1,
+        "failure_types": {"TimeoutError": 1},
+        "elapsed_seconds": 2.0,
+        "event_latencies_ms": (1.0, 2.0),
+    }
+    candidate.update(overrides)
+    with pytest.raises(ValueError):
+        SyntheticLoadReport(**candidate)
+
+
+def test_failure_categories_are_snapshotted_and_immutable() -> None:
+    errors = {"TimeoutError": 1}
+    report = SyntheticLoadReport(
+        config=SyntheticLoadConfig(),
+        attempted_events=2,
+        evaluated_payments=1,
+        accepted_journey_events=0,
+        duplicate_events=0,
+        failed_events=1,
+        failure_types=errors,
+        elapsed_seconds=1.0,
+        event_latencies_ms=(1.0, 2.0),
+    )
+    errors["raw_customer_reference"] = 99
+    assert dict(report.failure_types) == {"TimeoutError": 1}
+    assert report.to_dict()["failure_types"] == {"TimeoutError": 1}
+    with pytest.raises(TypeError):
+        report.failure_types["OtherError"] = 1
+
+
+def test_nonfinite_observed_rate_is_not_serialized() -> None:
+    report = SyntheticLoadReport(
+        config=SyntheticLoadConfig(),
+        attempted_events=1,
+        evaluated_payments=1,
+        accepted_journey_events=0,
+        duplicate_events=0,
+        failed_events=0,
+        failure_types={},
+        elapsed_seconds=5e-324,
+        event_latencies_ms=(0.0,),
+    )
+    payload = report.to_dict()
+    assert payload["observed_events_per_second"] is None
+    assert payload["bank_kpi_approved"] is False
+    assert payload["enforcement_activated"] is False

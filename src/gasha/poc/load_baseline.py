@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
-from math import ceil
+from math import ceil, isfinite
 from statistics import fmean
 from time import perf_counter_ns
+from types import MappingProxyType
 
 from gasha.domain.models import DecisionAction, DecisionPolicy
 from gasha.ingestion.reference import ReferenceJsonAdapter
@@ -48,14 +49,74 @@ class SyntheticLoadReport:
     accepted_journey_events: int
     duplicate_events: int
     failed_events: int
-    failure_types: dict[str, int]
+    failure_types: Mapping[str, int]
     elapsed_seconds: float
     event_latencies_ms: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        """Require one consistent, non-identifying measured event population.
+
+        This guards a locally constructed report against contradictory counts,
+        non-finite timestamps and unsafe failure labels. It is not bank provenance.
+        """
+        if type(self.config) is not SyntheticLoadConfig:
+            raise ValueError("config must be a SyntheticLoadConfig")
+        for name in (
+            "attempted_events",
+            "evaluated_payments",
+            "accepted_journey_events",
+            "duplicate_events",
+            "failed_events",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        if (
+            self.evaluated_payments
+            + self.accepted_journey_events
+            + self.duplicate_events
+            + self.failed_events
+            != self.attempted_events
+        ):
+            raise ValueError("outcome counts must reconcile with attempted events")
+        if type(self.failure_types) is not dict:
+            raise ValueError("failure_types must be a dictionary")
+        for name, count in self.failure_types.items():
+            if (
+                type(name) is not str
+                or not name.isascii()
+                or not name.isidentifier()
+                or len(name) > 80
+                or type(count) is not int
+                or count <= 0
+            ):
+                raise ValueError("failure_types require safe exception names and positive counts")
+        if sum(self.failure_types.values()) != self.failed_events:
+            raise ValueError("failure types must reconcile with failed events")
+        if (
+            type(self.elapsed_seconds) not in (int, float)
+            or not isfinite(self.elapsed_seconds)
+            or self.elapsed_seconds < 0
+        ):
+            raise ValueError("elapsed_seconds must be finite and nonnegative")
+        if type(self.event_latencies_ms) is not tuple:
+            raise ValueError("event_latencies_ms must be an immutable tuple")
+        if len(self.event_latencies_ms) != self.attempted_events:
+            raise ValueError("latency sample count must equal attempted events")
+        if any(
+            type(value) not in (int, float) or not isfinite(value) or value < 0
+            for value in self.event_latencies_ms
+        ):
+            raise ValueError("latency samples must be finite and nonnegative")
+        object.__setattr__(self, "failure_types", MappingProxyType(dict(self.failure_types)))
 
     def to_dict(self) -> dict[str, object]:
         sorted_ms = sorted(self.event_latencies_ms)
         count = len(sorted_ms)
         elapsed = self.elapsed_seconds
+        observed_rate = self.attempted_events / elapsed if elapsed > 0 else None
+        if observed_rate is not None and not isfinite(observed_rate):
+            observed_rate = None
         return {
             "schema_version": "gasha-synthetic-load-1",
             "source": "synthetic_only",
@@ -73,7 +134,7 @@ class SyntheticLoadReport:
             "failed_events": self.failed_events,
             "failure_types": dict(sorted(self.failure_types.items())),
             "elapsed_seconds": elapsed,
-            "observed_events_per_second": self.attempted_events / elapsed if elapsed > 0 else None,
+            "observed_events_per_second": observed_rate,
             "latency_ms": {
                 "sample_count": count,
                 "mean": fmean(sorted_ms) if count else None,
