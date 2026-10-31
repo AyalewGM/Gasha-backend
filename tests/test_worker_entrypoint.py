@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import pytest
 
@@ -174,6 +175,35 @@ def test_durable_worker_preserves_valid_explicit_scope(
         assert store._tenant_ids == tuple(scope)
     with pytest.raises(PermissionError, match="outside authorized"):
         ingestion.get("tenant-outside", uuid4())
+
+
+@pytest.mark.parametrize(
+    "lease_ttl_s",
+    [0.0, -1.0, -0.0, float("nan"), float("inf"), -float("inf"), 1e-12, 1e100],
+)
+@pytest.mark.parametrize("durable", [False, True])
+def test_worker_rejects_invalid_lease_before_opening_database(
+    lease_ttl_s: float, durable: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zero/negative/ineffective lease silently stalls evaluation and recovery."""
+    monkeypatch.setattr(
+        "gasha.worker._postgres_connection",
+        lambda dsn: pytest.fail("connected with an invalid pending lease"),
+    )
+    settings = WorkerSettings(
+        lease_ttl_s=lease_ttl_s,
+        postgres_dsn="postgresql://example/db" if durable else None,
+        tenant_ids=["tenant-a"] if durable else None,
+    )
+    with pytest.raises(ValueError, match="GASHA_LEASE_TTL_S"):
+        build_stores(settings)
+
+
+@pytest.mark.parametrize("lease_ttl_s", [1e-6, 0.001, 300.0])
+def test_worker_preserves_effective_positive_lease(lease_ttl_s: float) -> None:
+    _, _, _, _, pending, _ = build_stores(WorkerSettings(lease_ttl_s=lease_ttl_s))
+    assert isinstance(pending, InMemoryPendingEvaluationStore)
+    assert pending._lease_ttl == timedelta(seconds=lease_ttl_s)
 
 
 class _FakeError:
