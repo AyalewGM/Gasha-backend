@@ -51,6 +51,11 @@ atomic outcome-and-terminal-audit persistence adapter is independently accepted:
   the exact tenant/event, carry signal source and signal version, an immutable
   serialized policy/signal snapshot and SHA-256 context reference, plus a
   provider-declared collection/expiry window checked against service time.
+  The reference now binds both timestamps as canonical UTC instants: a
+  collection/expiry claim change produces a different reference even if the
+  event, policy and signals are identical. This closes an internal lineage
+  ambiguity but **does not** authenticate or attest the provider's timestamps,
+  satisfy historical point-in-time feature validation, or authorize bank evidence.
   Provider trust/attestation and actual bank signal ingestion remain separate
   integration controls.
 - The legacy `outcome_ingestion` field is deliberately ignored by protected
