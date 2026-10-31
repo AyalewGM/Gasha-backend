@@ -7,9 +7,11 @@ bank role grants and evidence provenance are NOT established by this module.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from hashlib import sha256
 from json import dumps
+from re import fullmatch
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -76,6 +78,21 @@ def _deserialize(payload: Any) -> CaseEvent:
             "idempotency_ref", "command_ref", "bank_execution",
         }:
             raise CaseRejected("stored event schema mismatch")
+        if (
+            any(type(payload[key]) is not str for key in (
+                "tenant_id", "case_id", "source_event_id", "source_context_ref",
+                "operation", "actor_ref", "recorded_at", "reason_code",
+                "idempotency_ref", "command_ref", "bank_execution",
+            ))
+            or type(payload["revision"]) is not int
+            or (payload["previous_revision"] is not None
+                and type(payload["previous_revision"]) is not int)
+            or (payload["disposition"] is not None
+                and type(payload["disposition"]) is not str)
+            or (payload["assignee_ref"] is not None
+                and type(payload["assignee_ref"]) is not str)
+        ):
+            raise CaseRejected("stored case event field type mismatch")
         return CaseEvent(
             tenant_id=payload["tenant_id"],
             case_id=UUID(payload["case_id"]),
@@ -96,6 +113,105 @@ def _deserialize(payload: Any) -> CaseEvent:
         )
     except (TypeError, ValueError, KeyError, OverflowError) as exc:
         raise CaseRejected("invalid stored case history") from exc
+
+
+_HISTORY_SQL = (
+    "SELECT tenant_id, case_id, revision, previous_revision, "
+    "source_event_id, source_context_ref, actor_ref, occurred_at, "
+    "idempotency_ref, command_ref, event_json, bank_execution "
+    "FROM analyst_case_events WHERE tenant_id = %s AND case_id = %s "
+    "ORDER BY revision"
+)
+_PREVIOUS: dict[CaseOperation, frozenset[CaseOperation | None]] = {
+    CaseOperation.CREATE: frozenset({None}),
+    CaseOperation.TRIAGE: frozenset({CaseOperation.CREATE}),
+    CaseOperation.ASSIGN: frozenset({CaseOperation.TRIAGE}),
+    CaseOperation.DISPOSE: frozenset({CaseOperation.ASSIGN}),
+    CaseOperation.CORRECT: frozenset({CaseOperation.DISPOSE, CaseOperation.CORRECT}),
+    CaseOperation.RECONCILE: frozenset({CaseOperation.DISPOSE, CaseOperation.CORRECT}),
+}
+_REASON: dict[CaseOperation, CaseReason] = {
+    CaseOperation.CREATE: CaseReason.SOURCE_EVALUATION,
+    CaseOperation.TRIAGE: CaseReason.ANALYST_TRIAGE,
+    CaseOperation.ASSIGN: CaseReason.INVESTIGATION_ASSIGNED,
+    CaseOperation.CORRECT: CaseReason.CORRECTED_FINDING,
+    CaseOperation.RECONCILE: CaseReason.FEEDBACK_RECONCILED,
+}
+_DISPOSITION_REASON: dict[CaseDisposition, CaseReason] = {
+    CaseDisposition.FRAUD: CaseReason.FRAUD_EVIDENCE,
+    CaseDisposition.LEGITIMATE: CaseReason.LEGITIMATE_EVIDENCE,
+    CaseDisposition.UNRESOLVED: CaseReason.NEEDS_REVIEW,
+}
+
+
+def _verified_history(
+    rows: list[Mapping[str, object]], *, tenant_id: str, case_id: UUID,
+) -> tuple[CaseEvent, ...]:
+    """Fail closed on corrupt metadata, JSON, revision or source lineage.
+
+    This local consistency check does not attest bank origin or DB tamper-proofing.
+    """
+    history: list[CaseEvent] = []
+    for row in rows:
+        event = _deserialize(row["event_json"])
+        revision = len(history) + 1
+        previous = history[-1] if history else None
+        if (
+            event.tenant_id != tenant_id
+            or event.case_id != case_id
+            or row["tenant_id"] != event.tenant_id
+            or row["case_id"] != event.case_id
+            or event.revision != revision
+            or row["revision"] != revision
+            or event.previous_revision != (revision - 1 if previous else None)
+            or row["previous_revision"] != event.previous_revision
+            or row["source_event_id"] != event.source_event_id
+            or row["source_context_ref"] != event.source_context_ref
+            or row["actor_ref"] != event.actor_ref
+            or row["occurred_at"] != event.recorded_at
+            or row["idempotency_ref"] != event.idempotency_ref
+            or row["command_ref"] != event.command_ref
+            or row["bank_execution"] != BankExecution.UNKNOWN.value
+            or event.bank_execution is not BankExecution.UNKNOWN
+            or event.recorded_at.utcoffset() is None
+            or any(fullmatch(r"[0-9a-f]{64}", field) is None for field in (
+                event.source_context_ref, event.actor_ref,
+                event.idempotency_ref, event.command_ref,
+            ))
+            or (event.assignee_ref is not None
+                and fullmatch(r"[0-9a-f]{64}", event.assignee_ref) is None)
+            or (previous and (
+                event.source_event_id != previous.source_event_id
+                or event.source_context_ref != previous.source_context_ref
+                or event.recorded_at < previous.recorded_at
+            ))
+            or (previous.operation if previous else None)
+            not in _PREVIOUS[event.operation]
+        ):
+            raise CaseRejected("stored case history/row integrity mismatch")
+        if event.operation is CaseOperation.DISPOSE:
+            if (event.disposition is None
+                    or event.reason_code is not _DISPOSITION_REASON[event.disposition]):
+                raise CaseRejected("stored disposition/reason mismatch")
+        elif event.reason_code is not _REASON[event.operation]:
+            raise CaseRejected("stored transition reason mismatch")
+        if (event.operation in {CaseOperation.DISPOSE, CaseOperation.CORRECT}
+                and event.disposition is None):
+            raise CaseRejected("stored disposition missing")
+        if (event.operation not in {CaseOperation.DISPOSE, CaseOperation.CORRECT}
+                and event.disposition is not None):
+            raise CaseRejected("stored disposition on wrong operation")
+        if (event.assignee_ref is None) == (event.operation is CaseOperation.ASSIGN):
+            raise CaseRejected("stored assignee/operation mismatch")
+        if event.operation is CaseOperation.CORRECT:
+            last = next(
+                (e.disposition for e in reversed(history) if e.disposition is not None),
+                None,
+            )
+            if event.disposition is last:
+                raise CaseRejected("stored correction did not change disposition")
+        history.append(event)
+    return tuple(history)
 
 
 class PostgresCaseTimelineService:
@@ -128,15 +244,14 @@ class PostgresCaseTimelineService:
         try:
             with self._connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT event_json FROM analyst_case_events "
-                    "WHERE tenant_id = %s AND case_id = %s ORDER BY revision",
+                    _HISTORY_SQL,
                     (tenant_id, case_id),
                 )
                 rows = cursor.fetchall()
         finally:
             # Terminate the read transaction even after SQL failure.
             self._connection.rollback()
-        return tuple(_deserialize(row["event_json"]) for row in rows)
+        return _verified_history(rows, tenant_id=tenant_id, case_id=case_id)
 
     def apply(
         self, command: CaseCommand, *, principal: TrustedPrincipal,
@@ -172,12 +287,12 @@ class PostgresCaseTimelineService:
                     ),),
                 )
                 cursor.execute(
-                    "SELECT event_json FROM analyst_case_events "
-                    "WHERE tenant_id = %s AND case_id = %s ORDER BY revision",
+                    _HISTORY_SQL,
                     (command.tenant_id, command.case_id),
                 )
-                history = tuple(
-                    _deserialize(row["event_json"]) for row in cursor.fetchall()
+                history = _verified_history(
+                    cursor.fetchall(), tenant_id=command.tenant_id,
+                    case_id=command.case_id,
                 )
                 proposed, event = advance_case(
                     history, command, principal=principal, source=source, at=at,
