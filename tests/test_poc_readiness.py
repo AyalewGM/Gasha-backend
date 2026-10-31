@@ -86,8 +86,8 @@ def test_tenant_identity_required() -> None:
 @pytest.mark.parametrize(
     "tenant_id",
     [
-        "", " ", "\\t", "\\n", " leading", "trailing ", "embedded\\nnewline",
-        "nul\\x00injection", "zero\\u200bwidth", "bidi\\u202ereversal",
+        "", " ", "\t", "\n", " leading", "trailing ", "embedded\nnewline",
+        "nul\x00injection", "zero\u200bwidth", "bidi\u202ereversal",
     ],
 )
 def test_tenant_identity_must_be_canonical_printable_text(
