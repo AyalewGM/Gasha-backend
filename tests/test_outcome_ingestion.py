@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
-from gasha.api.main import app
+from gasha.api.synthetic import app
 from gasha.ingestion.outcome_ingestion import (
     IncumbentOutcomeRecord,
     OutcomeIngestionService,

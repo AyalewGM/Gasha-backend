@@ -19,6 +19,61 @@ jobs:
       - run: mypy src
       - run: pytest -q
 
+
+  protected-api-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e ".[dev]"
+      - name: Execute installed protected FastAPI negative matrix
+        run: |
+          mkdir -p test-results
+          python -m pytest -vv -rA --junitxml=test-results/protected-api.xml \
+            tests/test_api_security.py \
+            tests/test_security_access.py \
+            tests/test_audit_actor_identity.py
+      - name: Require executed negative tests without skipped cases
+        if: always()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from xml.etree import ElementTree
+          p = Path("test-results/protected-api.xml")
+          assert p.is_file(), "Protected API evidence missing"
+          root = ElementTree.parse(p).getroot()
+          cases = list(root.iter("testcase"))
+          bad = list(root.iter("failure")) + list(root.iter("error"))
+          skipped = list(root.iter("skipped"))
+          names = " ".join(c.attrib.get("name", "") for c in cases)
+          required = (
+              "identity_and_role_denied",
+              "cross_tenant_denial",
+              "missing_context_or_audit_fails_closed",
+              "root_path_tenant_role_and_body_spoofing",
+              "root_path_concurrent_outcome_attempts_never_mutate",
+              "audit_actor_distinguishes_delimiter_shifted_identities",
+          )
+          assert len(cases) >= 25, f"Too few protected API tests: {len(cases)}"
+          assert not skipped and not bad, (len(skipped), len(bad))
+          assert all(n in names for n in required), "Required security regressions missing"
+          print(f"Protected API evidence: {len(cases)} passed; zero skips/failures")
+          PY
+      - name: Preserve protected API test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protected-api-evidence
+          path: test-results/protected-api.xml
+          if-no-files-found: error
+
   docker:
     runs-on: ubuntu-latest
     steps:
@@ -28,9 +83,14 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: gasha-backend:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Assert bank image excludes synthetic entrypoint
+        run: |
+          docker run --rm gasha-backend:ci python -c 'from importlib.util import find_spec; assert find_spec("gasha.api.synthetic") is None, "synthetic app present in bank image"'
+          docker run --rm gasha-backend:ci python -c 'from gasha.api.main import app; assert app.state.identity_verifier is None; assert app.state.security_audit is None'
 
   postgres-integration:
     runs-on: ubuntu-latest

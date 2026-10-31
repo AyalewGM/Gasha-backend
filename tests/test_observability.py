@@ -9,7 +9,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from gasha.api.main import app
+from gasha.api.synthetic import app
 from gasha.domain.models import (
     BeneficiaryType,
     CanonicalTransaction,
