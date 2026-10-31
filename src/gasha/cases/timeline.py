@@ -173,6 +173,8 @@ def _check_command(command: CaseCommand) -> None:
     elif command.disposition is not None:
         raise CaseRejected("disposition allowed only for disposition/correction")
     if command.operation is CaseOperation.DISPOSE:
+        if not isinstance(command.disposition, CaseDisposition):
+            raise CaseRejected("typed disposition required")
         required_reason = {
             CaseDisposition.FRAUD: CaseReason.FRAUD_EVIDENCE,
             CaseDisposition.LEGITIMATE: CaseReason.LEGITIMATE_EVIDENCE,
