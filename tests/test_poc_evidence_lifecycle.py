@@ -7,7 +7,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from gasha.poc.evidence_identity import EvidenceBinding, EvidencePacket, EvidenceRecord
+from gasha.poc.evidence_identity import (
+    EvidenceBinding, EvidenceIdentityRejected, EvidencePacket, EvidenceRecord,
+)
 from gasha.poc.evidence_lifecycle import (
     EvidenceAction,
     EvidenceLifecycle,
@@ -444,3 +446,40 @@ def test_failed_verification_reader_does_not_append_event() -> None:
             )
         assert reader.calls == 1
         assert len(lifecycle.events) == 2
+
+
+def test_replay_rejects_forged_submission_outside_collection_and_expiry() -> None:
+    """Durable/untrusted histories must obey the proposal's original clock gate."""
+    item = packet()
+    record = item.records[0]
+    for event_time in (
+        record.collected_at - timedelta(microseconds=1),
+        record.expires_at,
+    ):
+        forged = EvidenceTransition(
+            action=EvidenceAction.SUBMIT,
+            actor_ref=COLLECTOR.audit_actor,
+            at=event_time,
+            packet_digest=item.packet_digest(),
+            evidence_id=record.evidence_id,
+        )
+        with pytest.raises(EvidenceIdentityRejected, match="future-dated|expired"):
+            EvidenceLifecycle(item, (forged,))
+
+
+def test_replay_submission_must_follow_all_packet_collections() -> None:
+    """A signed-looking complete packet cannot preexist a later-collected record."""
+    original = packet()
+    later = replace(original.records[1], collected_at=NOW - timedelta(minutes=5))
+    item = EvidencePacket(original.binding, original.evaluator_version,
+                          (original.records[0], later))
+    event = EvidenceTransition(
+        action=EvidenceAction.SUBMIT,
+        actor_ref=COLLECTOR.audit_actor,
+        at=NOW - timedelta(minutes=20),
+        packet_digest=item.packet_digest(),
+        evidence_id=original.records[0].evidence_id,
+    )
+    with pytest.raises(EvidenceIdentityRejected, match="future-dated"):
+        EvidenceLifecycle(item, (event,))
+    assert len(EvidenceLifecycle(item, (replace(event, at=later.collected_at),)).events) == 1
