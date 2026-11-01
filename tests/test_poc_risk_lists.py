@@ -8,10 +8,10 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from gasha.poc.risk_lists import (
+    MatchedRiskListEntry,
     RiskListEntry,
     RiskListKind,
     RiskListMatch,
-    MatchedRiskListEntry,
     RiskListRejected,
     RiskListSnapshot,
     RiskListSubject,
