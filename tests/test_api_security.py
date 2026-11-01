@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -778,6 +779,109 @@ def test_context_digest_binds_signal_validity_window() -> None:
     assert baseline.context_ref != context(
         collected_at, expires_at + timedelta(seconds=1)
     ).context_ref
+
+
+
+
+def _dst_decision_context(
+    collected_at: datetime, expires_at: datetime, *, event_id: UUID | None = None,
+) -> TrustedDecisionContext:
+    """Synthetic context with caller-controlled clock for validation testing."""
+    return TrustedDecisionContext(
+        tenant_id="tenant-a", event_id=event_id or uuid4(),
+        policy=DecisionPolicy(
+            configuration_version="synthetic-config",
+            policy_version="synthetic-policy",
+            rule_version="synthetic-rules",
+        ),
+        intelligence=IntelligenceSnapshot(network_risk=0.93),
+        signal_source_version="synthetic-source",
+        signal_version="synthetic-signal",
+        collected_at=collected_at, expires_at=expires_at,
+    )
+
+
+@pytest.mark.parametrize(
+    ("collected_minute", "collected_fold", "expiry_minute", "expiry_fold", "valid"),
+    [
+        (15, 1, 30, 0, False),  # 06:15 UTC collection; 05:30 UTC expiry.
+        (30, 0, 15, 1, True),   # 05:30 UTC collection; 06:15 UTC expiry.
+    ],
+)
+def test_context_window_uses_absolute_utc_across_dst(
+    collected_minute: int, collected_fold: int,
+    expiry_minute: int, expiry_fold: int, valid: bool,
+) -> None:
+    zone = ZoneInfo("America/New_York")
+    collected = datetime(2026, 11, 1, 1, collected_minute, tzinfo=zone, fold=collected_fold)
+    expires = datetime(2026, 11, 1, 1, expiry_minute, tzinfo=zone, fold=expiry_fold)
+    event_id = uuid4()
+    if not valid:
+        with pytest.raises(ValueError, match="trusted event-bound decision provenance"):
+            _dst_decision_context(collected, expires, event_id=event_id)
+        return
+    context = _dst_decision_context(collected, expires, event_id=event_id)
+    canonical = _dst_decision_context(
+        collected.astimezone(UTC), expires.astimezone(UTC), event_id=event_id,
+    )
+    assert context.context_ref == canonical.context_ref
+    assert context.collected_at.astimezone(UTC) < context.expires_at.astimezone(UTC)
+
+
+def test_context_window_rejects_equal_instant_with_other_timezone() -> None:
+    collected = datetime(2026, 11, 1, 1, 15, tzinfo=ZoneInfo("America/New_York"), fold=1)
+    same_instant = collected.astimezone(timezone(timedelta(hours=3)))
+    with pytest.raises(ValueError, match="trusted event-bound decision provenance"):
+        _dst_decision_context(collected, same_instant)
+
+
+@pytest.mark.parametrize("naive_field", ["collected_at", "expires_at"])
+def test_context_window_rejects_naive_clocks(naive_field: str) -> None:
+    collected = datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
+    expires = datetime(2026, 11, 1, 6, 15, tzinfo=UTC)
+    if naive_field == "collected_at":
+        collected = collected.replace(tzinfo=None)
+    else:
+        expires = expires.replace(tzinfo=None)
+    with pytest.raises(ValueError, match="trusted event-bound decision provenance"):
+        _dst_decision_context(collected, expires)
+
+
+@pytest.mark.parametrize("path", ["/v1/decisions", "/v1/evaluations"])
+@pytest.mark.parametrize("root_path", ["", "/bank"])
+def test_protected_api_fails_closed_for_invalid_dst_context_window(
+    wired, path: str, root_path: str,
+) -> None:
+    _, audit, store = wired
+    zone = ZoneInfo("America/New_York")
+
+    class InvalidContextProvider:
+        def resolve(self, transaction, principal):
+            return _dst_decision_context(
+                datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=1),
+                datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=0),
+                event_id=transaction.event_id,
+            )
+
+    app.state.decision_context_provider = InvalidContextProvider()
+    payload = tx()
+    response = TestClient(app, root_path=root_path).post(
+        f"{root_path}{path}", json={"transaction": payload}, headers=headers(),
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] in {"decision unavailable", "evaluation unavailable"}
+    assert "X-Gasha-Context-Ref" not in response.headers
+    auth = [event for event in audit.events if event.action == "authenticate"]
+    actions = [
+        event for event in audit.events
+        if event.action == Capability.DECISION_SUBMIT.value
+    ]
+    assert len(auth) == 1 and auth[0].result == "verified"
+    assert [event.result for event in actions] == ["authorized", "failed"]
+    assert actions[0].attempt_ref == actions[1].attempt_ref
+    assert actions[1].context_ref == ""
+    assert not any(event.result == "succeeded" for event in audit.events)
+    assert store.store.outcomes("tenant-a", UUID(str(payload["event_id"]))) == ()
 
 
 
