@@ -99,7 +99,7 @@ class SignalLineage:
 class HistoricalFeatureEnvelope:
     """Dataset and event-bound feature lineage, with an explicit decision cutoff.
 
-    \`\`decision_cutoff\`\` is a bank/dataset-specific supplied clock, NOT replay
+    ``decision_cutoff`` is a bank/dataset-specific supplied clock, NOT replay
     execution time. Its authenticity is not established by this component.
     """
 
