@@ -285,3 +285,39 @@ def test_dependency_override_cannot_upgrade_case_read_role(wired_case_history):
     finally:
         app.dependency_overrides.clear()
         app.dependency_overrides.update(saved)
+
+
+def test_case_history_multiple_transitions_are_immutable_and_nonexecuting(
+    wired_case_history,
+):
+    client, _, reader = wired_case_history
+    first = synthetic_event()
+    second = replace(
+        first, revision=2, previous_revision=1, operation=CaseOperation.TRIAGE,
+        reason_code=CaseReason.ANALYST_TRIAGE,
+        recorded_at=first.recorded_at + timedelta(seconds=1),
+    )
+    reader.events = (first, second)
+    response = client.get(path(), headers=token())
+    assert response.status_code == 200
+    events = response.json()["events"]
+    assert [e["revision"] for e in events] == [1, 2]
+    assert [e["previous_revision"] for e in events] == [None, 1]
+    assert all(e["bank_execution"] == "unknown" for e in events)
+    assert response.json()["enforcement_activated"] is False
+
+
+def test_boolean_previous_revision_is_rejected_without_read_disclosure(wired_case_history):
+    client, audit, reader = wired_case_history
+    first = synthetic_event()
+    corrupted = replace(
+        first, revision=2, previous_revision=True, operation=CaseOperation.TRIAGE,
+        reason_code=CaseReason.ANALYST_TRIAGE,
+        recorded_at=first.recorded_at + timedelta(seconds=1),
+    )
+    reader.events = (first, corrupted)
+    response = client.get(path(), headers=token())
+    assert response.status_code == 503
+    assert response.json() == {"detail": "case history unavailable"}
+    assert any(e.result == "failed" and e.reason == "case_history_unavailable"
+               for e in audit.events)
