@@ -25,6 +25,10 @@ class Capability(StrEnum):
     EVIDENCE_VERIFY = "evidence.verify"
     EVIDENCE_APPROVE = "evidence.approve"
     EVIDENCE_REVOKE = "evidence.revoke"
+    # Bank authority-plane capabilities are separate from legacy API labels.
+    EVIDENCE_SUBMIT = "evidence.submit"
+    STAGE_APPROVE = "stage.approve"
+    APPROVAL_REVOKE = "approval.revoke"
     CASE_READ = "case.read"
     CASE_CREATE = "case.create"
     CASE_TRIAGE = "case.triage"
