@@ -276,28 +276,45 @@ def scoped_roles():
 
     suffix = uuid4().hex[:12]
     installs = (
-        ("gasha_role_a_" + suffix, "gasha_aw_" + suffix, "gasha_ar_" + suffix),
-        ("gasha_role_b_" + suffix, "gasha_bw_" + suffix, "gasha_br_" + suffix),
+        ("gasha_role_a_" + suffix, "gasha_aw_" + suffix,
+         "gasha_ar_" + suffix, "gasha_am_" + suffix),
+        ("gasha_role_b_" + suffix, "gasha_bw_" + suffix,
+         "gasha_br_" + suffix, "gasha_bm_" + suffix),
     )
     with psycopg.connect(DSN, autocommit=True) as admin:
         try:
-            for schema_name, writer, reader in installs:
-                admin.execute(
-                    sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
-                )
-                for role_name in (writer, reader):
+            for schema_name, writer, reader, migrator_role in installs:
+                # Distinct login identities: schema owner/migrator, runtime
+                # writer, and read-only reader; no runtime role owns DDL.
+                for role_name in (migrator_role, writer, reader):
                     admin.execute(
                         sql.SQL(
                             "CREATE ROLE {} LOGIN PASSWORD {} NOSUPERUSER "
                             "NOCREATEDB NOCREATEROLE NOINHERIT"
-                        ).format(sql.Identifier(role_name), sql.Literal("synthetic_ci_role_only"))
+                        ).format(
+                            sql.Identifier(role_name), sql.Literal("synthetic_ci_role_only"),
+                        )
                     )
-                with connect(schema_name) as migrator:
+                admin.execute(
+                    sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(
+                        sql.Identifier(schema_name), sql.Identifier(migrator_role),
+                    )
+                )
+                with restricted_connect(migrator_role) as migrator:
+                    assert migrator.execute(
+                        "SELECT current_user AS who"
+                    ).fetchone()["who"] == migrator_role
+                    migrator.execute(
+                        sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+                    )
                     for filename in (
                         "010_security_audit_events.sql",
                         "012_poc_evidence_proposal_ledger.sql",
                     ):
                         migrator.execute((MIGRATIONS / filename).read_text())
+                    migrator.execute(
+                        "CREATE TABLE private_installation_control (id INTEGER NOT NULL)"
+                    )
                     migrator.commit()
                 admin.execute(
                     sql.SQL("REVOKE ALL ON SCHEMA {} FROM PUBLIC").format(
@@ -335,14 +352,14 @@ def scoped_roles():
                 )
             yield installs
         finally:
-            for schema_name, _, _ in installs:
+            for schema_name, _, _, _ in installs:
                 admin.execute(
                     sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
                         sql.Identifier(schema_name)
                     )
                 )
-            for _, writer, reader in installs:
-                for role_name in (writer, reader):
+            for _, writer, reader, migrator_role in installs:
+                for role_name in (writer, reader, migrator_role):
                     admin.execute(
                         sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role_name))
                     )
@@ -369,10 +386,18 @@ def assert_sql_denied(connection, statement: str) -> None:
 
 
 def test_restricted_role_lifecycle_and_reader_isolation(scoped_roles):
-    (schema_a, writer_a, reader_a), (schema_b, writer_b, _) = scoped_roles
+    (schema_a, writer_a, reader_a, migrator_a), (schema_b, writer_b, _, _) = scoped_roles
     item = packet()
     with restricted_connect(writer_a) as connection:
         assert connection.execute("SELECT current_user").fetchone()["current_user"] == writer_a
+        attributes = connection.execute(
+            "SELECT rolsuper, rolcreatedb, rolcreaterole FROM pg_roles "
+            "WHERE rolname = current_user"
+        ).fetchone()
+        assert attributes == {
+            "rolsuper": False, "rolcreatedb": False, "rolcreaterole": False,
+        }
+        assert_sql_denied(connection, f'SET ROLE "{migrator_a}"')
         runtime = make_ledger(connection, schema_a)
         for revision, (actor, action) in enumerate((
             (COLLECTOR, EvidenceAction.SUBMIT),
@@ -427,7 +452,7 @@ def test_restricted_role_lifecycle_and_reader_isolation(scoped_roles):
 
 
 def test_restricted_writer_cannot_mutate_schema_or_triggers(scoped_roles):
-    (schema_a, writer_a, _), _ = scoped_roles
+    (schema_a, writer_a, _, migrator_a), _ = scoped_roles
     item = packet()
     with restricted_connect(writer_a) as connection:
         record(make_ledger(connection, schema_a), item, COLLECTOR, EvidenceAction.SUBMIT, 0)
@@ -445,6 +470,9 @@ def test_restricted_writer_cannot_mutate_schema_or_triggers(scoped_roles):
         for command in (
             f'CREATE TABLE "{schema_a}".forged_evidence (id int)',
             f'DROP FUNCTION "{schema_a}".reject_poc_evidence_mutation()',
+            f'INSERT INTO "{schema_a}".private_installation_control (id) VALUES (1)',
+            f'SELECT * FROM "{schema_a}".private_installation_control',
+            f'SET ROLE "{migrator_a}"',
             (f'CREATE OR REPLACE FUNCTION "{schema_a}".reject_poc_evidence_mutation() '
              "RETURNS trigger LANGUAGE plpgsql AS $body$BEGIN RETURN NEW; END;$body$"),
         ):
@@ -454,7 +482,7 @@ def test_restricted_writer_cannot_mutate_schema_or_triggers(scoped_roles):
 
 
 def test_restricted_runtime_search_path_and_temp_shadows_do_not_redirect(scoped_roles):
-    (schema_a, writer_a, _), _ = scoped_roles
+    (schema_a, writer_a, _, _), _ = scoped_roles
     with restricted_connect(writer_a) as connection:
         connection.execute("CREATE TEMP TABLE poc_evidence_packets (forged int)")
         connection.execute("CREATE TEMP TABLE poc_evidence_events (forged int)")
@@ -477,7 +505,7 @@ def test_restricted_runtime_search_path_and_temp_shadows_do_not_redirect(scoped_
 
 
 def test_restricted_role_two_writer_revision_race(scoped_roles):
-    (schema_a, writer_a, _), _ = scoped_roles
+    (schema_a, writer_a, _, _), _ = scoped_roles
     item = packet()
     with restricted_connect(writer_a) as connection:
         record(make_ledger(connection, schema_a), item, COLLECTOR, EvidenceAction.SUBMIT, 0)
@@ -501,7 +529,7 @@ def test_restricted_role_two_writer_revision_race(scoped_roles):
 
 
 def test_restricted_role_audit_failure_rolls_back_packet_and_event(scoped_roles):
-    (schema_a, writer_a, _), _ = scoped_roles
+    (schema_a, writer_a, _, _), _ = scoped_roles
     import psycopg
     from psycopg import sql
 
