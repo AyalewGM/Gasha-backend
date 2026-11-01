@@ -564,7 +564,10 @@ def test_restricted_role_audit_failure_rolls_back_packet_and_event(scoped_roles)
         assert counts(admin) == (1, 1, 1)
 
 
-def test_migrator_clock_tamper_in_stored_submit_fails_canonical_replay(schema) -> None:
+@pytest.mark.parametrize("forged_clock", ("before_collection", "at_expiry"))
+def test_migrator_clock_tamper_in_stored_submit_fails_canonical_replay(
+    schema, forged_clock: str,
+) -> None:
     """A consistently re-timestamped SQL/JSON event is still invalid evidence.
 
     The synthetic migrator can bypass immutability triggers for this negative
@@ -575,7 +578,10 @@ def test_migrator_clock_tamper_in_stored_submit_fails_canonical_replay(schema) -
         ledger = make_ledger(connection, schema)
         record(ledger, item, COLLECTOR, EvidenceAction.SUBMIT, 0)
         before = counts(connection)
-        forged_at = item.records[0].collected_at - timedelta(microseconds=1)
+        if forged_clock == "before_collection":
+            forged_at = item.records[0].collected_at - timedelta(microseconds=1)
+        else:
+            forged_at = item.records[0].expires_at
         connection.execute(
             "ALTER TABLE poc_evidence_events DISABLE TRIGGER poc_evidence_event_immutable"
         )

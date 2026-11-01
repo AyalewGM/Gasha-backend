@@ -38,6 +38,7 @@ jobs:
           mkdir -p test-results
           python -m pytest -vv -rA --junitxml=test-results/protected-api.xml \
             tests/test_api_security.py \
+            tests/test_api_case_history.py \
             tests/test_security_access.py \
             tests/test_audit_actor_identity.py
       - name: Require executed negative tests without skipped cases
@@ -55,6 +56,12 @@ jobs:
           names = " ".join(c.attrib.get("name", "") for c in cases)
           required = (
               "identity_and_role_denied",
+              "denied_credentials_and_capability_do_not_read",
+              "cross_tenant_and_spoofed_proxy_claims_cannot_read",
+              "audit_outage_prevents_case_reader_access",
+              "untrusted_reader_payload_fails_closed",
+              "invalid_initial_case_lifecycle_is_denied",
+              "invalid_subsequent_case_lifecycle_is_denied",
               "cross_tenant_denial",
               "missing_context_or_audit_fails_closed",
               "root_path_tenant_role_and_body_spoofing",
