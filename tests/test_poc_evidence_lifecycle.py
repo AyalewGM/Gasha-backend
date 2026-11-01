@@ -266,7 +266,7 @@ def test_tampered_approval_without_verify_is_rejected() -> None:
 
 def test_revocation_requires_authorized_tenant_and_capability() -> None:
     lifecycle = approved()
-    for principal in (actor("tenant-else", Capability.EVIDENCE_REVOKE, tenant="bank-b"),
+    for principal in (actor("tenant-else", Capability.APPROVAL_REVOKE, tenant="bank-b"),
                       actor("wrong-cap", Capability.STAGE_APPROVE)):
         with pytest.raises(LifecycleRejected, match="denied"):
             apply(lifecycle, EvidenceAction.REVOKE_APPROVAL, principal)
