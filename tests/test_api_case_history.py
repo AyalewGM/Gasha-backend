@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from fastapi.testclient import TestClient
 
-from gasha.api.main import app
+from gasha.api.main import app, get_principal
 from gasha.cases.timeline import (
     BankExecution,
     CaseEvent,
@@ -247,3 +247,41 @@ def test_ingress_auth_precedes_malformed_path_validation(wired_case_history):
     assert client.get(bad_path).status_code == 401
     assert reader.calls == []
     assert any(e.action == "authenticate" and e.result == "denied" for e in audit.events)
+
+
+@pytest.mark.parametrize(("root_path", "prefixed"), [
+    ("", False), ("/bank", False), ("/bank", True),
+    ("/gateway/bank", True),
+])
+def test_case_read_root_path_auth_and_tenant_scope(
+    wired_case_history, root_path: str, prefixed: bool,
+):
+    _, audit, reader = wired_case_history
+    client = TestClient(app, root_path=root_path)
+    prefix = root_path if prefixed else ""
+    url = f"{prefix}{path()}"
+    assert client.get(url, headers=token()).status_code == 200
+    assert client.get(url).status_code == 401
+    assert client.get(url, headers=token("no-read")).status_code == 403
+    assert client.get(
+        f"{prefix}{path(tenant='tenant-b')}",
+        headers={**token(), "X-Forwarded-Prefix": "/forged",
+                 "X-Role": "administrator", "X-Tenant-Id": "tenant-b"},
+    ).status_code == 404
+    assert reader.calls == [("tenant-a", CASE_ID)]
+    assert "tenant-b" not in str(audit.events)
+
+
+def test_dependency_override_cannot_upgrade_case_read_role(wired_case_history):
+    client, audit, reader = wired_case_history
+    saved = dict(app.dependency_overrides)
+    app.dependency_overrides[get_principal] = lambda: identity()
+    try:
+        assert client.get(path()).status_code == 401
+        assert client.get(path(), headers=token("no-read")).status_code == 403
+        assert reader.calls == []
+        assert any(e.action == Capability.CASE_READ.value and e.result == "denied"
+                   for e in audit.events)
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(saved)
