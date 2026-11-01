@@ -446,7 +446,7 @@ def test_restricted_writer_cannot_mutate_schema_or_triggers(scoped_roles):
             f'CREATE TABLE "{schema_a}".forged_evidence (id int)',
             f'DROP FUNCTION "{schema_a}".reject_poc_evidence_mutation()',
             (f'CREATE OR REPLACE FUNCTION "{schema_a}".reject_poc_evidence_mutation() '
-             "RETURNS trigger LANGUAGE plpgsql AS $BEGIN RETURN NEW; END;$"),
+             "RETURNS trigger LANGUAGE plpgsql AS $body$BEGIN RETURN NEW; END;$body$"),
         ):
             assert_sql_denied(connection, command)
     with connect(schema_a) as admin:
