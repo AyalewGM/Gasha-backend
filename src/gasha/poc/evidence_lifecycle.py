@@ -150,6 +150,9 @@ def _replay(lifecycle: EvidenceLifecycle) -> _State:
                 if event.evidence_id not in submitted or event.evidence_id in revoked:
                     raise LifecycleRejected("invalid evidence revocation")
                 revoked.add(event.evidence_id)
+                # Revoking any constituent evidence invalidates its packet approval.
+                if approved_by is not None:
+                    approval_revoked = True
         else:
             if event.evidence_id is not None:
                 raise LifecycleRejected("approval action cannot reference one evidence record")
