@@ -236,7 +236,7 @@ def test_changed_packet_cannot_reuse_another_scope_or_revision(schema):
         changed_binding = replace(item.binding, policy_version="policy-v2")
         changed_record = replace(item.records[0], binding=changed_binding)
         changed = EvidencePacket(changed_binding, item.evaluator_version, (changed_record,))
-        with pytest.raises(LifecycleRejected, match="submission"):
+        with pytest.raises(LifecycleRejected, match="invalid independent verification"):
             record(ledger, changed, VERIFIER, EvidenceAction.VERIFY, 0, ArtifactReader())
         assert counts(connection) == (1, 1, 1)
 
