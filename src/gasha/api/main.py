@@ -7,6 +7,7 @@ by this app. This is a bounded #42 foundation, not bank deployment approval.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -19,6 +20,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 from starlette._utils import get_route_path
 
+from gasha.cases.timeline import (
+    BankExecution,
+    CaseDisposition,
+    CaseEvent,
+    CaseOperation,
+    CaseReason,
+)
 from gasha.decision.mode import DecisionEnvelope, ModeAwareDecisionService
 from gasha.decision.service import DecisionService
 from gasha.domain.models import (
@@ -163,6 +171,19 @@ class TrustedDecisionContextProvider(Protocol):
     ) -> TrustedDecisionContext: ...
 
 
+class TrustedCaseHistoryReader(Protocol):
+    """Server-installed, principal-scoped, immutable #45 history reader.
+
+    A Bank installation must supply a tenant-isolating durable adapter; neither
+    request JSON nor a caller-selected DB connection is a trusted reader.
+    """
+
+    def history(
+        self, *, principal: TrustedPrincipal, tenant_id: str,
+        case_id: UUID, at: datetime,
+    ) -> tuple[CaseEvent, ...]: ...
+
+
 class TrustedDecisionRequest(BaseModel):
     """Only transaction facts are accepted; policy, risk and mode are forbidden."""
 
@@ -186,6 +207,8 @@ app.state.security_audit = None
 app.state.decision_context_provider = None
 # Legacy reference service remains injectable for negative tests, never bank writes.
 app.state.outcome_ingestion = None
+# No bank case reader is installed by default; the endpoint fails closed.
+app.state.case_history_reader = None
 
 
 @app.middleware("http")
@@ -353,6 +376,115 @@ def _trusted_context(
     ):
         raise HTTPException(status_code=503, detail="trusted decision context unavailable")
     return context
+
+
+
+def _case_history_view(
+    history: tuple[CaseEvent, ...], *, tenant_id: str, case_id: UUID,
+) -> list[dict[str, object]]:
+    """Defensive projection of a trusted reader result; no raw case notes/PII."""
+    if type(history) is not tuple:
+        raise ValueError("immutable case history required")
+    projection: list[dict[str, object]] = []
+    first_event: UUID | None = None
+    first_context: str | None = None
+    previous_at: datetime | None = None
+    for revision, event in enumerate(history, 1):
+        if (
+            type(event) is not CaseEvent
+            or event.tenant_id != tenant_id
+            or event.case_id != case_id
+            or type(event.source_event_id) is not UUID
+            or type(event.source_context_ref) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", event.source_context_ref) is None
+            or type(event.actor_ref) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", event.actor_ref) is None
+            or event.revision != revision
+            or type(event.revision) is not int
+            or event.previous_revision != (revision - 1 if revision > 1 else None)
+            or type(event.operation) is not CaseOperation
+            or type(event.reason_code) is not CaseReason
+            or (event.disposition is not None
+                and type(event.disposition) is not CaseDisposition)
+            or (event.assignee_ref is not None
+                and (type(event.assignee_ref) is not str
+                     or re.fullmatch(r"[0-9a-f]{64}", event.assignee_ref) is None))
+            or event.bank_execution is not BankExecution.UNKNOWN
+            or not isinstance(event.recorded_at, datetime)
+            or event.recorded_at.utcoffset() is None
+        ):
+            raise ValueError("malformed tenant-scoped case history")
+        if first_event is None:
+            first_event = event.source_event_id
+            first_context = event.source_context_ref
+        elif event.source_event_id != first_event or event.source_context_ref != first_context:
+            raise ValueError("case history source identity changed")
+        at = event.recorded_at.astimezone(UTC)
+        if previous_at is not None and at < previous_at:
+            raise ValueError("case history clock regressed")
+        previous_at = at
+        projection.append({
+            "revision": revision,
+            "previous_revision": event.previous_revision,
+            "operation": event.operation.value,
+            "recorded_at": at.isoformat(),
+            "reason_code": event.reason_code.value,
+            "disposition": event.disposition.value if event.disposition else None,
+            "actor_ref": event.actor_ref,
+            "assignee_ref": event.assignee_ref,
+            "source_event_id": str(event.source_event_id),
+            "source_context_ref": event.source_context_ref,
+            "bank_execution": "unknown",
+        })
+    return projection
+
+
+@app.get("/v1/tenants/{tenant_id}/cases/{case_id}/history")
+def get_case_history(
+    tenant_id: str,
+    case_id: UUID,
+    request: Request,
+    principal: Annotated[TrustedPrincipal, Depends(get_principal)],
+) -> dict[str, object]:
+    """Authenticated read-only #45 integration; no case/outcome mutation.
+
+    The default app has no reader. In a controlled installation, an explicitly
+    wired durable adapter must independently recheck identity, tenancy and
+    credential expiry immediately before the read. Never trust frontend roles.
+    """
+    action = Capability.CASE_READ
+    _require_action(request, principal, tenant_id, action, event_id=case_id)
+    reader: TrustedCaseHistoryReader | None = getattr(
+        request.app.state, "case_history_reader", None
+    )
+    try:
+        if reader is None:
+            raise RuntimeError("trusted case history reader not configured")
+        history = reader.history(
+            principal=principal, tenant_id=tenant_id, case_id=case_id, at=utcnow(),
+        )
+        events = _case_history_view(history, tenant_id=tenant_id, case_id=case_id)
+    except Exception as exc:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action,
+            "failed", "case_history_unavailable",
+        )
+        raise HTTPException(status_code=503, detail="case history unavailable") from exc
+    if not events:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action,
+            "not_found", "case_not_found",
+        )
+        raise HTTPException(status_code=404, detail="case not found")
+    _operation_audit(
+        request, principal, tenant_id, case_id, action,
+        "succeeded", "case_history_read",
+    )
+    return {
+        "case_id": str(case_id),
+        "events": events,
+        "enforcement_activated": False,
+    }
 
 
 @app.get("/health/live")
