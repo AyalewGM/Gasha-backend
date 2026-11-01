@@ -172,6 +172,52 @@ def test_future_and_naive_receipt_rejected() -> None:
     assert row["checks"]["invalid.receipt_order"] == 1
 
 
+@pytest.mark.parametrize("invalid_payload", [
+    None, "not-an-object", [], ["event_id"], 0, False,
+])
+def test_unvalidated_nonmapping_payload_is_quarantined_without_crashing(
+    invalid_payload: object,
+) -> None:
+    """Synthetic adapter bypasses must not abort the report or poison deduplication."""
+    valid = candidate(
+        "nonmapping-body", payload_changes={"intelligence": {"beneficiary_risk": 0.0}},
+        label=True, confirmed_at=AT + timedelta(days=1), alerted=True,
+    )
+    baseline = result_for(valid)
+    corrupted = replace(valid, event=valid.event.model_copy(
+        update={"payload": invalid_payload},
+    ))
+    for rows in ((corrupted, valid), (valid, corrupted)):
+        report = result_for(*rows)
+        assert report["total"] == 2
+        assert report["accepted"] == 1 and report["rejected"] == 1
+        assert report["checks"]["invalid.payload"] == 1
+        assert "duplicate.event_id" not in report["checks"]
+        assert report["labels"] == baseline["labels"]
+        assert report["alerts"] == baseline["alerts"]
+        assert report["optional_signals"] == baseline["optional_signals"]
+        assert report["acceptance"] == {
+            "count": 1, "denominator": 2, "rate": 0.5, "undefined_reason": None,
+        }
+
+
+def test_nonmapping_payload_preserves_independent_scope_failures() -> None:
+    """A corrupt body must not hide an independently wrong tenant or schema."""
+    valid = candidate("nonmapping-scope")
+    invalid = replace(valid, event=valid.event.model_copy(update={
+        "payload": [],
+        "tenant_id": "other-tenant",
+        "schema_version": "different-schema",
+    }))
+    for rows in ((invalid, valid), (valid, invalid)):
+        report = result_for(*rows)
+        assert report["accepted"] == 1 and report["rejected"] == 1
+        assert report["checks"]["invalid.payload"] == 1
+        assert report["checks"]["tenant_mismatch"] == 1
+        assert report["checks"]["schema_mismatch"] == 1
+        assert "duplicate.event_id" not in report["checks"]
+
+
 def test_optional_missing_is_unavailable_not_zero_or_rejection() -> None:
     good_zero = candidate("zero", payload_changes={"intelligence": {"device_session_risk": 0.0}},
                           uc=UseCase.UC03)
