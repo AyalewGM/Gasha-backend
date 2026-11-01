@@ -1,5 +1,6 @@
 """#42 trusted identity/capability seam; synthetic identities only."""
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -90,3 +91,37 @@ def test_untyped_capability_and_naive_expiry_rejected() -> None:
         principal(capabilities=frozenset({"policy.admin"}))
     with pytest.raises(ValueError):
         principal(expires_at=NOW.replace(tzinfo=None))
+
+
+# The two local 01:xx hours on 2026-11-01 are distinct UTC instants.
+_NY = ZoneInfo("America/New_York")
+
+
+@pytest.mark.parametrize(
+    ("expires_at", "now", "should_reject"),
+    [
+        # Expired in actual time, although the later wall clock looks earlier.
+        (datetime(2026, 11, 1, 1, 30, tzinfo=_NY, fold=0),
+         datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1), True),
+        # Valid in actual time, although the earlier wall clock looks later.
+        (datetime(2026, 11, 1, 1, 30, tzinfo=_NY, fold=1),
+         datetime(2026, 11, 1, 1, 45, tzinfo=_NY, fold=0), False),
+        # Equality must reject even when the clock uses a different timezone.
+        (datetime(2026, 11, 1, 1, 30, tzinfo=_NY, fold=0),
+         datetime(2026, 11, 1, 8, 30, tzinfo=timezone(timedelta(hours=3))), True),
+        (datetime(2026, 11, 1, 1, 30, tzinfo=_NY, fold=1),
+         datetime(2026, 11, 1, 6, 29, 59, tzinfo=UTC), False),
+        (datetime(2026, 11, 1, 1, 30, tzinfo=_NY, fold=1),
+         datetime(2026, 11, 1, 6, 30, tzinfo=UTC), True),
+    ],
+)
+def test_authenticate_credential_expiry_dst_fold(
+    expires_at: datetime, now: datetime, should_reject: bool,
+) -> None:
+    trusted = principal(expires_at=expires_at)
+    verifier = Verifier(trusted)
+    if should_reject:
+        with pytest.raises(CredentialRejected, match="credential expired"):
+            authenticate("Bearer synthetic-token", verifier, now=now)
+    else:
+        assert authenticate("Bearer synthetic-token", verifier, now=now) is trusted
