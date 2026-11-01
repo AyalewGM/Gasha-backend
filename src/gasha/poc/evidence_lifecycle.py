@@ -44,11 +44,11 @@ class EvidenceAction(StrEnum):
 
 
 _CAPABILITY = {
-    EvidenceAction.SUBMIT: Capability.EVIDENCE_CREATE,
+    EvidenceAction.SUBMIT: Capability.EVIDENCE_SUBMIT,
     EvidenceAction.VERIFY: Capability.EVIDENCE_VERIFY,
-    EvidenceAction.APPROVE: Capability.EVIDENCE_APPROVE,
+    EvidenceAction.APPROVE: Capability.STAGE_APPROVE,
     EvidenceAction.REVOKE_EVIDENCE: Capability.EVIDENCE_REVOKE,
-    EvidenceAction.REVOKE_APPROVAL: Capability.EVIDENCE_REVOKE,
+    EvidenceAction.REVOKE_APPROVAL: Capability.APPROVAL_REVOKE,
 }
 
 
