@@ -562,3 +562,35 @@ def test_restricted_role_audit_failure_rolls_back_packet_and_event(scoped_roles)
                EvidenceAction.SUBMIT, 0)
     with connect(schema_a) as admin:
         assert counts(admin) == (1, 1, 1)
+
+
+def test_migrator_clock_tamper_in_stored_submit_fails_canonical_replay(schema) -> None:
+    """A consistently re-timestamped SQL/JSON event is still invalid evidence.
+
+    The synthetic migrator can bypass immutability triggers for this negative
+    test. A normal runtime writer cannot; replay is defense in depth.
+    """
+    item = packet()
+    with connect(schema) as connection:
+        ledger = make_ledger(connection, schema)
+        record(ledger, item, COLLECTOR, EvidenceAction.SUBMIT, 0)
+        before = counts(connection)
+        forged_at = item.records[0].collected_at - timedelta(microseconds=1)
+        connection.execute(
+            "ALTER TABLE poc_evidence_events DISABLE TRIGGER poc_evidence_event_immutable"
+        )
+        connection.execute(
+            "UPDATE poc_evidence_events SET occurred_at = %s, "
+            "event_json = jsonb_set(event_json, '{at}', to_jsonb(%s::text)) "
+            "WHERE revision = 1",
+            (forged_at, forged_at.isoformat(timespec="microseconds")),
+        )
+        connection.execute(
+            "ALTER TABLE poc_evidence_events ENABLE TRIGGER poc_evidence_event_immutable"
+        )
+        connection.commit()
+        reader = ArtifactReader()
+        with pytest.raises(EvidenceLedgerRejected, match="stored evidence replay invalid"):
+            record(ledger, item, VERIFIER, EvidenceAction.VERIFY, 1, reader)
+        assert reader.calls == 0
+        assert counts(connection) == before
