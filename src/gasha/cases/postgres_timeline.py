@@ -8,7 +8,7 @@ bank role grants and evidence provenance are NOT established by this module.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from hashlib import sha256
 from json import dumps
 from re import fullmatch
@@ -236,7 +236,8 @@ class PostgresCaseTimelineService:
             raise AuthorizationRejected("trusted authenticated principal required")
         if not isinstance(at, datetime) or at.utcoffset() is None:
             raise CaseRejected("trusted aware clock required")
-        if principal.expires_at <= at:
+        # Same-zone aware datetime comparison ignores DST fold; compare UTC.
+        if principal.expires_at.astimezone(UTC) <= at.astimezone(UTC):
             raise AuthorizationRejected("expired principal")
         authorize(principal, tenant_id=tenant_id, capability=Capability.CASE_READ)
         if not isinstance(case_id, UUID):
@@ -270,7 +271,8 @@ class PostgresCaseTimelineService:
             raise AuthorizationRejected("trusted authenticated principal required")
         if not isinstance(at, datetime) or at.utcoffset() is None:
             raise CaseRejected("trusted aware clock required")
-        if principal.expires_at <= at:
+        # Same-zone aware datetime comparison ignores DST fold; compare UTC.
+        if principal.expires_at.astimezone(UTC) <= at.astimezone(UTC):
             raise AuthorizationRejected("expired principal")
         # Security boundary before DB access, event lookup, or idempotent replay.
         authorize(

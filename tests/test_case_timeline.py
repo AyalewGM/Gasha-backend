@@ -2,6 +2,7 @@
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -267,3 +268,31 @@ def test_mismatched_disposition_and_reason_code_is_rejected():
     with pytest.raises(CaseRejected):
         step(history, command(CaseOperation.DISPOSE, 3,
                               disposition=CaseDisposition.LEGITIMATE))
+
+def test_case_kernel_rejects_expired_principal_across_dst_fallback():
+    zone = ZoneInfo("America/New_York")
+    at = datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=1)
+    expired = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=0)
+    assert expired > at  # Wall time is misleading; the credential has expired.
+    assert expired.astimezone(UTC) < at.astimezone(UTC)
+    with pytest.raises(AuthorizationRejected, match="expired principal"):
+        step((), command(CaseOperation.CREATE, 0),
+             identity=replace(principal(), expires_at=expired), at=at)
+
+
+def test_case_kernel_accepts_valid_principal_across_dst_fallback():
+    zone = ZoneInfo("America/New_York")
+    at = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=0)
+    expires = datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=1)
+    assert expires < at  # Wall time is misleading; expiry is later in UTC.
+    assert expires.astimezone(UTC) > at.astimezone(UTC)
+    history, event = step((), command(CaseOperation.CREATE, 0),
+                          identity=replace(principal(), expires_at=expires), at=at)
+    assert len(history) == 1
+    assert event.recorded_at == at.astimezone(UTC)
+
+
+def test_case_kernel_rejects_exact_credential_expiry():
+    with pytest.raises(AuthorizationRejected, match="expired principal"):
+        step((), command(CaseOperation.CREATE, 0),
+             identity=replace(principal(), expires_at=NOW), at=NOW)
