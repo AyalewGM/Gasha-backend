@@ -99,6 +99,13 @@ def schema():
             admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(name)))
 
 
+def ledger(connection, schema: str) -> PostgresEvidenceProposalLedger:
+    return PostgresEvidenceProposalLedger(
+        connection, installation_schema=schema,
+        tenant_id="bank-a", installation_id="synthetic-installation",
+    )
+
+
 def counts(connection) -> tuple[int, int, int]:
     a = connection.execute("SELECT COUNT(*) AS n FROM poc_evidence_packets").fetchone()["n"]
     b = connection.execute("SELECT COUNT(*) AS n FROM poc_evidence_events").fetchone()["n"]
@@ -127,7 +134,7 @@ def record(
 def test_durable_submit_verify_approve_revoke_and_redacted_atomic_audit(schema) -> None:
     item = packet()
     with connect(schema) as connection:
-        ledger = PostgresEvidenceProposalLedger(connection)
+        ledger = ledger(connection, schema)
         for revision, (actor, action) in enumerate((
             (COLLECTOR, EvidenceAction.SUBMIT),
             (VERIFIER, EvidenceAction.VERIFY),
@@ -163,7 +170,7 @@ def test_durable_submit_verify_approve_revoke_and_redacted_atomic_audit(schema) 
 def test_denied_tenant_capability_stale_and_reader_failure_leave_no_new_writes(schema):
     item = packet()
     with connect(schema) as connection:
-        ledger = PostgresEvidenceProposalLedger(connection)
+        ledger = ledger(connection, schema)
         for actor in (
             principal("wrong-tenant", Capability.EVIDENCE_SUBMIT, tenant="bank-b"),
             principal("wrong-capability", Capability.STAGE_APPROVE),
@@ -192,7 +199,7 @@ def test_audit_failure_rolls_back_evidence_packet_and_retry_succeeds(schema):
             FOR EACH ROW EXECUTE FUNCTION deny_evidence_audit();
         """)
         connection.commit()
-        ledger = PostgresEvidenceProposalLedger(connection)
+        ledger = ledger(connection, schema)
         with pytest.raises(Exception, match="synthetic audit outage"):
             record(ledger, item, COLLECTOR, EvidenceAction.SUBMIT, 0)
         assert counts(connection) == (0, 0, 0)
@@ -205,7 +212,7 @@ def test_audit_failure_rolls_back_evidence_packet_and_retry_succeeds(schema):
 def test_append_only_triggers_and_stored_identity_tampering_fail_closed(schema):
     item = packet()
     with connect(schema) as connection:
-        ledger = PostgresEvidenceProposalLedger(connection)
+        ledger = ledger(connection, schema)
         record(ledger, item, COLLECTOR, EvidenceAction.SUBMIT, 0)
         with pytest.raises(Exception, match="append-only"):
             connection.execute("DELETE FROM poc_evidence_events")
@@ -231,7 +238,7 @@ def test_append_only_triggers_and_stored_identity_tampering_fail_closed(schema):
 def test_changed_packet_cannot_reuse_another_scope_or_revision(schema):
     item = packet()
     with connect(schema) as connection:
-        ledger = PostgresEvidenceProposalLedger(connection)
+        ledger = ledger(connection, schema)
         record(ledger, item, COLLECTOR, EvidenceAction.SUBMIT, 0)
         changed_binding = replace(item.binding, policy_version="policy-v2")
         changed_record = replace(item.records[0], binding=changed_binding)
@@ -247,7 +254,7 @@ def test_two_independent_connections_cannot_append_same_revision(schema):
     def attempt(_index: int) -> str:
         with connect(schema) as connection:
             try:
-                record(PostgresEvidenceProposalLedger(connection), item,
+                record(ledger(connection, schema), item,
                        COLLECTOR, EvidenceAction.SUBMIT, 0)
                 return "accepted"
             except EvidenceLedgerRejected:
@@ -258,3 +265,270 @@ def test_two_independent_connections_cannot_append_same_revision(schema):
     assert sorted(outcomes) == ["accepted", "stale"]
     with connect(schema) as connection:
         assert counts(connection) == (1, 1, 1)
+
+
+# Real non-superuser role tests. These intentionally use separate authenticated
+# connections, NOT SET ROLE on the migration/superuser connection.
+@pytest.fixture
+def scoped_roles():
+    import psycopg
+    from psycopg import sql
+
+    suffix = uuid4().hex[:12]
+    installs = (
+        ("gasha_role_a_" + suffix, "gasha_aw_" + suffix, "gasha_ar_" + suffix),
+        ("gasha_role_b_" + suffix, "gasha_bw_" + suffix, "gasha_br_" + suffix),
+    )
+    with psycopg.connect(DSN, autocommit=True) as admin:
+        try:
+            for schema_name, writer, reader in installs:
+                admin.execute(
+                    sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+                )
+                for role_name in (writer, reader):
+                    admin.execute(
+                        sql.SQL(
+                            "CREATE ROLE {} LOGIN PASSWORD {} NOSUPERUSER "
+                            "NOCREATEDB NOCREATEROLE NOINHERIT"
+                        ).format(sql.Identifier(role_name), sql.Literal("synthetic_ci_role_only"))
+                    )
+                with connect(schema_name) as migrator:
+                    for filename in (
+                        "010_security_audit_events.sql",
+                        "012_poc_evidence_proposal_ledger.sql",
+                    ):
+                        migrator.execute((MIGRATIONS / filename).read_text())
+                    migrator.commit()
+                admin.execute(
+                    sql.SQL("REVOKE ALL ON SCHEMA {} FROM PUBLIC").format(
+                        sql.Identifier(schema_name)
+                    )
+                )
+                admin.execute(
+                    sql.SQL("GRANT USAGE ON SCHEMA {} TO {}, {}").format(
+                        sql.Identifier(schema_name), sql.Identifier(writer),
+                        sql.Identifier(reader),
+                    )
+                )
+                admin.execute(
+                    sql.SQL(
+                        "GRANT SELECT, INSERT ON TABLE {}.poc_evidence_packets, "
+                        "{}.poc_evidence_events TO {}"
+                    ).format(
+                        sql.Identifier(schema_name), sql.Identifier(schema_name),
+                        sql.Identifier(writer),
+                    )
+                )
+                admin.execute(
+                    sql.SQL("GRANT INSERT ON TABLE {}.security_audit_events TO {}").format(
+                        sql.Identifier(schema_name), sql.Identifier(writer),
+                    )
+                )
+                admin.execute(
+                    sql.SQL(
+                        "GRANT SELECT ON TABLE {}.poc_evidence_packets, "
+                        "{}.poc_evidence_events, {}.security_audit_events TO {}"
+                    ).format(
+                        sql.Identifier(schema_name), sql.Identifier(schema_name),
+                        sql.Identifier(schema_name), sql.Identifier(reader),
+                    )
+                )
+            yield installs
+        finally:
+            for schema_name, _, _ in installs:
+                admin.execute(
+                    sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                        sql.Identifier(schema_name)
+                    )
+                )
+            for _, writer, reader in installs:
+                for role_name in (writer, reader):
+                    admin.execute(
+                        sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role_name))
+                    )
+
+
+def restricted_connect(role_name: str):
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+    from psycopg.rows import dict_row
+
+    return psycopg.connect(
+        make_conninfo(DSN, user=role_name, password="synthetic_ci_role_only"),
+        row_factory=dict_row,
+    )
+
+
+def assert_sql_denied(connection, statement: str) -> None:
+    import psycopg
+
+    with pytest.raises(psycopg.Error) as exc:
+        connection.execute(statement)
+    assert exc.value.sqlstate in {"42501", "42P01"}, exc.value.sqlstate
+    connection.rollback()
+
+
+def test_restricted_role_lifecycle_and_reader_isolation(scoped_roles):
+    (schema_a, writer_a, reader_a), (schema_b, writer_b, _) = scoped_roles
+    item = packet()
+    with restricted_connect(writer_a) as connection:
+        assert connection.execute("SELECT current_user").fetchone()["current_user"] == writer_a
+        runtime = ledger(connection, schema_a)
+        for revision, (actor, action) in enumerate((
+            (COLLECTOR, EvidenceAction.SUBMIT),
+            (VERIFIER, EvidenceAction.VERIFY),
+            (APPROVER, EvidenceAction.APPROVE),
+            (REVOKER, EvidenceAction.REVOKE_EVIDENCE),
+        )):
+            result = record(runtime, item, actor, action, revision, ArtifactReader())
+            assert len(result.events) == revision + 1
+        # Caller-supplied scope must not override the installed schema binding.
+        changed_binding = replace(item.binding, installation_id="another-installation")
+        changed = EvidencePacket(
+            changed_binding, item.evaluator_version,
+            (replace(item.records[0], binding=changed_binding),),
+        )
+        with pytest.raises(EvidenceLedgerRejected, match="installation scope"):
+            record(runtime, changed, COLLECTOR, EvidenceAction.SUBMIT, 0)
+        assert_sql_denied(
+            connection,
+            f'SELECT packet_json FROM "{schema_a}".poc_evidence_packets FOR UPDATE',
+        )
+        assert_sql_denied(
+            connection, f'SELECT * FROM "{schema_a}".security_audit_events',
+        )
+        for statement in (
+            f'SELECT COUNT(*) FROM "{schema_b}".poc_evidence_packets',
+            f'SELECT * FROM "{schema_b}".poc_evidence_packets FOR UPDATE',
+            f'LOCK TABLE "{schema_b}".poc_evidence_events IN SHARE MODE',
+            f'INSERT INTO "{schema_b}".poc_evidence_packets (tenant_id) VALUES (\'x\')',
+        ):
+            assert_sql_denied(connection, statement)
+    with connect(schema_a) as admin:
+        assert counts(admin) == (1, 4, 4)
+    with restricted_connect(reader_a) as connection:
+        assert connection.execute(
+            f'SELECT COUNT(*) AS n FROM "{schema_a}".poc_evidence_events'
+        ).fetchone()["n"] == 4
+        for statement in (
+            f'SELECT packet_json FROM "{schema_a}".poc_evidence_packets FOR UPDATE',
+            f'INSERT INTO "{schema_a}".poc_evidence_packets (tenant_id) VALUES (\'x\')',
+            f'DELETE FROM "{schema_a}".poc_evidence_events',
+            f'SELECT COUNT(*) FROM "{schema_b}".poc_evidence_packets',
+        ):
+            assert_sql_denied(connection, statement)
+    # A distinct installation writer cannot read A by changing its search_path.
+    with restricted_connect(writer_b) as connection:
+        connection.execute(f'SET search_path TO "{schema_a}"')
+        connection.commit()
+        assert_sql_denied(
+            connection, f'SELECT COUNT(*) FROM "{schema_a}".poc_evidence_packets'
+        )
+
+
+def test_restricted_writer_cannot_mutate_schema_or_triggers(scoped_roles):
+    (schema_a, writer_a, _), _ = scoped_roles
+    item = packet()
+    with restricted_connect(writer_a) as connection:
+        record(ledger(connection, schema_a), item, COLLECTOR, EvidenceAction.SUBMIT, 0)
+        for table in ("poc_evidence_packets", "poc_evidence_events", "security_audit_events"):
+            for command in (
+                f'UPDATE "{schema_a}".{table} SET tenant_id = \'bank-b\''
+                if table != "security_audit_events" else
+                f'UPDATE "{schema_a}".{table} SET reason = \'forged\'',
+                f'DELETE FROM "{schema_a}".{table}',
+                f'TRUNCATE "{schema_a}".{table}',
+                f'ALTER TABLE "{schema_a}".{table} DISABLE TRIGGER ALL',
+                f'DROP TABLE "{schema_a}".{table}',
+            ):
+                assert_sql_denied(connection, command)
+        for command in (
+            f'CREATE TABLE "{schema_a}".forged_evidence (id int)',
+            f'DROP FUNCTION "{schema_a}".reject_poc_evidence_mutation()',
+            f'CREATE OR REPLACE FUNCTION "{schema_a}".reject_poc_evidence_mutation() '
+            "RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END;$$",
+        ):
+            assert_sql_denied(connection, command)
+    with connect(schema_a) as admin:
+        assert counts(admin) == (1, 1, 1)
+
+
+def test_restricted_runtime_search_path_and_temp_shadows_do_not_redirect(scoped_roles):
+    (schema_a, writer_a, _), _ = scoped_roles
+    with restricted_connect(writer_a) as connection:
+        connection.execute("CREATE TEMP TABLE poc_evidence_packets (forged int)")
+        connection.execute("CREATE TEMP TABLE poc_evidence_events (forged int)")
+        connection.execute("CREATE TEMP TABLE security_audit_events (forged int)")
+        connection.execute("SET search_path TO pg_temp, public")
+        connection.commit()
+        record(
+            ledger(connection, schema_a), packet(),
+            COLLECTOR, EvidenceAction.SUBMIT, 0,
+        )
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM pg_temp.poc_evidence_packets"
+        ).fetchone()["n"] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM pg_temp.security_audit_events"
+        ).fetchone()["n"] == 0
+        connection.rollback()
+    with connect(schema_a) as admin:
+        assert counts(admin) == (1, 1, 1)
+
+
+def test_restricted_role_two_writer_revision_race(scoped_roles):
+    (schema_a, writer_a, _), _ = scoped_roles
+    item = packet()
+    with restricted_connect(writer_a) as connection:
+        record(ledger(connection, schema_a), item, COLLECTOR, EvidenceAction.SUBMIT, 0)
+
+    def attempt(_index: int) -> str:
+        with restricted_connect(writer_a) as connection:
+            try:
+                record(
+                    ledger(connection, schema_a), item, VERIFIER,
+                    EvidenceAction.VERIFY, 1, ArtifactReader(),
+                )
+                return "accepted"
+            except EvidenceLedgerRejected:
+                return "stale"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(attempt, (0, 1)))
+    assert sorted(outcomes) == ["accepted", "stale"]
+    with connect(schema_a) as admin:
+        assert counts(admin) == (1, 2, 2)
+
+
+def test_restricted_role_audit_failure_rolls_back_packet_and_event(scoped_roles):
+    (schema_a, writer_a, _), _ = scoped_roles
+    import psycopg
+    from psycopg import sql
+
+    with connect(schema_a) as migrator:
+        migrator.execute(sql.SQL(
+            "CREATE FUNCTION {}.deny_restricted_audit() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$BEGIN "
+            "RAISE EXCEPTION 'synthetic restricted audit outage'; END;$$"
+        ).format(sql.Identifier(schema_a)))
+        migrator.execute(sql.SQL(
+            "CREATE TRIGGER deny_restricted_audit_insert "
+            "BEFORE INSERT ON {}.security_audit_events "
+            "FOR EACH ROW EXECUTE FUNCTION {}.deny_restricted_audit()"
+        ).format(sql.Identifier(schema_a), sql.Identifier(schema_a)))
+        migrator.commit()
+    with restricted_connect(writer_a) as connection:
+        with pytest.raises(psycopg.Error, match="synthetic restricted audit outage"):
+            record(ledger(connection, schema_a), packet(), COLLECTOR,
+                   EvidenceAction.SUBMIT, 0)
+    with connect(schema_a) as admin:
+        assert counts(admin) == (0, 0, 0)
+        admin.execute(sql.SQL(
+            "DROP TRIGGER deny_restricted_audit_insert ON {}.security_audit_events"
+        ).format(sql.Identifier(schema_a)))
+        admin.commit()
+    with restricted_connect(writer_a) as connection:
+        record(ledger(connection, schema_a), packet(), COLLECTOR,
+               EvidenceAction.SUBMIT, 0)
+    with connect(schema_a) as admin:
+        assert counts(admin) == (1, 1, 1)

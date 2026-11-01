@@ -147,7 +147,9 @@ def authenticate(
         raise IdentityUnavailable("identity verifier unavailable") from exc
     if not isinstance(principal, TrustedPrincipal):
         raise IdentityUnavailable("invalid verifier result")
-    if principal.expires_at <= now:
+    # Compare absolute instants: ZoneInfo fold=0/fold=1 values sharing one
+    # tzinfo can otherwise compare by local wall time across a DST fallback.
+    if principal.expires_at.astimezone(UTC) <= now.astimezone(UTC):
         raise CredentialRejected("credential expired")
     return principal
 

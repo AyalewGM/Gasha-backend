@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from hashlib import sha256
 from json import dumps
+from re import fullmatch
 from uuid import UUID, uuid4
 
 from gasha.poc.evidence_identity import EvidencePacket
@@ -122,8 +123,25 @@ class PostgresEvidenceProposalLedger:
     without a trusted IdP/reader, tenant-scoped SQL roles and approval controls.
     """
 
-    def __init__(self, connection: Connection) -> None:
+    def __init__(
+        self, connection: Connection, *, installation_schema: str,
+        tenant_id: str, installation_id: str,
+    ) -> None:
+        # Schema and tenant/installation bindings come from trusted deployment
+        # configuration, never an HTTP payload or a claimed packet.
+        if (
+            type(installation_schema) is not str
+            or fullmatch(r"[a-z_][a-z0-9_]{0,62}", installation_schema) is None
+            or not tenant_id or not installation_id
+        ):
+            raise EvidenceLedgerRejected("configured installation scope required")
+        # Autocommit would split event and audit into independent transactions.
+        if getattr(connection, "autocommit", None) is not False:
+            raise EvidenceLedgerRejected("transactional connection required")
         self._connection = connection
+        self._schema = f'"{installation_schema}"'
+        self._tenant_id = tenant_id
+        self._installation_id = installation_id
 
     def apply(
         self,
@@ -140,6 +158,11 @@ class PostgresEvidenceProposalLedger:
             raise EvidenceLedgerRejected("typed packet/action required")
         if type(principal) is not TrustedPrincipal:
             raise EvidenceLedgerRejected("verified principal required")
+        if (
+            packet.binding.tenant_id != self._tenant_id
+            or packet.binding.installation_id != self._installation_id
+        ):
+            raise EvidenceLedgerRejected("configured installation scope mismatch")
         if not isinstance(now, datetime) or now.utcoffset() is None:
             raise EvidenceLedgerRejected("trusted timezone-aware clock required")
         if type(expected_revision) is not int or expected_revision < 0:
@@ -157,28 +180,30 @@ class PostgresEvidenceProposalLedger:
         snapshot = _packet_payload(packet)
         try:
             with self._connection.cursor() as cursor:
-                # Inserting the parent row serializes competing first writers by
-                # unique key; FOR UPDATE serializes all subsequent transitions.
-                # An invalid transition rolls this insert back with its audit.
+                # INSERT/ON CONFLICT serializes first writers by the packet
+                # unique key. Later concurrent same-revision writers contend on
+                # the unique event revision key (optimistic CAS), not FOR UPDATE:
+                # the immutable tables need no runtime UPDATE privilege.
+                # All SQL names use the configured, validated installation schema.
                 cursor.execute(
-                    """INSERT INTO poc_evidence_packets
+                    f"""INSERT INTO {self._schema}.poc_evidence_packets
                        (tenant_id, installation_id, packet_digest, packet_json, created_at)
                        VALUES (%s, %s, %s, %s::jsonb, %s)
                        ON CONFLICT DO NOTHING""",
                     (tenant, installation, digest, dumps(snapshot), now),
                 )
                 cursor.execute(
-                    """SELECT packet_json FROM poc_evidence_packets
+                    f"""SELECT packet_json FROM {self._schema}.poc_evidence_packets
                        WHERE tenant_id = %s AND installation_id = %s
-                         AND packet_digest = %s FOR UPDATE""",
+                         AND packet_digest = %s""",
                     (tenant, installation, digest),
                 )
                 stored = cursor.fetchone()
                 if stored is None or stored["packet_json"] != snapshot:
                     raise EvidenceLedgerRejected("stored packet identity mismatch")
                 cursor.execute(
-                    """SELECT revision, action, actor_ref, occurred_at, evidence_id,
-                              event_json FROM poc_evidence_events
+                    f"""SELECT revision, action, actor_ref, occurred_at, evidence_id,
+                              event_json FROM {self._schema}.poc_evidence_events
                        WHERE tenant_id = %s AND installation_id = %s
                          AND packet_digest = %s ORDER BY revision""",
                     (tenant, installation, digest),
@@ -192,21 +217,29 @@ class PostgresEvidenceProposalLedger:
                 )
                 event = proposed.events[-1]
                 revision = len(proposed.events)
-                cursor.execute(
-                    """INSERT INTO poc_evidence_events (
+                try:
+                    cursor.execute(
+                        f"""INSERT INTO {self._schema}.poc_evidence_events (
                           tenant_id, installation_id, packet_digest, revision,
                           action, actor_ref, occurred_at, evidence_id, event_json
                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)""",
-                    (
-                        tenant, installation, digest, revision, event.action.value,
-                        event.actor_ref, event.at, event.evidence_id,
-                        dumps(_event_payload(event)),
-                    ),
-                )
+                        (
+                            tenant, installation, digest, revision, event.action.value,
+                            event.actor_ref, event.at, event.evidence_id,
+                            dumps(_event_payload(event)),
+                        ),
+                    )
+                except Exception as exc:
+                    # A concurrent writer won the same revision. PostgreSQL's
+                    # unique index is the compare-and-swap gate; the entire
+                    # losing transaction (including audit) is rolled back.
+                    if getattr(exc, "sqlstate", None) == "23505":
+                        raise EvidenceLedgerRejected("stale evidence revision") from exc
+                    raise
                 # Mandatory audit shares the exact transaction. Failure rolls back
                 # the event and, for an initial submission, the parent packet.
                 cursor.execute(
-                    """INSERT INTO security_audit_events (
+                    f"""INSERT INTO {self._schema}.security_audit_events (
                           occurred_at, action, result, actor_ref, tenant_ref,
                           reason, attempt_ref, event_ref, context_ref
                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
