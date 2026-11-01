@@ -7,7 +7,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from gasha.poc.evidence_identity import EvidenceBinding, EvidencePacket, EvidenceRecord
+from gasha.poc.evidence_identity import (
+    EvidenceBinding,
+    EvidenceIdentityRejected,
+    EvidencePacket,
+    EvidenceRecord,
+)
 from gasha.poc.evidence_lifecycle import (
     EvidenceAction,
     EvidenceLifecycle,
@@ -444,3 +449,98 @@ def test_failed_verification_reader_does_not_append_event() -> None:
             )
         assert reader.calls == 1
         assert len(lifecycle.events) == 2
+
+
+def test_replay_rejects_forged_submission_outside_collection_and_expiry() -> None:
+    """Durable/untrusted histories must obey the proposal's original clock gate."""
+    item = packet()
+    record = item.records[0]
+    for event_time in (
+        record.collected_at - timedelta(microseconds=1),
+        record.expires_at,
+        record.expires_at + timedelta(microseconds=1),
+    ):
+        forged = EvidenceTransition(
+            action=EvidenceAction.SUBMIT,
+            actor_ref=COLLECTOR.audit_actor,
+            at=event_time,
+            packet_digest=item.packet_digest(),
+            evidence_id=record.evidence_id,
+        )
+        with pytest.raises(EvidenceIdentityRejected, match="future-dated|expired"):
+            EvidenceLifecycle(item, (forged,))
+
+
+def test_replay_submission_must_follow_all_packet_collections() -> None:
+    """A signed-looking complete packet cannot preexist a later-collected record."""
+    original = packet()
+    later = replace(original.records[1], collected_at=NOW - timedelta(minutes=5))
+    item = EvidencePacket(original.binding, original.evaluator_version,
+                          (original.records[0], later))
+    event = EvidenceTransition(
+        action=EvidenceAction.SUBMIT,
+        actor_ref=COLLECTOR.audit_actor,
+        at=NOW - timedelta(minutes=20),
+        packet_digest=item.packet_digest(),
+        evidence_id=original.records[0].evidence_id,
+    )
+    with pytest.raises(EvidenceIdentityRejected, match="future-dated"):
+        EvidenceLifecycle(item, (event,))
+    assert len(EvidenceLifecycle(item, (replace(event, at=later.collected_at),)).events) == 1
+
+
+
+def test_replay_submission_accepts_exact_collection_boundary() -> None:
+    """Equality at collection is valid; equality at expiry is not."""
+    item = packet()
+    record = item.records[0]
+    submitted_at_collection = EvidenceTransition(
+        action=EvidenceAction.SUBMIT,
+        actor_ref=COLLECTOR.audit_actor,
+        at=record.collected_at,
+        packet_digest=item.packet_digest(),
+        evidence_id=record.evidence_id,
+    )
+    assert len(EvidenceLifecycle(item, (submitted_at_collection,)).events) == 1
+
+
+def test_replay_submission_uses_utc_instants_across_dst_fold() -> None:
+    """Wall-clock ordering is not the chronology of a repeated local hour."""
+    zone = ZoneInfo("America/New_York")
+    original = packet()
+    collected_early = datetime(2026, 11, 1, 1, 45, tzinfo=zone, fold=0)
+    expires_late = datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=1)
+    valid = replace(
+        original,
+        records=tuple(
+            replace(record, collected_at=collected_early, expires_at=expires_late)
+            for record in original.records
+        ),
+    )
+    valid_event = EvidenceTransition(
+        action=EvidenceAction.SUBMIT,
+        actor_ref=COLLECTOR.audit_actor,
+        at=datetime(2026, 11, 1, 1, 10, tzinfo=zone, fold=1),
+        packet_digest=valid.packet_digest(),
+        evidence_id=valid.records[0].evidence_id,
+    )
+    assert len(EvidenceLifecycle(valid, (valid_event,)).events) == 1
+
+    collected_late = datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=1)
+    expires_later = datetime(2026, 11, 1, 1, 45, tzinfo=zone, fold=1)
+    invalid = replace(
+        original,
+        records=tuple(
+            replace(record, collected_at=collected_late, expires_at=expires_later)
+            for record in original.records
+        ),
+    )
+    invalid_event = EvidenceTransition(
+        action=EvidenceAction.SUBMIT,
+        actor_ref=COLLECTOR.audit_actor,
+        at=datetime(2026, 11, 1, 1, 45, tzinfo=zone, fold=0),
+        packet_digest=invalid.packet_digest(),
+        evidence_id=invalid.records[0].evidence_id,
+    )
+    with pytest.raises(EvidenceIdentityRejected, match="future-dated"):
+        EvidenceLifecycle(invalid, (invalid_event,))
