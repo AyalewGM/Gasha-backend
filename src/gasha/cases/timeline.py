@@ -16,7 +16,7 @@ from re import fullmatch
 from typing import Protocol
 from uuid import UUID
 
-from gasha.security.access import Capability, TrustedPrincipal, authorize
+from gasha.security.access import AuthorizationRejected, Capability, TrustedPrincipal, authorize
 
 
 class CaseOperation(StrEnum):
@@ -210,6 +210,10 @@ def advance_case(
               capability=_CAPABILITIES[command.operation])
     if not isinstance(at, datetime) or at.utcoffset() is None:
         raise CaseRejected("trusted timezone-aware time required")
+    # A typed principal can be stale when a verifier result is reused. Check the
+    # absolute instant; equal-zone DST folds cannot be compared by wall clock.
+    if principal.expires_at.astimezone(UTC) <= at.astimezone(UTC):
+        raise AuthorizationRejected("expired principal")
     if not isinstance(history, tuple) or any(not isinstance(e, CaseEvent) for e in history):
         raise CaseRejected("trusted immutable history required")
     try:

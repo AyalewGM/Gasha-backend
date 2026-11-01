@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -541,3 +542,38 @@ def test_case_runtime_reader_and_audit_roles_are_separate():
                 ))
             for role in reversed(made_roles):
                 admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
+
+def test_case_postgres_expiry_uses_utc_for_reads_and_writes_across_dst(schema):
+    zone = ZoneInfo("America/New_York")
+    after_fallback = datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=1)
+    before_fallback = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=0)
+    valid_now = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=0)
+    valid_expiry = datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=1)
+    case_id, event_id = uuid4(), uuid4()
+    with connect(schema) as connection:
+        service = PostgresCaseTimelineService(connection)
+        expired_writer = replace(principal(), expires_at=before_fallback)
+        with pytest.raises(AuthorizationRejected, match="expired principal"):
+            apply(service, cmd(CaseOperation.CREATE, case_id, event_id, 0),
+                  identity=expired_writer, at=after_fallback)
+        expired_reader = replace(
+            principal(capabilities=frozenset({Capability.CASE_READ})),
+            expires_at=before_fallback,
+        )
+        with pytest.raises(AuthorizationRejected, match="expired principal"):
+            service.history(principal=expired_reader, tenant_id="tenant-a",
+                            case_id=case_id, at=after_fallback)
+        assert counts(connection) == (0, 0)
+
+        valid_writer = replace(principal(), expires_at=valid_expiry)
+        created = apply(service, cmd(CaseOperation.CREATE, case_id, event_id, 0),
+                        identity=valid_writer, at=valid_now)
+        valid_reader = replace(
+            principal(capabilities=frozenset({Capability.CASE_READ})),
+            expires_at=valid_expiry,
+        )
+        history = service.history(principal=valid_reader, tenant_id="tenant-a",
+                                  case_id=case_id, at=valid_now)
+        assert history == (created,)
+        assert created.recorded_at == valid_now.astimezone(UTC)
+        assert counts(connection) == (1, 1)
