@@ -99,7 +99,7 @@ def schema():
             admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(name)))
 
 
-def ledger(connection, schema: str) -> PostgresEvidenceProposalLedger:
+def make_ledger(connection, schema: str) -> PostgresEvidenceProposalLedger:
     return PostgresEvidenceProposalLedger(
         connection, installation_schema=schema,
         tenant_id="bank-a", installation_id="synthetic-installation",
@@ -134,7 +134,7 @@ def record(
 def test_durable_submit_verify_approve_revoke_and_redacted_atomic_audit(schema) -> None:
     item = packet()
     with connect(schema) as connection:
-        ledger = ledger(connection, schema)
+        ledger = make_ledger(connection, schema)
         for revision, (actor, action) in enumerate((
             (COLLECTOR, EvidenceAction.SUBMIT),
             (VERIFIER, EvidenceAction.VERIFY),
@@ -170,7 +170,7 @@ def test_durable_submit_verify_approve_revoke_and_redacted_atomic_audit(schema) 
 def test_denied_tenant_capability_stale_and_reader_failure_leave_no_new_writes(schema):
     item = packet()
     with connect(schema) as connection:
-        ledger = ledger(connection, schema)
+        ledger = make_ledger(connection, schema)
         for actor in (
             principal("wrong-tenant", Capability.EVIDENCE_SUBMIT, tenant="bank-b"),
             principal("wrong-capability", Capability.STAGE_APPROVE),
@@ -199,7 +199,7 @@ def test_audit_failure_rolls_back_evidence_packet_and_retry_succeeds(schema):
             FOR EACH ROW EXECUTE FUNCTION deny_evidence_audit();
         """)
         connection.commit()
-        ledger = ledger(connection, schema)
+        ledger = make_ledger(connection, schema)
         with pytest.raises(Exception, match="synthetic audit outage"):
             record(ledger, item, COLLECTOR, EvidenceAction.SUBMIT, 0)
         assert counts(connection) == (0, 0, 0)
@@ -212,7 +212,7 @@ def test_audit_failure_rolls_back_evidence_packet_and_retry_succeeds(schema):
 def test_append_only_triggers_and_stored_identity_tampering_fail_closed(schema):
     item = packet()
     with connect(schema) as connection:
-        ledger = ledger(connection, schema)
+        ledger = make_ledger(connection, schema)
         record(ledger, item, COLLECTOR, EvidenceAction.SUBMIT, 0)
         with pytest.raises(Exception, match="append-only"):
             connection.execute("DELETE FROM poc_evidence_events")
@@ -238,7 +238,7 @@ def test_append_only_triggers_and_stored_identity_tampering_fail_closed(schema):
 def test_changed_packet_cannot_reuse_another_scope_or_revision(schema):
     item = packet()
     with connect(schema) as connection:
-        ledger = ledger(connection, schema)
+        ledger = make_ledger(connection, schema)
         record(ledger, item, COLLECTOR, EvidenceAction.SUBMIT, 0)
         changed_binding = replace(item.binding, policy_version="policy-v2")
         changed_record = replace(item.records[0], binding=changed_binding)
@@ -254,7 +254,7 @@ def test_two_independent_connections_cannot_append_same_revision(schema):
     def attempt(_index: int) -> str:
         with connect(schema) as connection:
             try:
-                record(ledger(connection, schema), item,
+                record(make_ledger(connection, schema), item,
                        COLLECTOR, EvidenceAction.SUBMIT, 0)
                 return "accepted"
             except EvidenceLedgerRejected:
@@ -373,7 +373,7 @@ def test_restricted_role_lifecycle_and_reader_isolation(scoped_roles):
     item = packet()
     with restricted_connect(writer_a) as connection:
         assert connection.execute("SELECT current_user").fetchone()["current_user"] == writer_a
-        runtime = ledger(connection, schema_a)
+        runtime = make_ledger(connection, schema_a)
         for revision, (actor, action) in enumerate((
             (COLLECTOR, EvidenceAction.SUBMIT),
             (VERIFIER, EvidenceAction.VERIFY),
@@ -430,7 +430,7 @@ def test_restricted_writer_cannot_mutate_schema_or_triggers(scoped_roles):
     (schema_a, writer_a, _), _ = scoped_roles
     item = packet()
     with restricted_connect(writer_a) as connection:
-        record(ledger(connection, schema_a), item, COLLECTOR, EvidenceAction.SUBMIT, 0)
+        record(make_ledger(connection, schema_a), item, COLLECTOR, EvidenceAction.SUBMIT, 0)
         for table in ("poc_evidence_packets", "poc_evidence_events", "security_audit_events"):
             for command in (
                 f'UPDATE "{schema_a}".{table} SET tenant_id = \'bank-b\''
@@ -445,8 +445,8 @@ def test_restricted_writer_cannot_mutate_schema_or_triggers(scoped_roles):
         for command in (
             f'CREATE TABLE "{schema_a}".forged_evidence (id int)',
             f'DROP FUNCTION "{schema_a}".reject_poc_evidence_mutation()',
-            f'CREATE OR REPLACE FUNCTION "{schema_a}".reject_poc_evidence_mutation() '
-            "RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END;$$",
+            (f'CREATE OR REPLACE FUNCTION "{schema_a}".reject_poc_evidence_mutation() '
+             "RETURNS trigger LANGUAGE plpgsql AS $BEGIN RETURN NEW; END;$"),
         ):
             assert_sql_denied(connection, command)
     with connect(schema_a) as admin:
@@ -462,7 +462,7 @@ def test_restricted_runtime_search_path_and_temp_shadows_do_not_redirect(scoped_
         connection.execute("SET search_path TO pg_temp, public")
         connection.commit()
         record(
-            ledger(connection, schema_a), packet(),
+            make_ledger(connection, schema_a), packet(),
             COLLECTOR, EvidenceAction.SUBMIT, 0,
         )
         assert connection.execute(
@@ -480,13 +480,13 @@ def test_restricted_role_two_writer_revision_race(scoped_roles):
     (schema_a, writer_a, _), _ = scoped_roles
     item = packet()
     with restricted_connect(writer_a) as connection:
-        record(ledger(connection, schema_a), item, COLLECTOR, EvidenceAction.SUBMIT, 0)
+        record(make_ledger(connection, schema_a), item, COLLECTOR, EvidenceAction.SUBMIT, 0)
 
     def attempt(_index: int) -> str:
         with restricted_connect(writer_a) as connection:
             try:
                 record(
-                    ledger(connection, schema_a), item, VERIFIER,
+                    make_ledger(connection, schema_a), item, VERIFIER,
                     EvidenceAction.VERIFY, 1, ArtifactReader(),
                 )
                 return "accepted"
@@ -517,10 +517,12 @@ def test_restricted_role_audit_failure_rolls_back_packet_and_event(scoped_roles)
             "FOR EACH ROW EXECUTE FUNCTION {}.deny_restricted_audit()"
         ).format(sql.Identifier(schema_a), sql.Identifier(schema_a)))
         migrator.commit()
-    with restricted_connect(writer_a) as connection:
-        with pytest.raises(psycopg.Error, match="synthetic restricted audit outage"):
-            record(ledger(connection, schema_a), packet(), COLLECTOR,
-                   EvidenceAction.SUBMIT, 0)
+    with (
+        restricted_connect(writer_a) as connection,
+        pytest.raises(psycopg.Error, match="synthetic restricted audit outage"),
+    ):
+        record(make_ledger(connection, schema_a), packet(), COLLECTOR,
+               EvidenceAction.SUBMIT, 0)
     with connect(schema_a) as admin:
         assert counts(admin) == (0, 0, 0)
         admin.execute(sql.SQL(
@@ -528,7 +530,7 @@ def test_restricted_role_audit_failure_rolls_back_packet_and_event(scoped_roles)
         ).format(sql.Identifier(schema_a)))
         admin.commit()
     with restricted_connect(writer_a) as connection:
-        record(ledger(connection, schema_a), packet(), COLLECTOR,
+        record(make_ledger(connection, schema_a), packet(), COLLECTOR,
                EvidenceAction.SUBMIT, 0)
     with connect(schema_a) as admin:
         assert counts(admin) == (1, 1, 1)
