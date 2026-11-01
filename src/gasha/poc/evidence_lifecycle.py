@@ -110,6 +110,8 @@ def _replay(lifecycle: EvidenceLifecycle) -> _State:
     if type(lifecycle.events) is not tuple:
         raise LifecycleRejected("immutable event sequence required")
     records = {r.evidence_id: r for r in lifecycle.packet.records}
+    # Packet-level separation: no collector may verify ANY record in this packet.
+    collector_refs = {record.collector_actor_ref for record in records.values()}
     submitted: set[UUID] = set()
     verified_by: dict[UUID, str] = {}
     revoked: set[UUID] = set()
@@ -141,7 +143,7 @@ def _replay(lifecycle: EvidenceLifecycle) -> _State:
                     event.evidence_id not in submitted
                     or event.evidence_id in verified_by
                     or event.evidence_id in revoked
-                    or event.actor_ref == record.collector_actor_ref
+                    or event.actor_ref in collector_refs
                 ):
                     raise LifecycleRejected("invalid independent verification")
                 assert_packet_current(lifecycle.packet, expected=lifecycle.packet.binding, now=event.at)
@@ -161,8 +163,9 @@ def _replay(lifecycle: EvidenceLifecycle) -> _State:
                     approved_by is not None
                     or revoked
                     or set(verified_by) != set(records)
-                    or event.actor_ref in {r.collector_actor_ref for r in records.values()}
+                    or event.actor_ref in collector_refs
                     or event.actor_ref in set(verified_by.values())
+                    or not collector_refs.isdisjoint(verified_by.values())
                 ):
                     raise LifecycleRejected("independent verified approval required")
                 assert_packet_current(lifecycle.packet, expected=lifecycle.packet.binding, now=event.at)
@@ -222,6 +225,16 @@ def propose_transition(
         )
         if record is None or artifact_reader is None:
             raise LifecycleRejected("verified artifact reader and evidence required")
+        # Eligibility must be checked BEFORE accessing the privileged artifact.
+        # Final replay still checks these invariants against the complete history.
+        collector_refs = {r.collector_actor_ref for r in lifecycle.packet.records}
+        if (
+            evidence_id not in state.submitted
+            or evidence_id in state.verified_by
+            or evidence_id in state.revoked
+            or principal.audit_actor in collector_refs
+        ):
+            raise LifecycleRejected("invalid independent verification before artifact read")
         # The reader must be supplied by trusted deployment composition, not JSON.
         try:
             observed = artifact_reader.sha256_digest(record)

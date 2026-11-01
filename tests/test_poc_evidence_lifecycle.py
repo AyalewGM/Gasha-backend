@@ -308,3 +308,139 @@ def test_frozen_history_and_missing_approval_record_reference() -> None:
             EvidenceTransition(EvidenceAction.APPROVE, APPROVER.audit_actor, NOW,
                                lifecycle.packet.packet_digest(), UUID(int=1)),
         ))
+
+
+def split_collector_packet() -> EvidencePacket:
+    """Two records have different collectors, with both actors verifier-capable."""
+    original = packet()
+    second_collector = actor("collector-b", Capability.EVIDENCE_SUBMIT)
+    return replace(
+        original,
+        records=(
+            original.records[0],
+            replace(original.records[1], collector_actor_ref=second_collector.audit_actor),
+        ),
+    )
+
+
+def split_submitted() -> EvidenceLifecycle:
+    lifecycle = EvidenceLifecycle(split_collector_packet())
+    collectors = (
+        actor("collector", Capability.EVIDENCE_SUBMIT),
+        actor("collector-b", Capability.EVIDENCE_SUBMIT),
+    )
+    for record, principal in zip(lifecycle.packet.records, collectors, strict=True):
+        lifecycle = apply(lifecycle, EvidenceAction.SUBMIT, principal, record.evidence_id)
+    return lifecycle
+
+
+@pytest.mark.parametrize(
+    "verifier,evidence_id",
+    [
+        (actor("collector", Capability.EVIDENCE_VERIFY), UUID(int=2)),
+        (actor("collector-b", Capability.EVIDENCE_VERIFY), UUID(int=1)),
+    ],
+)
+def test_packet_collector_cannot_verify_another_collectors_record(
+    verifier: TrustedPrincipal, evidence_id: UUID,
+) -> None:
+    lifecycle = split_submitted()
+    reader = ArtifactReader()
+    with pytest.raises(LifecycleRejected, match="independent verification"):
+        apply(lifecycle, EvidenceAction.VERIFY, verifier, evidence_id, reader=reader)
+    assert reader.calls == 0
+    assert len(lifecycle.events) == 2
+
+
+@pytest.mark.parametrize(
+    "verifier,evidence_id",
+    [
+        (actor("collector", Capability.EVIDENCE_VERIFY), UUID(int=2)),
+        (actor("collector-b", Capability.EVIDENCE_VERIFY), UUID(int=1)),
+    ],
+)
+def test_replay_rejects_forged_cross_record_collector_verification(
+    verifier: TrustedPrincipal, evidence_id: UUID,
+) -> None:
+    lifecycle = split_submitted()
+    forged = EvidenceTransition(
+        EvidenceAction.VERIFY, verifier.audit_actor, NOW,
+        lifecycle.packet.packet_digest(), evidence_id,
+    )
+    with pytest.raises(LifecycleRejected, match="independent verification"):
+        EvidenceLifecycle(lifecycle.packet, lifecycle.events + (forged,))
+
+
+def test_disjoint_packet_collectors_verifier_and_approver_pass() -> None:
+    lifecycle = split_submitted()
+    for record in lifecycle.packet.records:
+        lifecycle = apply(
+            lifecycle, EvidenceAction.VERIFY, VERIFIER,
+            record.evidence_id, reader=ArtifactReader(),
+        )
+    lifecycle = apply(lifecycle, EvidenceAction.APPROVE, APPROVER)
+    assert lifecycle.events[-1].action is EvidenceAction.APPROVE
+    assert {r.collector_actor_ref for r in lifecycle.packet.records}.isdisjoint(
+        {VERIFIER.audit_actor, APPROVER.audit_actor}
+    )
+
+
+def test_verify_ineligible_state_never_reads_artifact() -> None:
+    never_submitted = EvidenceLifecycle(packet())
+    waiting = submitted()
+    verified_once = apply(
+        waiting, EvidenceAction.VERIFY, VERIFIER, UUID(int=1),
+        reader=ArtifactReader(),
+    )
+    revoked_record = apply(
+        waiting, EvidenceAction.REVOKE_EVIDENCE, REVOKER, UUID(int=1),
+    )
+    for lifecycle, evidence_id in (
+        (never_submitted, UUID(int=1)),
+        (waiting, UUID(int=99)),
+        (verified_once, UUID(int=1)),
+        (revoked_record, UUID(int=1)),
+    ):
+        reader = ArtifactReader()
+        events_before = lifecycle.events
+        with pytest.raises(LifecycleRejected):
+            apply(
+                lifecycle, EvidenceAction.VERIFY, VERIFIER,
+                evidence_id, reader=reader,
+            )
+        assert reader.calls == 0
+        assert lifecycle.events == events_before
+
+
+def test_verify_auth_denials_precede_reader_and_leave_history_unchanged() -> None:
+    lifecycle = submitted()
+    denied = (
+        actor("other-tenant", Capability.EVIDENCE_VERIFY, tenant="bank-b"),
+        actor("expired", Capability.EVIDENCE_VERIFY, expiry=NOW),
+        actor("wrong-cap", Capability.STAGE_APPROVE),
+        actor("legacy", Capability.EVIDENCE_CREATE, Capability.EVIDENCE_APPROVE),
+    )
+    for principal in denied:
+        reader = ArtifactReader()
+        with pytest.raises(LifecycleRejected, match="denied|expired"):
+            apply(
+                lifecycle, EvidenceAction.VERIFY, principal,
+                UUID(int=1), reader=reader,
+            )
+        assert reader.calls == 0
+        assert len(lifecycle.events) == 2
+
+
+def test_failed_verification_reader_does_not_append_event() -> None:
+    lifecycle = submitted()
+    for reader in (
+        ArtifactReader("sha256:" + "f" * 64),
+        ArtifactReader(fail=True),
+    ):
+        with pytest.raises(LifecycleRejected, match="mismatch|unavailable"):
+            apply(
+                lifecycle, EvidenceAction.VERIFY, VERIFIER,
+                UUID(int=1), reader=reader,
+            )
+        assert reader.calls == 1
+        assert len(lifecycle.events) == 2
