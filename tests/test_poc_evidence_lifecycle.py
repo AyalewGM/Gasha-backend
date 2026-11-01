@@ -1,6 +1,6 @@
 """#49 bounded offline proposal-kernel regression tests, not bank evidence."""
 from dataclasses import FrozenInstanceError, replace
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -201,6 +201,16 @@ def test_revoke_evidence_invalidates_future_approval_proposal() -> None:
     assert len(lifecycle.events) + 1 == len(revoked.events)
 
 
+def test_revoke_after_approval_invalidates_packet_approval() -> None:
+    lifecycle = approved()
+    revoked = apply(lifecycle, EvidenceAction.REVOKE_EVIDENCE, REVOKER, UUID(int=1))
+    assert revoked.events[-1].action is EvidenceAction.REVOKE_EVIDENCE
+    with pytest.raises(LifecycleRejected, match="no active approval"):
+        apply(revoked, EvidenceAction.REVOKE_APPROVAL, REVOKER)
+    with pytest.raises(LifecycleRejected, match="independent verified"):
+        apply(revoked, EvidenceAction.APPROVE, APPROVER)
+
+
 def test_approval_revocation_is_append_only_and_irreversible_for_packet() -> None:
     lifecycle = approved()
     revoked = apply(lifecycle, EvidenceAction.REVOKE_APPROVAL, REVOKER)
@@ -270,7 +280,7 @@ def test_dst_fold_event_instants_are_canonical_utc() -> None:
     assert event_early.at != event_late.at
     assert event_early.at.tzinfo is UTC and event_late.at.tzinfo is UTC
     assert event_late.at - event_early.at == timedelta(hours=1)
-    assert event_late.at == late.astimezone(timezone.utc)
+    assert event_late.at == late.astimezone(UTC)
 
 
 def test_frozen_history_and_missing_approval_record_reference() -> None:
