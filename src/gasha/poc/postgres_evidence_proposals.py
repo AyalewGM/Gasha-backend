@@ -11,7 +11,6 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from hashlib import sha256
 from json import dumps
-from typing import Any
 from uuid import UUID, uuid4
 
 from gasha.poc.evidence_identity import EvidencePacket
