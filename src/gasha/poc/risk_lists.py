@@ -1,9 +1,8 @@
 """Issue #44: inert, version-pinned risk-list matching reference kernel.
 
-This is an internal-only policy *proposal*. It does not authenticate a source,
-perform list administration, change DecisionService, or authorize BLOCK/HOLD.
-The Bank must approve conflict precedence and supply immutable, authenticated
-snapshots before any production decision-path integration.
+This is an inert match-only synthetic reference. It does not authenticate
+snapshots, resolve conflict policy, change DecisionService or act on payments.
+Bank-selected policy and trusted artifact provenance remain required.
 """
 
 from __future__ import annotations
@@ -87,6 +86,8 @@ class RiskListEntry:
         revoked = None if self.revoked_at is None else _time(self.revoked_at, "revoked_at")
         if end is not None and end <= start:
             raise RiskListRejected("effective interval must be positive")
+        if revoked is not None and revoked < start:
+            raise RiskListRejected("revocation cannot precede effective start")
         object.__setattr__(self, "effective_from", start)
         object.__setattr__(self, "effective_until", end)
         object.__setattr__(self, "revoked_at", revoked)
@@ -117,12 +118,17 @@ class RiskListSnapshot:
         if type(self.entries) is not tuple:
             raise RiskListRejected("immutable tuple of entries required")
         ids: set[UUID] = set()
+        logical: set[tuple[SubjectKind, str, RiskListKind]] = set()
         for entry in self.entries:
             if type(entry) is not RiskListEntry:
                 raise RiskListRejected("typed entries required")
             if entry.entry_id in ids:
                 raise RiskListRejected("duplicate list entry identity")
+            key = (entry.subject.kind, entry.subject.token, entry.kind)
+            if key in logical:
+                raise RiskListRejected("duplicate logical list entry")
             ids.add(entry.entry_id)
+            logical.add(key)
 
     def digest(self) -> str:
         """Content fingerprint only, not evidence of list authority or origin."""
@@ -152,24 +158,36 @@ class RiskListSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class RiskListMatch:
-    """Provisional list match: never a payment decision or release authority."""
+class MatchedRiskListEntry:
+    """Uncollapsed provenance for one active risk-list match."""
 
-    kind: RiskListKind | None
-    reason_codes: tuple[str, ...]
-    matched_entry_ids: tuple[UUID, ...]
+    entry_id: UUID
+    kind: RiskListKind
+    reason_code: str
+
+
+@dataclass(frozen=True, slots=True)
+class RiskListMatch:
+    """Match-only report; no winning class or payment authority."""
+
+    matches: tuple[MatchedRiskListEntry, ...]
     list_version: str
     policy_version: str
     snapshot_digest: str
+
+    @property
+    def matched_entry_ids(self) -> tuple[UUID, ...]:
+        return tuple(item.entry_id for item in self.matches)
+
+    @property
+    def reason_codes(self) -> tuple[str, ...]:
+        return tuple(item.reason_code for item in self.matches) or ("RISK_LIST_NO_MATCH",)
 
     @property
     def enforcement_activated(self) -> bool:
         return False
 
 
-# PROVISIONAL precedence, not a Bank-approved action policy. The returned kind
-# is advisory; it NEVER overrides fraud scoring or issues a payment HOLD/BLOCK.
-_RANK = {RiskListKind.ALLOW: 1, RiskListKind.WATCH: 2, RiskListKind.BLOCK: 3}
 _REASON = {
     RiskListKind.ALLOW: "RISK_LIST_ALLOW_MATCH",
     RiskListKind.WATCH: "RISK_LIST_WATCH_MATCH",
@@ -217,11 +235,11 @@ def match_reference_snapshot(
          if entry.subject in subject_set and entry.active_at(at)),
         key=lambda entry: entry.entry_id.int,
     ))
-    kind = max((entry.kind for entry in selected), key=_RANK.__getitem__, default=None)
     return RiskListMatch(
-        kind=kind,
-        reason_codes=(_REASON[kind],) if kind is not None else ("RISK_LIST_NO_MATCH",),
-        matched_entry_ids=tuple(entry.entry_id for entry in selected),
+        matches=tuple(
+            MatchedRiskListEntry(item.entry_id, item.kind, _REASON[item.kind])
+            for item in selected
+        ),
         list_version=snapshot.list_version,
         policy_version=snapshot.policy_version,
         snapshot_digest=snapshot.digest(),

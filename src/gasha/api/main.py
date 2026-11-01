@@ -104,7 +104,9 @@ class TrustedDecisionContext:
             or collected_at.utcoffset() is None
             or not isinstance(expires_at, datetime)
             or expires_at.utcoffset() is None
-            or expires_at <= collected_at
+            # Compare absolute instants: equal-zone ZoneInfo folds otherwise
+            # compare local wall time and can admit an expired validity window.
+            or expires_at.astimezone(UTC) <= collected_at.astimezone(UTC)
         ):
             raise ValueError("trusted event-bound decision provenance required")
         policy_snapshot = policy.model_dump_json()

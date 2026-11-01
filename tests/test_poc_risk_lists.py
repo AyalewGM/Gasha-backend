@@ -11,6 +11,7 @@ from gasha.poc.risk_lists import (
     RiskListEntry,
     RiskListKind,
     RiskListMatch,
+    MatchedRiskListEntry,
     RiskListRejected,
     RiskListSnapshot,
     RiskListSubject,
@@ -50,23 +51,27 @@ def lookup(
     )
 
 
-@pytest.mark.parametrize(("kinds", "expected"), [
-    ((RiskListKind.ALLOW,), RiskListKind.ALLOW),
-    ((RiskListKind.WATCH,), RiskListKind.WATCH),
-    ((RiskListKind.BLOCK,), RiskListKind.BLOCK),
-    ((RiskListKind.ALLOW, RiskListKind.WATCH), RiskListKind.WATCH),
-    ((RiskListKind.ALLOW, RiskListKind.BLOCK), RiskListKind.BLOCK),
-    ((RiskListKind.WATCH, RiskListKind.BLOCK), RiskListKind.BLOCK),
-    ((RiskListKind.ALLOW, RiskListKind.WATCH, RiskListKind.BLOCK), RiskListKind.BLOCK),
+@pytest.mark.parametrize("kinds", [
+    (RiskListKind.ALLOW,),
+    (RiskListKind.WATCH,),
+    (RiskListKind.BLOCK,),
+    (RiskListKind.ALLOW, RiskListKind.WATCH),
+    (RiskListKind.ALLOW, RiskListKind.BLOCK),
+    (RiskListKind.WATCH, RiskListKind.BLOCK),
+    (RiskListKind.ALLOW, RiskListKind.WATCH, RiskListKind.BLOCK),
 ])
-def test_provisional_precedence_all_conflicts(
-    kinds: tuple[RiskListKind, ...], expected: RiskListKind,
+def test_conflicts_preserve_all_per_entry_provenance(
+    kinds: tuple[RiskListKind, ...],
 ) -> None:
     original = snapshot(*(entry(i + 1, kind) for i, kind in enumerate(kinds)))
     result = lookup(original)
-    assert result.kind is expected
-    assert result.reason_codes == (f"RISK_LIST_{expected.name}_MATCH",)
-    assert len(result.matched_entry_ids) == len(kinds)
+    assert result.matches == tuple(
+        MatchedRiskListEntry(UUID(int=i + 1), kind, f"RISK_LIST_{kind.name}_MATCH")
+        for i, kind in enumerate(kinds)
+    )
+    assert result.reason_codes == tuple(f"RISK_LIST_{kind.name}_MATCH" for kind in kinds)
+    assert result.matched_entry_ids == tuple(UUID(int=i + 1) for i in range(len(kinds)))
+    assert not hasattr(result, "kind")
     assert not result.enforcement_activated
     assert result.snapshot_digest == original.digest()
 
@@ -75,28 +80,28 @@ def test_no_matching_identifiers_never_infers_allow() -> None:
     original = snapshot(entry(1, RiskListKind.BLOCK))
     for subjects in ((), (OTHER,)):
         outcome = lookup(original, subjects=subjects)
-        assert outcome.kind is None
+        assert outcome.matches == ()
         assert outcome.matched_entry_ids == ()
         assert outcome.reason_codes == ("RISK_LIST_NO_MATCH",)
 
 
 def test_lookups_do_not_match_other_subject_kinds_with_same_token() -> None:
     other_kind = RiskListSubject(SubjectKind.CUSTOMER, BANK.token)
-    assert lookup(snapshot(entry(1, RiskListKind.BLOCK)), subjects=(other_kind,)).kind is None
+    assert lookup(snapshot(entry(1, RiskListKind.BLOCK)), subjects=(other_kind,)).matches == ()
 
 
 def test_effective_boundaries_expiry_and_revocation_are_half_open() -> None:
     start = AT - timedelta(hours=2)
     end = AT + timedelta(hours=1)
     with_window = snapshot(entry(1, RiskListKind.BLOCK, effective_until=end))
-    assert lookup(with_window, at=start).kind is RiskListKind.BLOCK
-    assert lookup(with_window, at=start - timedelta(microseconds=1)).kind is None
-    assert lookup(with_window, at=end - timedelta(microseconds=1)).kind is RiskListKind.BLOCK
-    assert lookup(with_window, at=end).kind is None
+    assert lookup(with_window, at=start).matches[0].kind is RiskListKind.BLOCK
+    assert lookup(with_window, at=start - timedelta(microseconds=1)).matches == ()
+    assert lookup(with_window, at=end - timedelta(microseconds=1)).matches[0].kind is RiskListKind.BLOCK
+    assert lookup(with_window, at=end).matches == ()
     revoked = snapshot(entry(2, RiskListKind.BLOCK, revoked_at=AT))
-    assert lookup(revoked, at=AT - timedelta(microseconds=1)).kind is RiskListKind.BLOCK
-    assert lookup(revoked).kind is None
-    assert lookup(snapshot(entry(3, RiskListKind.BLOCK, revoked_at=start))).kind is None
+    assert lookup(revoked, at=AT - timedelta(microseconds=1)).matches[0].kind is RiskListKind.BLOCK
+    assert lookup(revoked).matches == ()
+    assert lookup(snapshot(entry(3, RiskListKind.BLOCK, revoked_at=start))).matches == ()
 
 
 @pytest.mark.parametrize("field", ["tenant_id", "list_version", "policy_version"])
@@ -161,8 +166,8 @@ def test_dst_repeated_hour_evaluates_utc_instants() -> None:
         "synthetic-tenant", "risk-v1", "policy-v1",
         earlier - timedelta(days=1), (allowed,),
     )
-    assert lookup(original, at=earlier).kind is RiskListKind.BLOCK
-    assert lookup(original, at=later).kind is None
+    assert lookup(original, at=earlier).matches[0].kind is RiskListKind.BLOCK
+    assert lookup(original, at=later).matches == ()
     # The reversed fold is a negative interval even if wall time looks ordered.
     with pytest.raises(RiskListRejected, match="interval"):
         replace(allowed, effective_from=later, effective_until=earlier)
@@ -207,6 +212,46 @@ def test_reject_duplicate_entry_ids() -> None:
         snapshot(entry(1, RiskListKind.ALLOW), entry(1, RiskListKind.BLOCK))
 
 
+def test_reject_duplicate_logical_entries_even_with_new_ids() -> None:
+    with pytest.raises(RiskListRejected, match="duplicate logical"):
+        snapshot(entry(1, RiskListKind.ALLOW), entry(2, RiskListKind.ALLOW))
+    assert len(lookup(snapshot(entry(1, RiskListKind.ALLOW),
+                               entry(2, RiskListKind.WATCH))).matches) == 2
+    other = replace(entry(2, RiskListKind.ALLOW), subject=OTHER)
+    assert len(lookup(snapshot(entry(1, RiskListKind.ALLOW), other),
+                      subjects=(BANK, OTHER)).matches) == 2
+
+
+def test_revoke_before_effective_start_rejected_with_dst_fold() -> None:
+    start = AT - timedelta(hours=2)
+    with pytest.raises(RiskListRejected, match="revocation"):
+        entry(1, RiskListKind.BLOCK, revoked_at=start - timedelta(microseconds=1))
+    equal = entry(2, RiskListKind.BLOCK, revoked_at=start)
+    assert not equal.active_at(start)
+    assert lookup(snapshot(equal), at=start).matches == ()
+    ny = ZoneInfo("America/New_York")
+    later = datetime(2026, 11, 1, 1, 15, tzinfo=ny, fold=1)
+    earlier = datetime(2026, 11, 1, 1, 30, tzinfo=ny, fold=0)
+    with pytest.raises(RiskListRejected, match="revocation"):
+        RiskListEntry(UUID(int=3), RiskListKind.WATCH, BANK, later, revoked_at=earlier)
+    valid = RiskListEntry(UUID(int=4), RiskListKind.WATCH, BANK, earlier, revoked_at=later)
+    assert valid.active_at(earlier)
+    assert not valid.active_at(later)
+
+
+def test_multisubject_conflict_provenance_and_order_stability() -> None:
+    original = snapshot(replace(entry(4, RiskListKind.BLOCK), subject=OTHER),
+                        entry(2, RiskListKind.ALLOW), entry(3, RiskListKind.WATCH))
+    result = lookup(original, subjects=(OTHER, BANK))
+    assert result.matches == (
+        MatchedRiskListEntry(UUID(int=2), RiskListKind.ALLOW, "RISK_LIST_ALLOW_MATCH"),
+        MatchedRiskListEntry(UUID(int=3), RiskListKind.WATCH, "RISK_LIST_WATCH_MATCH"),
+        MatchedRiskListEntry(UUID(int=4), RiskListKind.BLOCK, "RISK_LIST_BLOCK_MATCH"),
+    )
+    assert lookup(replace(original, entries=tuple(reversed(original.entries))),
+                  subjects=(BANK, OTHER)) == result
+
+
 def test_reject_invalid_request_inputs_without_scope_leak() -> None:
     original = snapshot()
     cases: tuple[dict[str, object], ...] = (
@@ -236,6 +281,8 @@ def test_immutable_reference_values_and_no_authorizing_fields() -> None:
     assert original.digest() == outcome.snapshot_digest
     assert not hasattr(outcome, "ready")
     assert not hasattr(outcome, "bank_approved")
+    assert not hasattr(outcome, "kind")
+    assert not hasattr(outcome, "action")
     assert not outcome.enforcement_activated
 
 

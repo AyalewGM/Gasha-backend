@@ -1,32 +1,26 @@
-# Issue #44 — provisional, non-authoritative versioned risk-list match semantics
+# Issue #44 — inert match-only risk-list reference
 
-**Status:** Synthetic-only bounded reference, not an integrated risk-list system. Subject to Product Owner and Security/Architecture approval before reuse. Does **not** change bank decision scoring, execute BLOCK/HOLD, establish trusted list provenance, or activate stage gates. Existing #42 authenticated authorization and #49 trusted approval contracts remain required.
+**Status:** Synthetic-only, non-authoritative. Product Owner and Security & Architecture required removal of global BLOCK > WATCH > ALLOW precedence. The kernel now returns **all active matches**, not a winning kind, payment action or readiness verdict.
 
-## Explicit proposed precedence and explainability
+## Match table and reason provenance
 
-When multiple *currently effective* list entries match any supplied bank-tokenized subject of the exact kind, the reference match kind is the strongest matching class by the **provisional ranking BLOCK > WATCH > ALLOW**. The returned *list-match class*, not a transaction action, has precisely one explanatory code:
-
-| Matching classes present | Reference result | Reason code |
+| Active list classes | Returned matches | Authority |
 |---|---|---|
-| none | no match | RISK_LIST_NO_MATCH |
-| allow only | allow match | RISK_LIST_ALLOW_MATCH |
-| watch only | watch match | RISK_LIST_WATCH_MATCH |
-| block only | block match | RISK_LIST_BLOCK_MATCH |
-| allow + watch | watch match | RISK_LIST_WATCH_MATCH |
-| allow + block | block match | RISK_LIST_BLOCK_MATCH |
-| watch + block | block match | RISK_LIST_BLOCK_MATCH |
-| allow + watch + block | block match | RISK_LIST_BLOCK_MATCH |
+| None | Empty tuple and RISK_LIST_NO_MATCH | Never permission to pay |
+| Allow | All matching ALLOW entries, per-entry RISK_LIST_ALLOW_MATCH | Never an allow override |
+| Watch | All matching WATCH entries, per-entry RISK_LIST_WATCH_MATCH | Not an action |
+| Block | All matching BLOCK entries, per-entry RISK_LIST_BLOCK_MATCH | Never an executed HOLD/BLOCK |
+| Any pair or all three | Complete, UUID-ordered match set, each with entry ID, kind and reason | **No** winning class or precedence |
 
-No match is **not** permission to allow a transaction. An allow match is **not** a risk override. Proposed precedence is not bank policy; the Product Owner/Bank must explicitly approve or replace it before integration. There is no caller-controlled runtime precedence override.
+The `policy_version` field remains a scope *label*, not the definition or authority of a conflict policy. Future integration must bind Bank-approved, immutable policy content/digest to its version and select it server-side for the authorized tenant, installation and event time. No browser/request/worker assertion grants policy selection.
 
-## Temporal and scope invariants
+## Time, scope and replay contract
 
-- A match requires a caller-provided snapshot pinned to the exact tenant, list version and policy version. The matcher rejects different versions/tenants and snapshots with published_at later than the original event time.
-- Each entry's active interval is inclusive start/exclusive end; a revocation is effective at revoked_at inclusively. All times are UTC-normalized to handle repeated DST hours correctly.
-- Snapshot content fingerprints are canonical and order-insensitive, bound to tenant/version/policy/publication time and every entry's ID, kind, subject-token, effective bounds and revocation. Hashes attest **byte identity only**, not authority/source. Immutable older snapshots can reproduce synthetic historical matches without retroactive changes from later snapshots.
-- Subjects are typed BANK/CUSTOMER/ACCOUNT/BENEFICIARY references with 64 lowercase hex characters, **not** raw IDs. Real installations must create these using Bank-controlled keyed tokenization; an unsalted SHA-256 of PII is not sufficient privacy protection.
-- Output contains only matched entry UUIDs, a reference reason code, pinned list/policy versions and content digest. There are no transaction identifiers, raw subject tokens, or bank-data values in output.
+- UTC-normalized validity uses inclusive start, exclusive end, and inclusive revocation. Revocation before effective start is invalid even across DST fall-back folds; revocation exactly at start makes an entry never active.
+- Repeated entry IDs **and** duplicate logical (subject kind, token, list kind) entries with different IDs are rejected. Distinct subjects and distinct list classes remain separate matches.
+- Pinned tenant, list version, policy label, publication and every entry are bound to an order-independent snapshot digest. A content digest is **not** trusted source provenance. Future-published snapshots are rejected for historical events. Repeat synthetic replay yields identical complete provenance.
+- Typed BANK/CUSTOMER/ACCOUNT/BENEFICIARY identifiers use 64 lowercase hex placeholder tokens. Shape validation does **not** prove Bank-keyed pseudonymization; real installations must attest the token namespace/key version, avoiding raw or merely unsalted-hashed PII. Outputs omit tokens and transaction IDs.
 
-## Missing acceptance criteria and rollout prohibition
+## Excluded scope
 
-This module **does not implement** authorized administration, append-only mutation/audit, idempotent mutation IDs, PostgreSQL persistence, certificate/identity-backed list artifact validation, trusted snapshot selection, policy-approved conflict behavior, cross-tenant read/write enforcement, outcome/decision wiring, bank replay, or rollback/migration. A caller can construct an arbitrary snapshot: it is never authoritative. Do not import this module from protected routes, decision service, worker or readiness evaluator. Separate Product Owner → Security & Architecture → Independent QA exact-SHA review is required before even inactive internal integration.
+No Bank-authenticated snapshot reader, privileged admin/RBAC, durable versioned list registry, append-only mutation/audit, idempotency, version-bound policy resolver, historical replay adapter, production decision/worker integration, or #49 readiness authority is implemented. The reference must not be imported into protected routes, scoring, worker or readiness evaluator. Independent Product Owner, Security & Architecture and QA exact-head reviews plus Unified Lead approval are required before even inactive internal integration. No bank deployment or payment enforcement.
