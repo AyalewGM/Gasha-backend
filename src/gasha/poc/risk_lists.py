@@ -205,7 +205,9 @@ def match_reference_snapshot(
         raise RiskListRejected("snapshot scope or version mismatch")
     if snapshot.published_at > at:
         raise RiskListRejected("snapshot was not published at event time")
-    if type(subjects) is not tuple or any(type(subject) is not RiskListSubject for subject in subjects):
+    if type(subjects) is not tuple or any(
+        type(subject) is not RiskListSubject for subject in subjects
+    ):
         raise RiskListRejected("immutable typed subjects required")
     if len(set(subjects)) != len(subjects):
         raise RiskListRejected("duplicate subject reference")
