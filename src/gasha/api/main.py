@@ -402,6 +402,8 @@ def _case_history_view(
             or event.revision != revision
             or type(event.revision) is not int
             or event.previous_revision != (revision - 1 if revision > 1 else None)
+            or (event.previous_revision is not None
+                and type(event.previous_revision) is not int)
             or type(event.operation) is not CaseOperation
             or type(event.reason_code) is not CaseReason
             or (event.disposition is not None
