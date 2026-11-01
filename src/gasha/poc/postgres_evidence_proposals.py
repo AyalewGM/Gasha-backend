@@ -14,7 +14,7 @@ from json import dumps
 from re import fullmatch
 from uuid import UUID, uuid4
 
-from gasha.poc.evidence_identity import EvidencePacket
+from gasha.poc.evidence_identity import EvidenceIdentityRejected, EvidencePacket
 from gasha.poc.evidence_lifecycle import (
     EvidenceAction,
     EvidenceLifecycle,
@@ -112,7 +112,7 @@ def _load_history(
         events.append(event)
     try:
         return EvidenceLifecycle(packet=packet, events=tuple(events))
-    except LifecycleRejected as exc:
+    except (LifecycleRejected, EvidenceIdentityRejected) as exc:
         raise EvidenceLedgerRejected("stored evidence replay invalid") from exc
 
 
