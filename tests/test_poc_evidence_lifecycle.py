@@ -30,10 +30,10 @@ def actor(subject: str, *caps: Capability, tenant: str = "bank-a", expiry: datet
     )
 
 
-COLLECTOR = actor("collector", Capability.EVIDENCE_CREATE)
+COLLECTOR = actor("collector", Capability.EVIDENCE_SUBMIT)
 VERIFIER = actor("verifier", Capability.EVIDENCE_VERIFY)
-APPROVER = actor("approver", Capability.EVIDENCE_APPROVE)
-REVOKER = actor("revoker", Capability.EVIDENCE_REVOKE)
+APPROVER = actor("approver", Capability.STAGE_APPROVE)
+REVOKER = actor("revoker", Capability.EVIDENCE_REVOKE, Capability.APPROVAL_REVOKE)
 
 
 class ArtifactReader:
@@ -116,8 +116,8 @@ def test_positive_synthetic_lifecycle_proposals_are_bound_but_not_authority() ->
 
 @pytest.mark.parametrize("capability_actor", [
     actor("wrong-cap", Capability.EVIDENCE_VERIFY),
-    actor("wrong-tenant", Capability.EVIDENCE_CREATE, tenant="bank-b"),
-    actor("expired", Capability.EVIDENCE_CREATE, expiry=NOW),
+    actor("wrong-tenant", Capability.EVIDENCE_SUBMIT, tenant="bank-b"),
+    actor("expired", Capability.EVIDENCE_SUBMIT, expiry=NOW),
 ])
 def test_submission_fails_on_capability_tenant_or_expired_credential(
     capability_actor: TrustedPrincipal,
@@ -128,11 +128,27 @@ def test_submission_fails_on_capability_tenant_or_expired_credential(
     assert lifecycle.events == ()
 
 
+def test_legacy_capabilities_do_not_grant_bank_lifecycle_actions() -> None:
+    draft = EvidenceLifecycle(packet())
+    with pytest.raises(LifecycleRejected, match="denied"):
+        apply(draft, EvidenceAction.SUBMIT,
+              actor("collector", Capability.EVIDENCE_CREATE), UUID(int=1))
+    with pytest.raises(LifecycleRejected, match="denied"):
+        apply(verified(), EvidenceAction.APPROVE,
+              actor("approver", Capability.EVIDENCE_APPROVE))
+    with pytest.raises(LifecycleRejected, match="denied"):
+        apply(approved(), EvidenceAction.REVOKE_APPROVAL,
+              actor("revoker", Capability.EVIDENCE_REVOKE))
+    with pytest.raises(LifecycleRejected, match="denied"):
+        apply(verified(), EvidenceAction.REVOKE_EVIDENCE,
+              actor("revoker", Capability.APPROVAL_REVOKE), UUID(int=1))
+
+
 def test_collector_identity_must_match_immutable_record() -> None:
     lifecycle = EvidenceLifecycle(packet())
     with pytest.raises(LifecycleRejected, match="collector mismatch"):
         apply(lifecycle, EvidenceAction.SUBMIT,
-              actor("other-collector", Capability.EVIDENCE_CREATE), UUID(int=1))
+              actor("other-collector", Capability.EVIDENCE_SUBMIT), UUID(int=1))
 
 
 def test_no_approval_without_every_independent_verification() -> None:
@@ -146,14 +162,14 @@ def test_no_approval_without_every_independent_verification() -> None:
 
 
 def test_collector_cannot_verify_even_with_both_capabilities() -> None:
-    dual = actor("collector", Capability.EVIDENCE_CREATE, Capability.EVIDENCE_VERIFY)
+    dual = actor("collector", Capability.EVIDENCE_SUBMIT, Capability.EVIDENCE_VERIFY)
     with pytest.raises(LifecycleRejected, match="independent verification"):
         apply(submitted(), EvidenceAction.VERIFY, dual, UUID(int=1), reader=ArtifactReader())
 
 
 @pytest.mark.parametrize("identity", ["collector", "verifier"])
 def test_approver_must_be_separate_from_collectors_and_verifiers(identity: str) -> None:
-    dual = actor(identity, Capability.EVIDENCE_APPROVE)
+    dual = actor(identity, Capability.STAGE_APPROVE)
     with pytest.raises(LifecycleRejected, match="independent verified"):
         apply(verified(), EvidenceAction.APPROVE, dual)
 
@@ -175,7 +191,7 @@ def test_reject_unauthorized_verifier_and_unknown_evidence() -> None:
     lifecycle = submitted()
     with pytest.raises(LifecycleRejected, match="capability"):
         apply(lifecycle, EvidenceAction.VERIFY,
-              actor("wrong", Capability.EVIDENCE_APPROVE), UUID(int=1),
+              actor("wrong", Capability.STAGE_APPROVE), UUID(int=1),
               reader=ArtifactReader())
     with pytest.raises(LifecycleRejected, match="reader and evidence"):
         apply(lifecycle, EvidenceAction.VERIFY, VERIFIER, UUID(int=99),
@@ -251,7 +267,7 @@ def test_tampered_approval_without_verify_is_rejected() -> None:
 def test_revocation_requires_authorized_tenant_and_capability() -> None:
     lifecycle = approved()
     for principal in (actor("tenant-else", Capability.EVIDENCE_REVOKE, tenant="bank-b"),
-                      actor("wrong-cap", Capability.EVIDENCE_APPROVE)):
+                      actor("wrong-cap", Capability.STAGE_APPROVE)):
         with pytest.raises(LifecycleRejected, match="denied"):
             apply(lifecycle, EvidenceAction.REVOKE_APPROVAL, principal)
 
