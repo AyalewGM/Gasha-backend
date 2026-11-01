@@ -8,7 +8,10 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from gasha.poc.evidence_identity import (
-    EvidenceBinding, EvidenceIdentityRejected, EvidencePacket, EvidenceRecord,
+    EvidenceBinding,
+    EvidenceIdentityRejected,
+    EvidencePacket,
+    EvidenceRecord,
 )
 from gasha.poc.evidence_lifecycle import (
     EvidenceAction,
