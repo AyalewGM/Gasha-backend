@@ -230,3 +230,21 @@ def test_timestamp_and_metadata_forgery_are_rejected_when_invalid() -> None:
         replace(envelope(), dataset_digest="sha256:" + "Z" * 64)
     with pytest.raises(HistoricalLineageRejected, match="opaque canonical"):
         replace(envelope(), policy_version="bad\nversion")
+
+
+def test_lineage_helper_is_not_imported_or_consulted_by_live_paths() -> None:
+    """Do not wire caller-supplied fingerprints into live replay or readiness."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "gasha"
+    helper = root / "poc" / "temporal_lineage.py"
+    assert helper.is_file()
+    forbidden = ("temporal_lineage", "HistoricalFeatureEnvelope", "assert_historical_snapshot_bound")
+    consumers = []
+    for candidate in root.rglob("*.py"):
+        if candidate == helper:
+            continue
+        source = candidate.read_text(encoding="utf-8")
+        if any(marker in source for marker in forbidden):
+            consumers.append(candidate.relative_to(root).as_posix())
+    assert consumers == [], f"Unreviewed production lineage integration: {consumers}"
