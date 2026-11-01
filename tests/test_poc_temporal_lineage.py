@@ -1,0 +1,250 @@
+"""Issue #48 source-only historical feature lineage negative/positive tests."""
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Any
+from uuid import UUID
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from gasha.domain.models import BeneficiaryType, CanonicalTransaction, IntelligenceSnapshot
+from gasha.poc.temporal_lineage import (
+    HistoricalFeatureEnvelope,
+    HistoricalLineageRejected,
+    SignalLineage,
+    assert_historical_snapshot_bound,
+)
+
+EVENT_TIME = datetime(2025, 6, 2, 12, tzinfo=UTC)
+CUTOFF = EVENT_TIME + timedelta(seconds=2)
+DATASET = "sha256:" + "a" * 64
+EVENT = UUID(int=81)
+
+
+def observation(name: str = "customer_risk") -> SignalLineage:
+    return SignalLineage(
+        name=name, value=0.2, source_ref="synthetic-source", source_version="signals-v1",
+        as_of=EVENT_TIME - timedelta(minutes=5), available_at=EVENT_TIME,
+    )
+
+
+def envelope() -> HistoricalFeatureEnvelope:
+    return HistoricalFeatureEnvelope(
+        tenant_id="synthetic-tenant", event_id=EVENT, dataset_digest=DATASET,
+        cohort_version="cohort-1", mapping_version="map-1",
+        configuration_version="config-1", policy_version="policy-1",
+        signal_policy_version="signals-1", occurred_at=EVENT_TIME,
+        decision_cutoff=CUTOFF,
+        signals=tuple(observation(name) for name in IntelligenceSnapshot.model_fields),
+    )
+
+
+def transaction() -> CanonicalTransaction:
+    return CanonicalTransaction(
+        tenant_id="synthetic-tenant", event_id=EVENT, occurred_at=EVENT_TIME,
+        channel="synthetic-channel", transaction_type="synthetic-payment",
+        amount=Decimal("1.0"), currency="ETB", sender_customer_id="sample-1",
+        sender_account_id="sample-2", beneficiary_id="sample-3",
+        beneficiary_type=BeneficiaryType.INTERNAL, correlation_id="synthetic-4",
+    )
+
+
+def validate(env: HistoricalFeatureEnvelope | None = None) -> None:
+    assert_historical_snapshot_bound(
+        envelope() if env is None else env, transaction=transaction(),
+        snapshot=IntelligenceSnapshot(**{n: 0.2 for n in IntelligenceSnapshot.model_fields}),
+        expected_tenant="synthetic-tenant", expected_dataset_digest=DATASET,
+    )
+
+
+def test_complete_synthetic_context_is_value_bound_but_not_verified() -> None:
+    original = envelope()
+    validate(original)
+    reordered = replace(original, signals=tuple(reversed(original.signals)))
+    assert original.fingerprint() == reordered.fingerprint()
+    assert original.fingerprint().startswith("sha256:")
+    assert original.unavailable_signals() == ()
+    assert not hasattr(original, "verified")
+    assert not hasattr(original, "ready")
+
+
+@pytest.mark.parametrize("field", [
+    "tenant_id", "event_id", "dataset_digest", "cohort_version", "mapping_version",
+    "configuration_version", "policy_version", "signal_policy_version",
+    "occurred_at", "decision_cutoff",
+])
+def test_material_scope_changes_alter_fingerprint(field: str) -> None:
+    original = envelope()
+    replacements: dict[str, Any] = {
+        "tenant_id": "other-tenant", "event_id": UUID(int=82),
+        "dataset_digest": "sha256:" + "b" * 64, "cohort_version": "cohort-2",
+        "mapping_version": "map-2", "configuration_version": "config-2",
+        "policy_version": "policy-2", "signal_policy_version": "signals-2",
+        "occurred_at": EVENT_TIME - timedelta(seconds=1),
+        "decision_cutoff": CUTOFF + timedelta(seconds=1),
+    }
+    other = replace(original, **{field: replacements[field]})
+    assert other.fingerprint() != original.fingerprint()
+
+
+@pytest.mark.parametrize("field", [
+    "value", "source_ref", "source_version", "as_of", "available_at",
+])
+def test_each_signal_provenance_change_alters_fingerprint(field: str) -> None:
+    replacements: dict[str, Any] = {
+        "value": 0.3, "source_ref": "other-source", "source_version": "signals-v2",
+        "as_of": EVENT_TIME - timedelta(minutes=7),
+        "available_at": EVENT_TIME + timedelta(seconds=1),
+    }
+    original = envelope()
+    new = replace(original.signals[0], **{field: replacements[field]})
+    modified = replace(original, signals=(new, *original.signals[1:]))
+    assert modified.fingerprint() != original.fingerprint()
+    if field == "value":
+        with pytest.raises(HistoricalLineageRejected, match="value contradicts"):
+            validate(modified)
+
+
+def test_newer_source_values_cannot_enter_old_decision() -> None:
+    original = envelope()
+    late = replace(
+        original.signals[0],
+        as_of=CUTOFF + timedelta(seconds=1),
+        available_at=CUTOFF + timedelta(seconds=1),
+    )
+    with pytest.raises(HistoricalLineageRejected, match="post-cutoff feature"):
+        replace(original, signals=(late, *original.signals[1:]))
+
+
+def test_as_of_cannot_follow_recorded_availability() -> None:
+    with pytest.raises(HistoricalLineageRejected, match="as-of follows"):
+        replace(observation(), as_of=CUTOFF, available_at=EVENT_TIME)
+
+
+def test_feature_available_exactly_at_cutoff_is_accepted() -> None:
+    original = envelope()
+    newest = replace(original.signals[0], as_of=CUTOFF, available_at=CUTOFF)
+    validate(replace(original, signals=(newest, *original.signals[1:])))
+
+
+def test_unavailable_telemetry_is_explicit_and_blocks_numeric_replay() -> None:
+    original = envelope()
+    missing = SignalLineage(name="customer_risk", value=None, unavailable_reason="not-collected")
+    deficient = replace(original, signals=(missing, *original.signals[1:]))
+    assert deficient.unavailable_signals() == ("customer_risk",)
+    assert deficient.fingerprint() != original.fingerprint()
+    with pytest.raises(HistoricalLineageRejected, match="unavailable telemetry"):
+        validate(deficient)
+
+
+@pytest.mark.parametrize("fields", [
+    {"source_ref": "source-1"},
+    {"source_version": "signals-v1"},
+    {"as_of": EVENT_TIME},
+    {"available_at": EVENT_TIME},
+])
+def test_unavailable_signal_cannot_claim_measured_source(fields: dict[str, Any]) -> None:
+    with pytest.raises(HistoricalLineageRejected, match="unavailable signal"):
+        SignalLineage(name="customer_risk", value=None, unavailable_reason="missing", **fields)
+
+
+@pytest.mark.parametrize("value", [True, 0, float("nan"), float("inf"), -0.1, 1.1])
+def test_invalid_signal_measurements_fail_closed(value: Any) -> None:
+    with pytest.raises(HistoricalLineageRejected):
+        replace(observation(), value=value)
+
+
+@pytest.mark.parametrize("bad", ["", "has space", "raw\npii", "é", " source", "x" * 129])
+def test_identifier_input_is_bounded_ascii(bad: str) -> None:
+    with pytest.raises(HistoricalLineageRejected):
+        replace(observation(), source_ref=bad)
+
+
+def test_duplicate_or_missing_signal_fails_before_fingerprint() -> None:
+    original = envelope()
+    with pytest.raises(HistoricalLineageRejected, match="duplicate"):
+        replace(original, signals=(*original.signals[:-1], original.signals[0]))
+    with pytest.raises(HistoricalLineageRejected, match="missing explicit"):
+        replace(original, signals=original.signals[:-1])
+
+
+@pytest.mark.parametrize("altered", ["tenant", "event", "dataset", "timestamp", "risk"])
+def test_reject_cross_scope_and_changed_scores(altered: str) -> None:
+    env = envelope()
+    tx = transaction()
+    snapshot = IntelligenceSnapshot(**{n: 0.2 for n in IntelligenceSnapshot.model_fields})
+    tenant = "synthetic-tenant"
+    dataset = DATASET
+    if altered == "tenant":
+        tenant = "other-tenant"
+    elif altered == "event":
+        tx = tx.model_copy(update={"event_id": UUID(int=82)})
+    elif altered == "dataset":
+        dataset = "sha256:" + "b" * 64
+    elif altered == "timestamp":
+        tx = tx.model_copy(update={"occurred_at": EVENT_TIME + timedelta(seconds=1)})
+    else:
+        snapshot = snapshot.model_copy(update={"customer_risk": 0.9})
+    with pytest.raises(HistoricalLineageRejected):
+        assert_historical_snapshot_bound(
+            env, transaction=tx, snapshot=snapshot,
+            expected_tenant=tenant, expected_dataset_digest=dataset,
+        )
+
+
+def test_dst_repeated_local_time_cannot_alias_same_source_provenance() -> None:
+    zone = ZoneInfo("America/New_York")
+    first = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=0)
+    second = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=1)
+    base = replace(envelope(), occurred_at=datetime(2026, 11, 1, 4, tzinfo=UTC),
+                   decision_cutoff=datetime(2026, 11, 1, 7, tzinfo=UTC))
+    early = replace(base.signals[0], as_of=first, available_at=first)
+    late = replace(base.signals[0], as_of=second, available_at=second)
+    first_env = replace(base, signals=(early, *base.signals[1:]))
+    second_env = replace(base, signals=(late, *base.signals[1:]))
+    assert first_env.fingerprint() != second_env.fingerprint()
+    assert early.available_at != late.available_at
+
+
+def test_equivalent_utc_instants_in_offsets_hash_same() -> None:
+    original = envelope()
+    offset = timezone(timedelta(hours=-4))
+    signals = tuple(
+        replace(s, as_of=s.as_of.astimezone(offset), available_at=s.available_at.astimezone(offset))
+        for s in original.signals
+    )
+    equivalent = replace(
+        original, occurred_at=EVENT_TIME.astimezone(offset),
+        decision_cutoff=CUTOFF.astimezone(offset), signals=signals,
+    )
+    assert original.fingerprint() == equivalent.fingerprint()
+
+
+def test_timestamp_and_metadata_forgery_are_rejected_when_invalid() -> None:
+    with pytest.raises(HistoricalLineageRejected, match="timezone-aware"):
+        replace(envelope(), decision_cutoff=datetime(2025, 6, 2, 12))
+    with pytest.raises(HistoricalLineageRejected, match="precedes event"):
+        replace(envelope(), decision_cutoff=EVENT_TIME - timedelta(seconds=1))
+    with pytest.raises(HistoricalLineageRejected, match="dataset_digest"):
+        replace(envelope(), dataset_digest="sha256:" + "Z" * 64)
+    with pytest.raises(HistoricalLineageRejected, match="opaque canonical"):
+        replace(envelope(), policy_version="bad\nversion")
+
+
+def test_lineage_helper_is_not_imported_or_consulted_by_live_paths() -> None:
+    """Do not wire caller-supplied fingerprints into live replay or readiness."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "gasha"
+    helper = root / "poc" / "temporal_lineage.py"
+    assert helper.is_file()
+    forbidden = ("temporal_lineage", "HistoricalFeatureEnvelope", "assert_historical_snapshot_bound")
+    consumers = []
+    for candidate in root.rglob("*.py"):
+        if candidate == helper:
+            continue
+        source = candidate.read_text(encoding="utf-8")
+        if any(marker in source for marker in forbidden):
+            consumers.append(candidate.relative_to(root).as_posix())
+    assert consumers == [], f"Unreviewed production lineage integration: {consumers}"
