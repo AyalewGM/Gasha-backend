@@ -26,6 +26,7 @@ from gasha.cases.timeline import (
     CaseEvent,
     CaseOperation,
     CaseReason,
+    validate_case_history,
 )
 from gasha.decision.mode import DecisionEnvelope, ModeAwareDecisionService
 from gasha.decision.service import DecisionService
@@ -385,6 +386,7 @@ def _case_history_view(
     """Defensive projection of a trusted reader result; no raw case notes/PII."""
     if type(history) is not tuple:
         raise ValueError("immutable case history required")
+    validate_case_history(history, tenant_id=tenant_id, case_id=case_id)
     projection: list[dict[str, object]] = []
     first_event: UUID | None = None
     first_context: str | None = None

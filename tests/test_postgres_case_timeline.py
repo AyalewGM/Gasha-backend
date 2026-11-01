@@ -577,3 +577,78 @@ def test_case_postgres_expiry_uses_utc_for_reads_and_writes_across_dst(schema):
         assert history == (created,)
         assert created.recorded_at == valid_now.astimezone(UTC)
         assert counts(connection) == (1, 1)
+
+
+def test_case_history_http_postgres_composition_and_terminal_audit(schema):
+    """Installed TestClient -> real PostgreSQL reader; still synthetic credentials.
+
+    Proves persistence/restart, tenant and credential checks, and final-audit
+    fail-close without treating the DB/IdP as a Bank deployment.
+    """
+    from fastapi.testclient import TestClient
+
+    from gasha.api.main import app
+    from gasha.security.access import CredentialRejected
+
+    class Verifier:
+        def verify(self, bearer):
+            if bearer == "valid":
+                return read_principal
+            if bearer == "expired":
+                return replace(read_principal, expires_at=AT - timedelta(seconds=1))
+            raise CredentialRejected("revoked synthetic credential")
+
+    class Audit:
+        def __init__(self):
+            self.events = []
+            self.fail_terminal = False
+
+        def append(self, event):
+            if self.fail_terminal and event.reason == "case_history_read":
+                raise RuntimeError("synthetic terminal audit unavailable")
+            self.events.append(event)
+
+    names = ("identity_verifier", "security_audit", "case_history_reader")
+    saved = {name: getattr(app.state, name, None) for name in names}
+    audit = Audit()
+    read_principal = principal(
+        capabilities=frozenset({Capability.CASE_READ}),
+    )
+    read_principal = replace(
+        read_principal, expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    case_id, event_id = uuid4(), uuid4()
+    url = f"/v1/tenants/tenant-a/cases/{case_id}/history"
+    try:
+        with connect(schema) as writer:
+            service = PostgresCaseTimelineService(writer)
+            apply(service, cmd(CaseOperation.CREATE, case_id, event_id, 0))
+        # A distinct connection after commit proves durable read composition.
+        with connect(schema) as reader_connection:
+            app.state.identity_verifier = Verifier()
+            app.state.security_audit = audit
+            app.state.case_history_reader = PostgresCaseTimelineService(reader_connection)
+            client = TestClient(app)
+            headers = {"Authorization": "Bearer valid"}
+            response = client.get(url, headers=headers)
+            assert response.status_code == 200
+            assert response.json()["events"][0]["operation"] == "create"
+            assert response.json()["enforcement_activated"] is False
+            assert client.get(url).status_code == 401
+            assert client.get(url, headers={"Authorization": "Bearer revoked"}).status_code == 401
+            assert client.get(url, headers={"Authorization": "Bearer expired"}).status_code == 401
+            assert client.get(
+                url.replace("/tenant-a/", "/tenant-b/"), headers=headers,
+            ).status_code == 404
+            audit.fail_terminal = True
+            denied = client.get(url, headers=headers)
+            assert denied.status_code == 503
+            assert '"events"' not in denied.text
+            audit.fail_terminal = False
+            assert client.get(url, headers=headers).status_code == 200
+            assert counts(reader_connection) == (1, 1)
+            assert any(e.reason == "case_history_read" and e.result == "succeeded"
+                       for e in audit.events)
+    finally:
+        for name, value in saved.items():
+            setattr(app.state, name, value)

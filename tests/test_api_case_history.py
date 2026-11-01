@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from gasha.api.main import app, get_principal
 from gasha.cases.timeline import (
     BankExecution,
+    CaseDisposition,
     CaseEvent,
     CaseOperation,
     CaseReason,
@@ -232,6 +233,88 @@ def test_history_clock_uses_absolute_utc_not_dst_wall_time(wired_case_history):
     assert response.status_code == 503
 
 
+
+@pytest.mark.parametrize("change", [
+    {"assignee_ref": "b" * 64},
+    {"operation": CaseOperation.RECONCILE, "reason_code": CaseReason.FEEDBACK_RECONCILED},
+    {"operation": CaseOperation.DISPOSE, "disposition": CaseDisposition.FRAUD,
+     "reason_code": CaseReason.LEGITIMATE_EVIDENCE},
+    {"operation": CaseOperation.CREATE, "reason_code": CaseReason.ANALYST_TRIAGE},
+    {"operation": CaseOperation.CREATE, "disposition": CaseDisposition.FRAUD},
+])
+def test_invalid_initial_case_lifecycle_is_denied(wired_case_history, change):
+    client, audit, reader = wired_case_history
+    reader.events = (replace(synthetic_event(), **change),)
+    response = client.get(path(), headers=token())
+    assert response.status_code == 503
+    assert response.json() == {"detail": "case history unavailable"}
+    assert reader.calls == [("tenant-a", CASE_ID)]
+    assert any(e.result == "failed" and e.reason == "case_history_unavailable"
+               for e in audit.events)
+    assert not any(e.result == "succeeded" and e.reason == "case_history_read"
+                   for e in audit.events)
+
+
+@pytest.mark.parametrize("change", [
+    {"operation": CaseOperation.CREATE, "reason_code": CaseReason.SOURCE_EVALUATION},
+    {"operation": CaseOperation.ASSIGN, "reason_code": CaseReason.INVESTIGATION_ASSIGNED,
+     "assignee_ref": "b" * 64},
+    {"operation": CaseOperation.DISPOSE, "reason_code": CaseReason.FRAUD_EVIDENCE,
+     "disposition": CaseDisposition.FRAUD},
+    {"operation": CaseOperation.CORRECT, "reason_code": CaseReason.CORRECTED_FINDING,
+     "disposition": CaseDisposition.LEGITIMATE},
+    {"operation": CaseOperation.RECONCILE, "reason_code": CaseReason.FEEDBACK_RECONCILED},
+    {"operation": CaseOperation.TRIAGE, "reason_code": CaseReason.SOURCE_EVALUATION},
+    {"operation": CaseOperation.TRIAGE, "reason_code": CaseReason.ANALYST_TRIAGE,
+     "assignee_ref": "b" * 64},
+    {"operation": CaseOperation.TRIAGE, "reason_code": CaseReason.ANALYST_TRIAGE,
+     "disposition": CaseDisposition.FRAUD},
+])
+def test_invalid_subsequent_case_lifecycle_is_denied(wired_case_history, change):
+    client, audit, reader = wired_case_history
+    first = synthetic_event()
+    next_event = replace(
+        first, revision=2, previous_revision=1,
+        recorded_at=first.recorded_at + timedelta(seconds=1),
+        idempotency_ref="f" * 64, command_ref="1" * 64,
+        **change,
+    )
+    reader.events = (first, next_event)
+    response = client.get(path(), headers=token())
+    assert response.status_code == 503
+    assert response.json() == {"detail": "case history unavailable"}
+    assert reader.calls == [("tenant-a", CASE_ID)]
+    assert any(e.result == "failed" and e.reason == "case_history_unavailable"
+               for e in audit.events)
+    assert not any(e.result == "succeeded" and e.reason == "case_history_read"
+                   for e in audit.events)
+
+
+def test_case_history_correction_requires_changed_disposition(wired_case_history):
+    client, audit, reader = wired_case_history
+    first = synthetic_event()
+    steps = (
+        (CaseOperation.TRIAGE, CaseReason.ANALYST_TRIAGE, None, None),
+        (CaseOperation.ASSIGN, CaseReason.INVESTIGATION_ASSIGNED, None, "b" * 64),
+        (CaseOperation.DISPOSE, CaseReason.FRAUD_EVIDENCE, CaseDisposition.FRAUD, None),
+        (CaseOperation.CORRECT, CaseReason.CORRECTED_FINDING, CaseDisposition.FRAUD, None),
+    )
+    history = [first]
+    for index, (operation, reason, disposition, assignee) in enumerate(steps, 2):
+        history.append(replace(
+            first, revision=index, previous_revision=index - 1,
+            operation=operation, reason_code=reason, disposition=disposition,
+            assignee_ref=assignee, recorded_at=first.recorded_at + timedelta(seconds=index),
+            idempotency_ref=f"{index:064x}", command_ref=f"{index + 10:064x}",
+        ))
+    reader.events = tuple(history)
+    response = client.get(path(), headers=token())
+    assert response.status_code == 503
+    assert response.json() == {"detail": "case history unavailable"}
+    assert any(e.result == "failed" and e.reason == "case_history_unavailable"
+               for e in audit.events)
+
+
 def test_empty_case_is_not_found_and_has_redacted_audit(wired_case_history):
     client, audit, reader = wired_case_history
     reader.events = ()
@@ -296,6 +379,7 @@ def test_case_history_multiple_transitions_are_immutable_and_nonexecuting(
         first, revision=2, previous_revision=1, operation=CaseOperation.TRIAGE,
         reason_code=CaseReason.ANALYST_TRIAGE,
         recorded_at=first.recorded_at + timedelta(seconds=1),
+        idempotency_ref="f" * 64, command_ref="1" * 64,
     )
     reader.events = (first, second)
     response = client.get(path(), headers=token())

@@ -60,6 +60,8 @@ jobs:
               "cross_tenant_and_spoofed_proxy_claims_cannot_read",
               "audit_outage_prevents_case_reader_access",
               "untrusted_reader_payload_fails_closed",
+              "invalid_initial_case_lifecycle_is_denied",
+              "invalid_subsequent_case_lifecycle_is_denied",
               "cross_tenant_denial",
               "missing_context_or_audit_fails_closed",
               "root_path_tenant_role_and_body_spoofing",

@@ -82,7 +82,12 @@ case_id, at)` and should be backed by the existing reviewed
 with tenant-scoped database permissions, validated historical source/evaluation
 links, fresh credential/capability checks and operational failure handling.
 The protected endpoint additionally validates the returned immutable history,
-opaque identifiers and UTC-monotonic timestamps before serialization.
+opaque identifiers, UTC-monotonic timestamps, and the canonical case lifecycle
+before serialization. The same pure validator is reused by the PostgreSQL
+adapter and the case proposal kernel: CREATE must be first; transitions,
+reason/disposition, assignee placement and corrections must be semantically
+valid. An invalid typed reader history returns redacted 503 with a failed
+audit event, never analyst evidence.
 
 Existing `tests/test_api_case_history.py` cases execute missing/revoked/expired
 and provider-down credentials, cross-tenant/capability denial, proxy/header
