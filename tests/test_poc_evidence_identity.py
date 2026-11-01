@@ -3,6 +3,7 @@ from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -227,3 +228,101 @@ def test_reconstructed_packet_cannot_attest_external_artifact_or_approval() -> N
     assert_packet_current(other, expected=binding(), now=NOW)
     assert other.packet_digest() != original.packet_digest()
     assert not hasattr(other, "bank_inline_approved")
+
+
+def _fold_scope(fold: int) -> EvidenceBinding:
+    """The repeated local 01:30 refers to two distinct real UTC instants."""
+    ny = ZoneInfo("America/New_York")
+    return replace(
+        binding(),
+        window_start=datetime(2026, 11, 1, 4, 0, tzinfo=UTC),
+        window_end=datetime(2026, 11, 1, 1, 30, tzinfo=ny, fold=fold),
+    )
+
+
+def _fold_record(scope: EvidenceBinding) -> EvidenceRecord:
+    return replace(
+        record(), binding=scope,
+        collected_at=datetime(2026, 11, 1, 7, 0, tzinfo=UTC),
+        expires_at=datetime(2026, 11, 1, 10, 0, tzinfo=UTC),
+    )
+
+
+def test_fall_back_different_instants_reject_wrong_expected_binding() -> None:
+    early = _fold_scope(0)
+    late = _fold_scope(1)
+    assert early.window_end == datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
+    assert late.window_end == datetime(2026, 11, 1, 6, 30, tzinfo=UTC)
+    assert early.window_end.tzinfo is UTC
+    assert late.window_end.tzinfo is UTC
+    assert early != late
+    sample = EvidencePacket(early, "evaluator-1", (_fold_record(early),))
+    assert_packet_current(sample, expected=early, now=datetime(2026, 11, 1, 8, tzinfo=UTC))
+    with pytest.raises(EvidenceIdentityRejected, match="binding mismatch"):
+        assert_packet_current(
+            sample, expected=late, now=datetime(2026, 11, 1, 8, tzinfo=UTC)
+        )
+
+
+def test_fall_back_cross_scope_record_rejected() -> None:
+    early = _fold_scope(0)
+    late = _fold_scope(1)
+    with pytest.raises(EvidenceIdentityRejected, match="cross-scope"):
+        EvidencePacket(early, "evaluator-1", (_fold_record(late),))
+
+
+def test_fall_back_different_instants_change_packet_fingerprint() -> None:
+    early = _fold_scope(0)
+    late = _fold_scope(1)
+    first = EvidencePacket(early, "evaluator-1", (_fold_record(early),))
+    second = EvidencePacket(late, "evaluator-1", (_fold_record(late),))
+    assert first.packet_digest() != second.packet_digest()
+
+
+def test_same_instant_different_offsets_have_same_scope_and_digest() -> None:
+    early = _fold_scope(0)
+    offset = timezone(timedelta(hours=-3))
+    equivalent = replace(
+        early,
+        window_start=early.window_start.astimezone(offset),
+        window_end=early.window_end.astimezone(offset),
+    )
+    original = _fold_record(early)
+    equivalent_record = replace(
+        original, binding=equivalent,
+        collected_at=original.collected_at.astimezone(offset),
+        expires_at=original.expires_at.astimezone(offset),
+    )
+    first = EvidencePacket(early, "evaluator-1", (original,))
+    second = EvidencePacket(equivalent, "evaluator-1", (equivalent_record,))
+    assert early == equivalent
+    assert original == equivalent_record
+    assert first.packet_digest() == second.packet_digest()
+    assert_packet_current(first, expected=equivalent, now=original.collected_at)
+    assert_packet_current(second, expected=early, now=original.collected_at)
+
+
+def test_dst_collection_and_expiry_exact_instant_boundaries() -> None:
+    late = _fold_scope(1)
+    local_cutoff = datetime(
+        2026, 11, 1, 1, 30, tzinfo=ZoneInfo("America/New_York"), fold=1
+    )
+    expiry = datetime(2026, 11, 1, 8, 0, tzinfo=UTC)
+    on_boundary = replace(
+        record(), binding=late, collected_at=local_cutoff,
+        expires_at=expiry.astimezone(timezone(timedelta(hours=-3))),
+    )
+    assert on_boundary.collected_at == late.window_end
+    assert on_boundary.collected_at.tzinfo is UTC
+    assert on_boundary.expires_at.tzinfo is UTC
+    with pytest.raises(EvidenceIdentityRejected, match="collection predates"):
+        replace(on_boundary, collected_at=late.window_end - timedelta(microseconds=1))
+
+    sample = EvidencePacket(late, "evaluator-1", (on_boundary,))
+    assert_packet_current(sample, expected=late, now=late.window_end)
+    with pytest.raises(EvidenceIdentityRejected, match="future-dated"):
+        assert_packet_current(
+            sample, expected=late, now=late.window_end - timedelta(microseconds=1)
+        )
+    with pytest.raises(EvidenceIdentityRejected, match="expired"):
+        assert_packet_current(sample, expected=late, now=expiry)

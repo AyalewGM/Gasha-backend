@@ -87,8 +87,14 @@ class EvidenceBinding:
             raise EvidenceIdentityRejected("commit_sha must be a lowercase Git SHA")
         _digest("image_digest", self.image_digest)
         _digest("dataset_digest", self.dataset_digest)
-        if _time("window_start", self.window_start) > _time("window_end", self.window_end):
+        start = _time("window_start", self.window_start)
+        end = _time("window_end", self.window_end)
+        if start > end:
             raise EvidenceIdentityRejected("window_end precedes window_start")
+        # Dataclass equality must compare UTC instants, not ambiguous local walls.
+        # A fall-back fold=0 versus fold=1 differs even with shared ZoneInfo.
+        object.__setattr__(self, "window_start", start)
+        object.__setattr__(self, "window_end", end)
 
     def _identity(self) -> dict[str, str]:
         return {
@@ -142,6 +148,8 @@ class EvidenceRecord:
             raise EvidenceIdentityRejected("collection predates observation window end")
         if expires <= collected:
             raise EvidenceIdentityRejected("expiry must follow collection")
+        object.__setattr__(self, "collected_at", collected)
+        object.__setattr__(self, "expires_at", expires)
 
     def _identity(self) -> dict[str, str]:
         return {

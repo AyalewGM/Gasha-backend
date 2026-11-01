@@ -15,7 +15,9 @@ evaluator, a verified Bank packet or an enforcement authorization.
   observation window. No arbitrary caller-controlled stage promotion occurs.
 - `EvidenceRecord` fixes UUID, evidence area, bounded opaque artifact reference
   and SHA-256 digest, pseudonymous collector reference, source, collection time
-  and expiry. Timezone-aware instants are canonicalized to UTC when hashed.
+  and expiry. Every timezone-aware timestamp is normalized to a stored UTC
+  instant during frozen construction, before dataclass scope comparisons and
+  hashing; the two repeated New York fall-back 01:30 times remain distinct.
 - `EvidencePacket` is a frozen, immutable collection; it rejects duplicate IDs,
   mixed scopes and mutable input collections. Its deterministic, domain-tagged
   content digest includes the policy evaluator version and every record identity.
@@ -23,7 +25,8 @@ evaluator, a verified Bank packet or an enforcement authorization.
 - `assert_packet_current(..., expected=..., now=...)` rejects scope/version
   substitutions, future-collected or expired evidence. The clock is injected; at
   exactly the expiry instant the record is expired. Collection must occur no earlier
-  than the bound observation window end.
+  than the bound observation window end. DST-fold wrong-expected and mixed-record
+  windows are rejected; equivalent UTC instants in other zones retain one identity.
 
 These are **local structural/freshness checks**, not evidence verification.
 Any untrusted caller can construct the same well-shaped data and compute a hash.
