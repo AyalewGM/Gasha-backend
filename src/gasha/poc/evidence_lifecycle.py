@@ -137,6 +137,13 @@ def _replay(lifecycle: EvidenceLifecycle) -> _State:
             if event.action is EvidenceAction.SUBMIT:
                 if event.evidence_id in submitted or event.actor_ref != record.collector_actor_ref:
                     raise LifecycleRejected("duplicate submission or collector mismatch")
+                # Replay must enforce the same collection/expiry boundary as
+                # propose_transition. Otherwise a forged or damaged persisted
+                # SUBMIT event can predate evidence collection or follow expiry,
+                # even though fresh submissions through the proposal API fail.
+                assert_packet_current(
+                    lifecycle.packet, expected=lifecycle.packet.binding, now=event.at,
+                )
                 submitted.add(event.evidence_id)
             elif event.action is EvidenceAction.VERIFY:
                 if (
