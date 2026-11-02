@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -137,6 +137,39 @@ def test_atomic_accept_duplicate_and_append_correction(schema: str) -> None:
                    and r["actor_ref"] == identity.audit_actor
                    and len(r["tenant_ref"]) == 64 and len(r["event_ref"]) == 64
                    for r in events)
+
+
+def test_equivalent_utc_instants_are_idempotent_across_source_offsets(
+    schema: str,
+) -> None:
+    with connect(schema) as connection:
+        service = writer(connection, schema)
+        gasha = outcome()
+        assert gasha.confirmed_at is not None
+        offset_gasha = gasha.model_copy(update={
+            "confirmed_at": gasha.confirmed_at.astimezone(timezone(timedelta(hours=-5)))
+        })
+        identity = principal(Capability.OUTCOME_SUBMIT)
+        assert service.submit(gasha, principal=identity, now=NOW).status is SubmissionStatus.ACCEPTED
+        assert (
+            service.submit(offset_gasha, principal=identity, now=NOW).status
+            is SubmissionStatus.DUPLICATE
+        )
+        bank = incumbent()
+        offset_bank = bank.model_copy(update={
+            "recorded_at": bank.recorded_at.astimezone(timezone(timedelta(hours=7)))
+        })
+        incumbent_id = principal(Capability.INCUMBENT_OUTCOME_SUBMIT)
+        assert (
+            service.submit_incumbent(bank, principal=incumbent_id, now=NOW).status
+            is SubmissionStatus.ACCEPTED
+        )
+        assert (
+            service.submit_incumbent(
+                offset_bank, principal=incumbent_id, now=NOW
+            ).status is SubmissionStatus.DUPLICATE
+        )
+        assert counts(connection) == (2, 4)
 
 
 def test_incumbent_path_is_distinct_and_capability_scoped(schema: str) -> None:
