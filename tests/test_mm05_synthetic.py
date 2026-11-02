@@ -162,7 +162,7 @@ def test_zero_transaction_count_rejects_nonzero_aggregate_value(
     count_field: str, value_field: str,
 ) -> None:
     row = packet()
-    invalid = {count_field: 0, value_field: Decimal("1")}
+    invalid = {count_field: 0, value_field: Decimal(1)}
     with pytest.raises(ScenarioContractError, match="zero transactions"):
         evaluate(row, values=replace(metrics(row), **invalid))
 
