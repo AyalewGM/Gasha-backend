@@ -145,16 +145,22 @@ def test_synthetic_case_snapshot_counts_rates_ages_and_unknown_clocks() -> None:
         "alert_timing_unknown": 2,
     }
     assert snapshot["backlog_age"] == {
-        "count": 2, "denominator": 2, "mean_seconds": 1800.0,
-        "max_seconds": 3000.0, "undefined_reason": None,
+        "count": 2, "denominator": 3, "eligible_count": 2,
+        "missing_count": 0, "censored_count": 0, "excluded_count": 1,
+        "coverage_rate": 2 / 3, "eligible_coverage_rate": 1.0,
+        "mean_seconds": 1800.0, "max_seconds": 3000.0, "undefined_reason": None,
     }
     assert snapshot["investigation_turnaround"] == {
-        "count": 2, "denominator": 3, "mean_seconds": 1200.0,
-        "max_seconds": 1800.0, "undefined_reason": None,
+        "count": 2, "denominator": 3, "eligible_count": 2,
+        "missing_count": 0, "censored_count": 1, "excluded_count": 0,
+        "coverage_rate": 2 / 3, "eligible_coverage_rate": 1.0,
+        "mean_seconds": 1200.0, "max_seconds": 1800.0, "undefined_reason": None,
     }
     assert snapshot["alert_latency"] == {
-        "count": 1, "denominator": 3, "mean_seconds": 120.0,
-        "max_seconds": 120.0, "undefined_reason": None,
+        "count": 1, "denominator": 3, "eligible_count": 3,
+        "missing_count": 2, "censored_count": 0, "excluded_count": 0,
+        "coverage_rate": 1 / 3, "eligible_coverage_rate": 1 / 3,
+        "mean_seconds": 120.0, "max_seconds": 120.0, "undefined_reason": None,
     }
     assert snapshot["unresolved_rate"] == {
         "count": 1, "denominator": 2, "rate": 0.5, "undefined_reason": None,
@@ -169,6 +175,17 @@ def test_synthetic_case_snapshot_counts_rates_ages_and_unknown_clocks() -> None:
 def test_empty_snapshot_and_only_untriaged_cases_have_defined_missing_values() -> None:
     empty = _report()
     assert empty["counts"]["total_cases"] == 0
+    for name in ("backlog_age", "investigation_turnaround", "alert_latency"):
+        summary = empty[name]
+        assert summary["denominator"] == 0
+        assert summary["eligible_count"] == 0
+        assert summary["missing_count"] == 0
+        assert summary["censored_count"] == 0
+        assert summary["excluded_count"] == 0
+        assert summary["coverage_rate"] is None
+        assert summary["eligible_coverage_rate"] is None
+        assert summary["mean_seconds"] is None
+    assert "NaN" not in json.dumps(empty, allow_nan=False)
     assert empty["alert_latency"]["mean_seconds"] is None
     assert empty["alert_latency"]["undefined_reason"] == "no_synthetic_alert_clocks"
     assert empty["unresolved_rate"]["rate"] is None
@@ -177,6 +194,11 @@ def test_empty_snapshot_and_only_untriaged_cases_have_defined_missing_values() -
     assert opened["counts"]["open_investigations"] == 1
     assert opened["investigation_turnaround"]["count"] == 0
     assert opened["investigation_turnaround"]["denominator"] == 1
+    assert opened["investigation_turnaround"]["eligible_count"] == 0
+    assert opened["investigation_turnaround"]["censored_count"] == 1
+    assert opened["investigation_turnaround"]["eligible_coverage_rate"] is None
+    assert opened["investigation_turnaround"]["coverage_rate"] == 0.0
+    assert opened["alert_latency"]["missing_count"] == 1
     assert opened["investigation_turnaround"]["undefined_reason"] == (
         "no_completed_investigations"
     )
@@ -340,3 +362,76 @@ def test_reject_malformed_clocks_scope_and_mutable_clock_inputs() -> None:
             "tenant-a", history[0].case_id, history[0].source_event_id,
             datetime(2026, 11, 1, 18), AS_OF,
         )
+
+
+def test_censoring_and_missing_timing_cover_every_synthetic_case() -> None:
+    complete = _done("complete-coverage")
+    pending = _unresolved("pending-coverage")
+    open_case = _open("open-coverage")
+    report = _report(complete, pending, open_case)
+    for name in ("backlog_age", "investigation_turnaround", "alert_latency"):
+        duration = report[name]
+        assert (
+            duration["count"] + duration["missing_count"]
+            + duration["censored_count"] + duration["excluded_count"]
+            == duration["denominator"] == 3
+        )
+        assert duration["count"] + duration["missing_count"] == duration["eligible_count"]
+    assert report["investigation_turnaround"]["censored_count"] == 1
+    assert report["alert_latency"]["missing_count"] == 3
+    assert report["alert_latency"]["coverage_rate"] == 0.0
+    assert report["alert_latency"]["eligible_coverage_rate"] == 0.0
+    assert report["alert_latency"]["mean_seconds"] is None
+    assert "NaN" not in json.dumps(report, allow_nan=False)
+
+
+def test_reassignment_cannot_reset_first_assignment_clock() -> None:
+    # The canonical append-only lifecycle admits exactly one ASSIGN. Neither
+    # a second ASSIGN nor an unassigned DISPOSE can enter the aggregate.
+    reassignment = _steps(
+        "reassigned", (CREATE, 60, None), (TRIAGE, 55, None),
+        (ASSIGN, 50, None), (ASSIGN, 40, None),
+        (DISPOSE, 20, CaseDisposition.FRAUD),
+    )
+    with pytest.raises(CaseRejected, match="invalid case lifecycle"):
+        _report(_done(), reassignment)
+    without_assignment = _steps(
+        "missing-assignment", (CREATE, 60, None), (TRIAGE, 55, None),
+        (DISPOSE, 20, CaseDisposition.FRAUD),
+    )
+    with pytest.raises(CaseRejected, match="invalid case lifecycle"):
+        _report(_done(), without_assignment)
+    valid = _report(_done())
+    assert valid["investigation_turnaround"]["count"] == 1
+    assert valid["investigation_turnaround"]["mean_seconds"] == 1800.0
+    assert valid["investigation_turnaround"]["missing_count"] == 0
+
+
+@pytest.mark.parametrize("invalid", [
+    datetime(2026, 11, 1, 18),
+    "2026-11-01T18:00:00Z",
+    None,
+    0,
+])
+def test_external_synthetic_clocks_must_be_typed_and_aware(invalid: object) -> None:
+    history = _done()
+    valid = _clock(history)
+    with pytest.raises(CaseMetricsRejected):
+        replace(valid, source_event_at=invalid)  # type: ignore[arg-type]
+    with pytest.raises(CaseMetricsRejected):
+        replace(valid, alert_emitted_at=invalid)  # type: ignore[arg-type]
+
+
+def test_equivalent_utc_offset_instants_keep_timing_canonical() -> None:
+    from datetime import timezone
+    hour_ahead = timezone(timedelta(hours=1))
+    history = _done()
+    clock = _clock(history)
+    shifted = replace(
+        clock,
+        source_event_at=clock.source_event_at.astimezone(hour_ahead),
+        alert_emitted_at=clock.alert_emitted_at.astimezone(hour_ahead),
+    )
+    assert _report(history, clocks=(clock,))["alert_latency"] == (
+        _report(history, clocks=(shifted,))["alert_latency"]
+    )

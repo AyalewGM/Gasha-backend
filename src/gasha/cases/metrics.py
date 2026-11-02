@@ -58,15 +58,29 @@ class SyntheticAlertClock:
 
 
 def _duration(
-    samples: list[float], denominator: int, missing_reason: str,
+    samples: list[float], *, cohort: int, eligible: int,
+    censored: int, missing_reason: str,
 ) -> dict[str, object]:
-    """Explicit sample coverage; missing timings never become zero latency."""
+    """Expose the complete cohort, observed, missing, censored and excluded counts.
+
+    All rates remain provisional synthetic measurements. Missing observations
+    cannot silently improve a Bank-facing latency or turnaround denominator.
+    """
+    observed = len(samples)
+    if eligible < observed or cohort < eligible + censored:
+        raise CaseMetricsRejected("invalid duration coverage accounting")
     return {
-        "count": len(samples),
-        "denominator": denominator,
-        "mean_seconds": sum(samples) / len(samples) if samples else None,
-        "max_seconds": max(samples) if samples else None,
-        "undefined_reason": None if samples else missing_reason,
+        "count": observed,
+        "denominator": cohort,
+        "eligible_count": eligible,
+        "missing_count": eligible - observed,
+        "censored_count": censored,
+        "excluded_count": cohort - eligible - censored,
+        "coverage_rate": observed / cohort if cohort else None,
+        "eligible_coverage_rate": observed / eligible if eligible else None,
+        "mean_seconds": sum(samples) / observed if observed else None,
+        "max_seconds": max(samples) if observed else None,
+        "undefined_reason": None if observed else missing_reason,
     }
 
 
@@ -179,11 +193,19 @@ def summarize_synthetic_case_metrics(
             "reconciled": reconciled,
             "alert_timing_unknown": total - len(latencies),
         },
-        "backlog_age": _duration(backlog_ages, backlog, "no_open_investigations"),
-        "investigation_turnaround": _duration(
-            turnarounds, total, "no_completed_investigations"
+        "backlog_age": _duration(
+            backlog_ages, cohort=total, eligible=backlog, censored=0,
+            missing_reason="no_open_investigations",
         ),
-        "alert_latency": _duration(latencies, total, "no_synthetic_alert_clocks"),
+        "investigation_turnaround": _duration(
+            turnarounds, cohort=total, eligible=disposed,
+            censored=total - disposed,
+            missing_reason="no_completed_investigations",
+        ),
+        "alert_latency": _duration(
+            latencies, cohort=total, eligible=total, censored=0,
+            missing_reason="no_synthetic_alert_clocks",
+        ),
         "unresolved_rate": {
             "count": unresolved,
             "denominator": disposed,
@@ -192,6 +214,7 @@ def summarize_synthetic_case_metrics(
         },
         "limitations": (
             "Clocks and histories are caller-supplied, not Bank-attested.",
+            "Every duration reports the whole synthetic cohort and its missing coverage.",
             "Alert latency excludes cases without both synthetic alert clocks.",
             "Backlog and disposition definitions require Bank KPI agreement.",
             "No protected API, trusted history reader, Bank action or release authority.",
