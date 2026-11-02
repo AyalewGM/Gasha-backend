@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
@@ -271,6 +271,16 @@ def inspect_scenario_coverage(
     """Coverage only: required absence BLOCKS; cannot promote #54 readiness."""
     if type(observation) is not ScenarioObservation:
         raise ScenarioContractError("typed scenario observation required")
+    # Frozen dataclasses can still be forged by object.__setattr__ or a
+    # deserializer. Re-run all field and packet invariants at the use boundary:
+    # unchecked timestamps or mutated evidence must not turn into coverage.
+    if type(observation.fields) is not tuple:
+        raise ScenarioContractError("fields must be an immutable tuple")
+    if any(type(field) is not FieldEvidence for field in observation.fields):
+        raise ScenarioContractError("untyped field evidence")
+    observation = replace(
+        observation, fields=tuple(replace(field) for field in observation.fields)
+    )
     _token("expected_installation", expected_installation)
     _token("expected_tenant", expected_tenant)
     _digest("expected_dataset_digest", expected_dataset_digest)
