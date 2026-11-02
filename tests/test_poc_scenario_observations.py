@@ -214,6 +214,49 @@ def test_duplicate_evidence_and_mutable_containers_rejected() -> None:
         replace(row, fields=list(row.fields))
 
 
+@pytest.mark.parametrize(
+    "attribute,value",
+    [
+        ("available_at", AT + timedelta(microseconds=1)),
+        ("observed_at", datetime(2026, 10, 30, 12)),
+        ("evidence_digest", "not-a-digest"),
+        ("source_ref", "raw customer identifier"),
+    ],
+)
+def test_coverage_revalidates_forged_field_before_claiming_coverage(
+    attribute: str, value: object,
+) -> None:
+    # An unchecked deserializer or object.__setattr__ can bypass frozen
+    # dataclass construction; consumption must not trust prior validation.
+    row = observation(ScenarioId.MM_05)
+    object.__setattr__(row.fields[0], attribute, value)
+    with pytest.raises(ScenarioContractError):
+        inspect(row)
+
+
+@pytest.mark.parametrize(
+    "attribute,value",
+    [
+        ("decision_cutoff", AT - timedelta(seconds=1)),
+        ("mapping_version", "bad version with spaces"),
+    ],
+)
+def test_coverage_revalidates_forged_packet_before_claiming_coverage(
+    attribute: str, value: object,
+) -> None:
+    row = observation(ScenarioId.APP_01)
+    object.__setattr__(row, attribute, value)
+    with pytest.raises(ScenarioContractError):
+        inspect(row)
+
+
+def test_coverage_rejects_forged_mutable_evidence_container() -> None:
+    row = observation(ScenarioId.APP_05)
+    object.__setattr__(row, "fields", list(row.fields))
+    with pytest.raises(ScenarioContractError, match="immutable"):
+        inspect(row)
+
+
 def test_immutable_and_field_order_independent_digest() -> None:
     row = observation(ScenarioId.APP_01)
     assert row.fingerprint() == replace(row, fields=tuple(reversed(row.fields))).fingerprint()
@@ -238,7 +281,8 @@ def test_chronology_naive_timestamp_and_wrong_dataset_shapes_rejected() -> None:
 
 @pytest.mark.parametrize(
     "path", ["src/gasha/api/main.py", "src/gasha/worker.py",
-             "src/gasha/decision/service.py", "src/gasha/poc/readiness.py"],
+             "src/gasha/decision/service.py", "src/gasha/poc/readiness.py",
+             "src/gasha/ingestion/postgres_atomic_outcomes.py"],
 )
 def test_contract_not_wired_to_protected_or_authoritative_paths(path: str) -> None:
     assert "scenario_observations" not in Path(path).read_text(encoding="utf-8")
