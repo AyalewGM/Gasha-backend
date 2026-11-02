@@ -167,6 +167,12 @@ def _inspect(scope: DataQualityScope, observation: QualityObservation) -> _Resul
         codes.add("tenant_mismatch")
     if event.schema_version != scope.schema_version:
         codes.add("schema_mismatch")
+    # The adapter normally validates this at construction, but an unchecked
+    # synthetic model_copy can erase or corrupt the claimed source. Reject the
+    # record before it can contribute labels, alerts or deduplication identity.
+    # This checks shape only; source authenticity remains unverified.
+    if not _safe_token(event.source_system):
+        codes.add("invalid.source_system")
     raw_id = payload.get("event_id")
     try:
         event_id = UUID(raw_id) if type(raw_id) is str else None
@@ -212,6 +218,10 @@ def _inspect(scope: DataQualityScope, observation: QualityObservation) -> _Resul
             codes.add("missing.destination_institution_id")
     raw_signals = payload.get("intelligence")
     signals = raw_signals if isinstance(raw_signals, Mapping) else {}
+    # Distinguish absent telemetry from an explicitly malformed container.
+    # Both remain unavailable, but only the latter produces a quality warning.
+    if "intelligence" in payload and not isinstance(raw_signals, Mapping):
+        warnings.add("invalid_optional.intelligence")
     present: list[str] = []
     unavailable: list[str] = []
     for name in _OPTIONAL_SIGNALS[observation.use_case]:
