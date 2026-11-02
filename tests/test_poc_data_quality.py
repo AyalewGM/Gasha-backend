@@ -7,6 +7,7 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, uuid5
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -172,8 +173,109 @@ def test_future_and_naive_receipt_rejected() -> None:
     assert row["checks"]["invalid.receipt_order"] == 1
 
 
+@pytest.mark.parametrize("invalid_received", [
+    "not-a-datetime", 0, False, [], {}, None, datetime(2026, 1, 1, 12),
+])
+def test_unvalidated_receipt_type_quarantined_without_poisoning_valid_row(
+    invalid_received: object,
+) -> None:
+    """Bad adapter model_copy data must not crash inspection or reserve an event ID."""
+    valid = candidate(
+        "malformed-receipt",
+        payload_changes={"intelligence": {"beneficiary_risk": 0.0}},
+        label=True, confirmed_at=AT + timedelta(days=1), alerted=True,
+    )
+    baseline = result_for(valid)
+    corrupted = replace(valid, event=valid.event.model_copy(
+        update={"received_at": invalid_received},
+    ))
+    for observed in ((corrupted, valid), (valid, corrupted)):
+        row = result_for(*observed)
+        assert row["total"] == 2
+        assert row["accepted"] == 1
+        assert row["rejected"] == 1
+        assert row["checks"] == {"invalid.received_at": 1}
+        assert row["labels"] == {"positive": 1, "negative": 0, "unlabelled": 0}
+        assert row["alerts"] == {"alerted": 1, "not_alerted": 0, "unknown": 0}
+        assert row["optional_signals"] == baseline["optional_signals"]
+        assert row["acceptance"] == {
+            "count": 1, "denominator": 2, "rate": 0.5, "undefined_reason": None,
+        }
+
+
+def test_malformed_receipt_does_not_suppress_independent_quality_failures() -> None:
+    """Aggregate error counts retain all independently detectable defects."""
+    good = candidate(
+        "multi-defect", payload_changes={"intelligence": {"beneficiary_risk": 0.0}},
+        label=True, confirmed_at=AT + timedelta(days=1), alerted=True,
+    )
+    damaged_event = good.event.model_copy(update={
+        "received_at": None,
+        "tenant_id": "synthetic-other-tenant",
+        "schema_version": "wrong-schema",
+        "payload": dict(good.event.payload, sender_customer_id=None),
+    })
+    damaged = replace(
+        good, event=damaged_event, confirmed_at=AT - timedelta(minutes=1),
+    )
+    baseline = result_for(good)
+    for observed in ((damaged, good), (good, damaged)):
+        row = result_for(*observed)
+        assert row["total"] == 2 and row["accepted"] == 1 and row["rejected"] == 1
+        assert row["checks"] == {
+            "invalid.label_order": 1,
+            "invalid.received_at": 1,
+            "invalid.sender_customer_id": 1,
+            "missing.sender_customer_id": 1,
+            "schema_mismatch": 1,
+            "tenant_mismatch": 1,
+        }
+        assert "duplicate.event_id" not in row["checks"]
+        assert row["labels"] == baseline["labels"]
+        assert row["alerts"] == baseline["alerts"]
+        assert row["optional_signals"] == baseline["optional_signals"]
+        assert row["acceptance"]["count"] == 1
+        assert row["acceptance"]["denominator"] == 2
+
+
+def test_received_at_utc_order_and_cutoff_across_dst_fold() -> None:
+    """A repeated local hour must compare actual instants, not wall-clock values."""
+    zone = ZoneInfo("America/New_York")
+    occurred = datetime(2026, 11, 1, 1, 45, tzinfo=zone, fold=0)
+    received = datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=1)
+    assert occurred.astimezone(UTC) < received.astimezone(UTC)
+    test_scope = scope(
+        window_start=occurred.astimezone(UTC) - timedelta(minutes=1),
+        window_end=received.astimezone(UTC),
+        label_cutoff=received.astimezone(UTC),
+    )
+    observation = candidate(
+        "dst-fold-receipt",
+        payload_changes={"occurred_at": occurred.isoformat()},
+        event_changes={"received_at": received},
+    )
+
+    def inspect(rewritten: QualityObservation) -> dict[str, object]:
+        report = inspect_reference_quality(test_scope, (rewritten,)).to_dict()
+        return report["use_cases"][0]
+
+    assert inspect(observation)["accepted"] == 1
+    equivalent = replace(observation, event=observation.event.model_copy(update={
+        "received_at": received.astimezone(timezone(timedelta(hours=-5))),
+    }))
+    assert inspect(equivalent)["accepted"] == 1
+    late = replace(observation, event=observation.event.model_copy(update={
+        "received_at": received.astimezone(UTC) + timedelta(microseconds=1),
+    }))
+    assert inspect(late)["checks"] == {"invalid.receipt_order": 1}
+    early = replace(observation, event=observation.event.model_copy(update={
+        "received_at": datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=0),
+    }))
+    assert inspect(early)["checks"] == {"invalid.receipt_order": 1}
+
+
 @pytest.mark.parametrize("invalid_payload", [
-    None, "not-an-object", [], ["event_id"], 0, False,
+    None, "not-an-object", [], ["event_id"], (), ("event_id",), range(2), 0, False,
 ])
 def test_unvalidated_nonmapping_payload_is_quarantined_without_crashing(
     invalid_payload: object,
@@ -216,6 +318,81 @@ def test_nonmapping_payload_preserves_independent_scope_failures() -> None:
         assert report["checks"]["tenant_mismatch"] == 1
         assert report["checks"]["schema_mismatch"] == 1
         assert "duplicate.event_id" not in report["checks"]
+
+
+
+@pytest.mark.parametrize("invalid_payload", [
+    None, "invalid-opaque-body", [], ["event_id"], (), ("event_id",), range(2), 0, False,
+])
+@pytest.mark.parametrize("invalid_received", [
+    "invalid-receipt", None, 0, False, datetime(2026, 1, 1, 12),
+])
+def test_combined_nonmapping_payload_and_invalid_receipt_are_quarantined(
+    invalid_payload: object, invalid_received: object,
+) -> None:
+    """Two adapter-bypass defects must coexist without crashes or dedup poisoning."""
+    valid = candidate(
+        "combined-adapter-bypass",
+        payload_changes={"intelligence": {"beneficiary_risk": 0.0}},
+        label=True, confirmed_at=AT + timedelta(days=1), alerted=True,
+    )
+    baseline = result_for(valid)
+    bad = replace(valid, event=valid.event.model_copy(update={
+        "payload": invalid_payload,
+        "received_at": invalid_received,
+    }))
+    before = result_for(bad, valid)
+    after = result_for(valid, bad)
+    assert before == after
+    for row in (before, after):
+        assert row["total"] == 2
+        assert row["accepted"] == 1 and row["rejected"] == 1
+        assert row["checks"]["invalid.payload"] == 1
+        assert row["checks"]["invalid.received_at"] == 1
+        # A structurally invalid body also produces deterministic missing and
+        # invalid field codes, but must not create extra raw observation rows.
+        assert row["checks"]["missing.event_id"] == 1
+        assert row["checks"]["invalid.event_id"] == 1
+        assert row["checks"]["missing.occurred_at"] == 1
+        assert row["checks"]["invalid.occurred_at"] == 1
+        assert "duplicate.event_id" not in row["checks"]
+        assert all(count == 1 for count in row["checks"].values())
+        assert row["labels"] == baseline["labels"]
+        assert row["alerts"] == baseline["alerts"]
+        assert row["optional_signals"] == baseline["optional_signals"]
+        assert row["acceptance"] == {
+            "count": 1, "denominator": 2, "rate": 0.5, "undefined_reason": None,
+        }
+        assert row["optional_signals"]["beneficiary_risk"]["available"] == {
+            "count": 1, "denominator": 1, "rate": 1.0, "undefined_reason": None,
+        }
+
+
+def test_combined_corruption_keeps_independent_scope_and_schema_failures() -> None:
+    valid = candidate(
+        "combined-scope", payload_changes={"intelligence": {"beneficiary_risk": 0.0}},
+        label=True, confirmed_at=AT + timedelta(days=1), alerted=True,
+    )
+    bad = replace(valid, event=valid.event.model_copy(update={
+        "payload": ("not", "a", "mapping"),
+        "received_at": "invalid",
+        "tenant_id": "wrong-tenant",
+        "schema_version": "wrong-schema",
+    }))
+    for observations in ((bad, valid), (valid, bad)):
+        row = result_for(*observations)
+        assert row["total"] == 2 and row["accepted"] == 1 and row["rejected"] == 1
+        for code in (
+            "invalid.payload", "invalid.received_at",
+            "tenant_mismatch", "schema_mismatch",
+            "missing.event_id", "invalid.event_id",
+        ):
+            assert row["checks"][code] == 1
+        assert "duplicate.event_id" not in row["checks"]
+        assert row["labels"] == {"positive": 1, "negative": 0, "unlabelled": 0}
+        assert row["alerts"] == {"alerted": 1, "not_alerted": 0, "unknown": 0}
+        assert row["optional_signals"]["beneficiary_risk"]["available"]["count"] == 1
+        assert row["acceptance"]["denominator"] == 2
 
 
 def test_optional_missing_is_unavailable_not_zero_or_rejection() -> None:

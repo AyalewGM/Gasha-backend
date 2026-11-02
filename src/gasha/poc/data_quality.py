@@ -156,6 +156,8 @@ def _inspect(scope: DataQualityScope, observation: QualityObservation) -> _Resul
     # An invalid body cannot supply an event ID for deduplication.
     if not isinstance(payload, Mapping):
         codes.add("invalid.payload")
+        # Derived missing/invalid field checks are deliberate, so structural
+        # corruption stays visible while the row denominator remains one.
         payload = {}
     required = _JOURNEY_REQUIRED if observation.use_case is UseCase.UC03 else _PAYMENT_REQUIRED
     for name in required:
@@ -178,7 +180,10 @@ def _inspect(scope: DataQualityScope, observation: QualityObservation) -> _Resul
     elif not (_utc(scope.window_start) <= occurred <= _utc(scope.window_end)):
         codes.add("event_outside_window")
     received = event.received_at
-    if received is None or received.utcoffset() is None:
+    # InboundBankEvent normally validates this field, but Pydantic model_copy
+    # can carry an unvalidated runtime value from a synthetic adapter. Treat
+    # it as a quarantined bad clock rather than aborting the entire report.
+    if not isinstance(received, datetime) or received.utcoffset() is None:
         codes.add("invalid.received_at")
     elif occurred is not None:
         at = _utc(received)
