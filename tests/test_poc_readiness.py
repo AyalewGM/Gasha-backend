@@ -299,3 +299,48 @@ def test_canonical_finding_keeps_existing_critical_only_veto(
     assert result.ready is should_be_ready
     assert result.to_dict()["enforcement_activated"] is False
     assert ("unresolved_critical_security_finding" in result.blockers) is not should_be_ready
+
+
+@pytest.mark.parametrize("stage", list(Stage))
+@pytest.mark.parametrize(
+    ("first_resolved", "second_resolved"),
+    ((False, False), (False, True), (True, False), (True, True)),
+)
+def test_duplicate_finding_id_is_rejected_at_every_stage(
+    stage: Stage, first_resolved: bool, second_resolved: bool
+) -> None:
+    # A single traceability ID cannot name two different owners/severities/
+    # dispositions, even when both are resolved or a stage requires less data.
+    first = SecurityFinding(
+        "synthetic-finding-1", FindingSeverity.CRITICAL, "security-a", first_resolved
+    )
+    conflicting = SecurityFinding(
+        "synthetic-finding-1", FindingSeverity.HIGH, "security-b", second_resolved
+    )
+    packet = replace(
+        request(stage),
+        historical_accepted=True,
+        shadow_accepted=True,
+        bank_inline_approved=True,
+        tenant_inline_enabled=True,
+        findings=(first, conflicting),
+    )
+    with pytest.raises(ValueError, match="duplicate finding_id"):
+        evaluate_poc_gate(packet)
+
+
+def test_distinct_finding_ids_preserve_existing_critical_only_veto() -> None:
+    packet = replace(
+        request(Stage.INLINE_PREPARATION),
+        historical_accepted=True,
+        shadow_accepted=True,
+        bank_inline_approved=True,
+        tenant_inline_enabled=True,
+        findings=(
+            SecurityFinding("synthetic-finding-1", FindingSeverity.HIGH, "team-a", False),
+            SecurityFinding("synthetic-finding-2", FindingSeverity.CRITICAL, "team-b", True),
+        ),
+    )
+    report = evaluate_poc_gate(packet)
+    assert report.ready is True
+    assert report.to_dict()["enforcement_activated"] is False
