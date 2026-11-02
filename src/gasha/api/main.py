@@ -365,15 +365,21 @@ def _trusted_context(
         raise HTTPException(
             status_code=503, detail="trusted decision context unavailable"
         ) from exc
-    now = utcnow()
+    now = utcnow().astimezone(UTC)
     if (
         not isinstance(context, TrustedDecisionContext)
         or context.tenant_id != tx.tenant_id
         or context.event_id != tx.event_id
         or not _safe_version_metadata(context.signal_source_version)
         or not _safe_version_metadata(context.signal_version)
-        or context.collected_at > now
-        or context.expires_at <= now
+        or not isinstance(context.collected_at, datetime)
+        or context.collected_at.utcoffset() is None
+        or not isinstance(context.expires_at, datetime)
+        or context.expires_at.utcoffset() is None
+        # ZoneInfo repeated local time in a DST fold compares by wall clock
+        # when both operands share tzinfo. Enforce freshness by UTC instants.
+        or context.collected_at.astimezone(UTC) > now
+        or context.expires_at.astimezone(UTC) <= now
     ):
         raise HTTPException(status_code=503, detail="trusted decision context unavailable")
     return context
