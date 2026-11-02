@@ -489,3 +489,131 @@ def test_mid_migration_ddl_failure_rolls_back_new_objects_and_can_retry() -> Non
             admin.execute(
                 sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(fresh))
             )
+
+
+def test_nonowner_runtime_credential_is_schema_scoped(schema: str) -> None:
+    """Actual LOGIN connection, not SET ROLE on a privileged fixture session.
+
+    This models a separately provisioned, per-installation runtime credential
+    and proves narrow grants with hostile SQL. It is NOT Bank provisioning or
+    proof of row isolation within a schema; no protected endpoint is wired.
+    """
+    import secrets
+
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+    from psycopg.rows import dict_row
+
+    other = "gasha_other_" + uuid4().hex[:15]
+    role = "gasha_runtime_" + uuid4().hex[:15]
+    password = secrets.token_urlsafe(32)
+
+    with psycopg.connect(DSN, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(other)))
+        try:
+            with connect(other) as owner:
+                owner.execute((MIGRATIONS / "010_security_audit_events.sql").read_text())
+                owner.execute(
+                    "SELECT set_config('gasha.installation_schema', %s, true)",
+                    (other,),
+                )
+                owner.execute(POC_MIGRATION.read_text())
+                owner.commit()
+
+            admin.execute(
+                sql.SQL(
+                    "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB "
+                    "NOCREATEROLE NOREPLICATION NOINHERIT PASSWORD {}"
+                ).format(sql.Identifier(role), sql.Literal(password))
+            )
+            try:
+                admin.execute(
+                    sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                        sql.Identifier(schema), sql.Identifier(role)
+                    )
+                )
+                admin.execute(
+                    sql.SQL(
+                        "GRANT SELECT, INSERT ON TABLE {}.poc_atomic_outcomes TO {}"
+                    ).format(sql.Identifier(schema), sql.Identifier(role))
+                )
+                admin.execute(
+                    sql.SQL(
+                        "GRANT INSERT ON TABLE {}.security_audit_events TO {}"
+                    ).format(sql.Identifier(schema), sql.Identifier(role))
+                )
+                runtime_dsn = make_conninfo(DSN, user=role, password=password)
+                with psycopg.connect(runtime_dsn, row_factory=dict_row) as runtime:
+                    assert runtime.execute(
+                        "SELECT current_user AS role"
+                    ).fetchone()["role"] == role
+                    accepted = writer(runtime, schema).submit(
+                        outcome(), principal=principal(Capability.OUTCOME_SUBMIT),
+                        now=NOW,
+                    )
+                    assert accepted.status is SubmissionStatus.ACCEPTED
+
+                    # In particular, the runtime may NOT disable the history
+                    # trigger, mutate committed rows, read audit records or
+                    # access the adjacent installation's tenant history.
+                    forbidden = (
+                        sql.SQL("UPDATE {}.poc_atomic_outcomes SET tenant_id = 'bank-b'")
+                        .format(sql.Identifier(schema)),
+                        sql.SQL("DELETE FROM {}.poc_atomic_outcomes")
+                        .format(sql.Identifier(schema)),
+                        sql.SQL("TRUNCATE TABLE {}.poc_atomic_outcomes")
+                        .format(sql.Identifier(schema)),
+                        sql.SQL(
+                            "ALTER TABLE {}.poc_atomic_outcomes "
+                            "DISABLE TRIGGER poc_atomic_outcomes_immutable"
+                        ).format(sql.Identifier(schema)),
+                        sql.SQL("CREATE TABLE {}.unapproved (id int)")
+                        .format(sql.Identifier(schema)),
+                        sql.SQL("SELECT * FROM {}.security_audit_events")
+                        .format(sql.Identifier(schema)),
+                        sql.SQL("SELECT * FROM {}.poc_atomic_outcomes")
+                        .format(sql.Identifier(other)),
+                        sql.SQL("INSERT INTO {}.poc_atomic_outcomes DEFAULT VALUES")
+                        .format(sql.Identifier(other)),
+                        sql.SQL("SET ROLE {}").format(sql.Identifier("gasha_test")),
+                    )
+                    for statement in forbidden:
+                        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                            runtime.execute(statement)
+                        runtime.rollback()
+
+                # A missing audit INSERT grant must roll back an otherwise
+                # authorized correction; no outcome can commit without audit.
+                admin.execute(
+                    sql.SQL(
+                        "REVOKE INSERT ON TABLE {}.security_audit_events FROM {}"
+                    ).format(sql.Identifier(schema), sql.Identifier(role))
+                )
+                with psycopg.connect(runtime_dsn, row_factory=dict_row) as runtime:
+                    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                        writer(runtime, schema).submit(
+                            outcome(OutcomeType.CONFIRMED_LEGITIMATE),
+                            principal=principal(Capability.OUTCOME_SUBMIT),
+                            now=NOW,
+                        )
+                with connect(schema) as owner:
+                    assert counts(owner) == (1, 1)
+            finally:
+                for table in ("poc_atomic_outcomes", "security_audit_events"):
+                    admin.execute(
+                        sql.SQL("REVOKE ALL ON TABLE {}.{} FROM {}").format(
+                            sql.Identifier(schema), sql.Identifier(table),
+                            sql.Identifier(role),
+                        )
+                    )
+                admin.execute(
+                    sql.SQL("REVOKE ALL ON SCHEMA {} FROM {}").format(
+                        sql.Identifier(schema), sql.Identifier(role)
+                    )
+                )
+                admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+        finally:
+            admin.execute(
+                sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(other))
+            )
