@@ -591,13 +591,15 @@ def test_nonowner_runtime_credential_is_schema_scoped(schema: str) -> None:
                         "REVOKE INSERT ON TABLE {}.security_audit_events FROM {}"
                     ).format(sql.Identifier(schema), sql.Identifier(role))
                 )
-                with psycopg.connect(runtime_dsn, row_factory=dict_row) as runtime:
-                    with pytest.raises(psycopg.errors.InsufficientPrivilege):
-                        writer(runtime, schema).submit(
-                            outcome(OutcomeType.CONFIRMED_LEGITIMATE),
-                            principal=principal(Capability.OUTCOME_SUBMIT),
-                            now=NOW,
-                        )
+                with (
+                    psycopg.connect(runtime_dsn, row_factory=dict_row) as runtime,
+                    pytest.raises(psycopg.errors.InsufficientPrivilege),
+                ):
+                    writer(runtime, schema).submit(
+                        outcome(OutcomeType.CONFIRMED_LEGITIMATE),
+                        principal=principal(Capability.OUTCOME_SUBMIT),
+                        now=NOW,
+                    )
                 with connect(schema) as owner:
                     assert counts(owner) == (1, 1)
             finally:
