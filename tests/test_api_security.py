@@ -1067,7 +1067,7 @@ def test_protected_http_audit_actor_distinguishes_delimiter_shifted_identities(
     ("collected", "expires", "clock", "expected_status"),
     [
         pytest.param((15, 0), (30, 0), (15, 1), 503, id="expired-in-later-fold"),
-        pytest.param((15, 1), (30, 1), (30, 0), 503, id="future-collected-in-later-fold"),
+        pytest.param((15, 1), (45, 1), (30, 0), 503, id="future-collected-in-later-fold"),
         pytest.param((30, 0), (15, 1), (45, 0), 200, id="valid-across-fold"),
     ],
 )
@@ -1083,6 +1083,22 @@ def test_protected_context_freshness_uses_absolute_utc_during_dst_fold(
     def local(instant: tuple[int, int]) -> datetime:
         minute, fold = instant
         return datetime(2026, 11, 1, 1, minute, tzinfo=zone, fold=fold)
+
+    # Independent mutation guard: each fixture must distinguish the former
+    # same-ZoneInfo wall-time comparison from correct UTC-instant ordering.
+    collected_at, expires_at, trusted_now = (
+        local(collected), local(expires), local(clock)
+    )
+    legacy_accepts = not (
+        collected_at > trusted_now or expires_at <= trusted_now
+    )
+    utc_accepts = (
+        collected_at.astimezone(UTC)
+        <= trusted_now.astimezone(UTC)
+        < expires_at.astimezone(UTC)
+    )
+    assert legacy_accepts is (expected_status == 503)
+    assert utc_accepts is (expected_status == 200)
 
     class FoldContextProvider:
         def resolve(self, transaction, principal):
