@@ -179,6 +179,16 @@ def test_below_one_or_more_proposed_amount_thresholds_is_not_candidate(
     ] == APP01Status.AMOUNT_NOT_UNUSUAL.value
 
 
+def test_relative_threshold_fails_independently_of_absolute_threshold() -> None:
+    row = packet()
+    values = replace(
+        metrics(row), payment_amount=Decimal(1200), baseline_typical_amount=Decimal(300),
+    )
+    result = evaluate(row, values)
+    assert result["status"] == APP01Status.AMOUNT_NOT_UNUSUAL.value
+    assert result["reasons"] == ["below_one_or_more_proposed_thresholds"]
+
+
 def test_cross_currency_refuses_unapproved_fx_even_with_source_presence() -> None:
     row = packet(include_context=True)
     result = evaluate(row, replace(metrics(row), payment_currency="USD"))
