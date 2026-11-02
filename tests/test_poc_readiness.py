@@ -344,3 +344,79 @@ def test_distinct_finding_ids_preserve_existing_critical_only_veto() -> None:
     report = evaluate_poc_gate(packet)
     assert report.ready is True
     assert report.to_dict()["enforcement_activated"] is False
+
+@pytest.mark.parametrize("stage", list(Stage))
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "otherwise_identical",
+        "conflicting_owner",
+        "conflicting_severity",
+        "conflicting_attribution",
+        "conflicting_resolution",
+    ),
+)
+@pytest.mark.parametrize("reversed_order", (False, True))
+def test_repeated_canonical_finding_id_fails_closed_independent_of_order(
+    stage: Stage, variant: str, reversed_order: bool
+) -> None:
+    # All other caller-asserted evidence and approvals are present. A duplicate
+    # identity must prevent construction of a report even if the findings agree.
+    first = SecurityFinding(
+        "synthetic-shared-id", FindingSeverity.HIGH, "security-a", False, True
+    )
+    second = {
+        "otherwise_identical": first,
+        "conflicting_owner": replace(first, owner="security-b"),
+        "conflicting_severity": replace(first, severity=FindingSeverity.CRITICAL),
+        "conflicting_attribution": replace(first, gasha_attributable=False),
+        "conflicting_resolution": replace(first, resolved=True),
+    }[variant]
+    findings = (second, first) if reversed_order else (first, second)
+    packet = replace(
+        request(stage),
+        historical_accepted=True,
+        shadow_accepted=True,
+        bank_inline_approved=True,
+        tenant_inline_enabled=True,
+        findings=findings,
+    )
+    with pytest.raises(ValueError, match="duplicate finding_id"):
+        evaluate_poc_gate(packet)
+
+
+@pytest.mark.parametrize("stage", list(Stage))
+def test_distinct_case_sensitive_finding_ids_are_not_normalized(stage: Stage) -> None:
+    packet = replace(
+        request(stage),
+        historical_accepted=True,
+        shadow_accepted=True,
+        bank_inline_approved=True,
+        tenant_inline_enabled=True,
+        findings=(
+            SecurityFinding("Finding-1", FindingSeverity.HIGH, "security-a", False),
+            SecurityFinding("finding-1", FindingSeverity.HIGH, "security-a", False),
+        ),
+    )
+    report = evaluate_poc_gate(packet)
+    assert report.ready is True
+    assert report.to_dict()["enforcement_activated"] is False
+
+
+@pytest.mark.parametrize("malformed_first", (False, True))
+def test_malformed_finding_is_not_masked_by_repeated_id(
+    malformed_first: bool,
+) -> None:
+    valid = SecurityFinding("synthetic-shared-id", FindingSeverity.HIGH, "owner", False)
+    malformed = replace(valid, severity="high")
+    findings = (malformed, valid) if malformed_first else (valid, malformed)
+    packet = replace(
+        request(Stage.INLINE_PREPARATION),
+        historical_accepted=True,
+        shadow_accepted=True,
+        bank_inline_approved=True,
+        tenant_inline_enabled=True,
+        findings=findings,
+    )
+    with pytest.raises(TypeError, match="severity"):
+        evaluate_poc_gate(packet)

@@ -274,6 +274,127 @@ def test_received_at_utc_order_and_cutoff_across_dst_fold() -> None:
     assert inspect(early)["checks"] == {"invalid.receipt_order": 1}
 
 
+@pytest.mark.parametrize("invalid_payload", [
+    None, "not-an-object", [], ["event_id"], (), ("event_id",), range(2), 0, False,
+])
+def test_unvalidated_nonmapping_payload_is_quarantined_without_crashing(
+    invalid_payload: object,
+) -> None:
+    """Synthetic adapter bypasses must not abort the report or poison deduplication."""
+    valid = candidate(
+        "nonmapping-body", payload_changes={"intelligence": {"beneficiary_risk": 0.0}},
+        label=True, confirmed_at=AT + timedelta(days=1), alerted=True,
+    )
+    baseline = result_for(valid)
+    corrupted = replace(valid, event=valid.event.model_copy(
+        update={"payload": invalid_payload},
+    ))
+    for rows in ((corrupted, valid), (valid, corrupted)):
+        report = result_for(*rows)
+        assert report["total"] == 2
+        assert report["accepted"] == 1 and report["rejected"] == 1
+        assert report["checks"]["invalid.payload"] == 1
+        assert "duplicate.event_id" not in report["checks"]
+        assert report["labels"] == baseline["labels"]
+        assert report["alerts"] == baseline["alerts"]
+        assert report["optional_signals"] == baseline["optional_signals"]
+        assert report["acceptance"] == {
+            "count": 1, "denominator": 2, "rate": 0.5, "undefined_reason": None,
+        }
+
+
+def test_nonmapping_payload_preserves_independent_scope_failures() -> None:
+    """A corrupt body must not hide an independently wrong tenant or schema."""
+    valid = candidate("nonmapping-scope")
+    invalid = replace(valid, event=valid.event.model_copy(update={
+        "payload": [],
+        "tenant_id": "other-tenant",
+        "schema_version": "different-schema",
+    }))
+    for rows in ((invalid, valid), (valid, invalid)):
+        report = result_for(*rows)
+        assert report["accepted"] == 1 and report["rejected"] == 1
+        assert report["checks"]["invalid.payload"] == 1
+        assert report["checks"]["tenant_mismatch"] == 1
+        assert report["checks"]["schema_mismatch"] == 1
+        assert "duplicate.event_id" not in report["checks"]
+
+
+
+@pytest.mark.parametrize("invalid_payload", [
+    None, "invalid-opaque-body", [], ["event_id"], (), ("event_id",), range(2), 0, False,
+])
+@pytest.mark.parametrize("invalid_received", [
+    "invalid-receipt", None, 0, False, datetime(2026, 1, 1, 12),
+])
+def test_combined_nonmapping_payload_and_invalid_receipt_are_quarantined(
+    invalid_payload: object, invalid_received: object,
+) -> None:
+    """Two adapter-bypass defects must coexist without crashes or dedup poisoning."""
+    valid = candidate(
+        "combined-adapter-bypass",
+        payload_changes={"intelligence": {"beneficiary_risk": 0.0}},
+        label=True, confirmed_at=AT + timedelta(days=1), alerted=True,
+    )
+    baseline = result_for(valid)
+    bad = replace(valid, event=valid.event.model_copy(update={
+        "payload": invalid_payload,
+        "received_at": invalid_received,
+    }))
+    before = result_for(bad, valid)
+    after = result_for(valid, bad)
+    assert before == after
+    for row in (before, after):
+        assert row["total"] == 2
+        assert row["accepted"] == 1 and row["rejected"] == 1
+        assert row["checks"]["invalid.payload"] == 1
+        assert row["checks"]["invalid.received_at"] == 1
+        # A structurally invalid body also produces deterministic missing and
+        # invalid field codes, but must not create extra raw observation rows.
+        assert row["checks"]["missing.event_id"] == 1
+        assert row["checks"]["invalid.event_id"] == 1
+        assert row["checks"]["missing.occurred_at"] == 1
+        assert row["checks"]["invalid.occurred_at"] == 1
+        assert "duplicate.event_id" not in row["checks"]
+        assert all(count == 1 for count in row["checks"].values())
+        assert row["labels"] == baseline["labels"]
+        assert row["alerts"] == baseline["alerts"]
+        assert row["optional_signals"] == baseline["optional_signals"]
+        assert row["acceptance"] == {
+            "count": 1, "denominator": 2, "rate": 0.5, "undefined_reason": None,
+        }
+        assert row["optional_signals"]["beneficiary_risk"]["available"] == {
+            "count": 1, "denominator": 1, "rate": 1.0, "undefined_reason": None,
+        }
+
+
+def test_combined_corruption_keeps_independent_scope_and_schema_failures() -> None:
+    valid = candidate(
+        "combined-scope", payload_changes={"intelligence": {"beneficiary_risk": 0.0}},
+        label=True, confirmed_at=AT + timedelta(days=1), alerted=True,
+    )
+    bad = replace(valid, event=valid.event.model_copy(update={
+        "payload": ("not", "a", "mapping"),
+        "received_at": "invalid",
+        "tenant_id": "wrong-tenant",
+        "schema_version": "wrong-schema",
+    }))
+    for observations in ((bad, valid), (valid, bad)):
+        row = result_for(*observations)
+        assert row["total"] == 2 and row["accepted"] == 1 and row["rejected"] == 1
+        for code in (
+            "invalid.payload", "invalid.received_at",
+            "tenant_mismatch", "schema_mismatch",
+            "missing.event_id", "invalid.event_id",
+        ):
+            assert row["checks"][code] == 1
+        assert "duplicate.event_id" not in row["checks"]
+        assert row["labels"] == {"positive": 1, "negative": 0, "unlabelled": 0}
+        assert row["alerts"] == {"alerted": 1, "not_alerted": 0, "unknown": 0}
+        assert row["optional_signals"]["beneficiary_risk"]["available"]["count"] == 1
+        assert row["acceptance"]["denominator"] == 2
+
+
 def test_optional_missing_is_unavailable_not_zero_or_rejection() -> None:
     good_zero = candidate("zero", payload_changes={"intelligence": {"device_session_risk": 0.0}},
                           uc=UseCase.UC03)

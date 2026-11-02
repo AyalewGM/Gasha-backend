@@ -150,6 +150,15 @@ def _inspect(scope: DataQualityScope, observation: QualityObservation) -> _Resul
     payload = event.payload
     codes: set[str] = set()
     warnings: set[str] = set()
+    # Normal construction validates a mapping, but Pydantic model_copy(update=...)
+    # can bypass that contract in a synthetic adapter. Quarantine the whole
+    # invalid body instead of raising during required-field or signal checks.
+    # An invalid body cannot supply an event ID for deduplication.
+    if not isinstance(payload, Mapping):
+        codes.add("invalid.payload")
+        # Derived missing/invalid field checks are deliberate, so structural
+        # corruption stays visible while the row denominator remains one.
+        payload = {}
     required = _JOURNEY_REQUIRED if observation.use_case is UseCase.UC03 else _PAYMENT_REQUIRED
     for name in required:
         if name not in payload or payload[name] is None or payload[name] == "":
