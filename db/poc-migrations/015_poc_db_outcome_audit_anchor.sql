@@ -43,12 +43,26 @@ BEGIN
 END;
 $installation$ LANGUAGE plpgsql;
 
+-- Single-use synthetic claim ledger: the same outcome cannot be anchored twice,
+-- and an attempt token cannot be reused for another outcome. The unique
+-- constraints serialize concurrent callers; a failed claim INSERT rolls back
+-- the audit INSERT in the same transaction. Existing pre-upgrade anchors are
+-- NOT retrospectively authenticated or deduplicated by this prototype.
+CREATE TABLE IF NOT EXISTS poc_outcome_audit_claims (
+    outcome_id BIGINT PRIMARY KEY REFERENCES poc_atomic_outcomes(id),
+    attempt_ref TEXT NOT NULL UNIQUE
+        CHECK (attempt_ref ~ '^[0-9a-f]{32}$'),
+    audit_id BIGINT NOT NULL UNIQUE REFERENCES security_audit_events(id)
+);
+REVOKE ALL ON TABLE poc_outcome_audit_claims FROM PUBLIC;
+
 -- No caller-supplied actor, tenant, event, clock, action, result or reason.
 -- The trusted PostgreSQL LOGIN OID must have a live approved tenant binding,
 -- and the referenced outcome must belong to that bound tenant. SECURITY
 -- DEFINER bypasses row policies, hence the explicit tenant equality below.
--- The caller supplies an attempt correlation string only; this is not proof
--- of Bank actor identity or that the referenced attempt actually occurred.
+-- The caller supplies an attempt correlation string only. The result is
+-- 'observed', NEVER terminal 'succeeded': no Bank actor or real attempt is
+-- authenticated and no source-of-truth adjudication is established.
 DO $function$
 DECLARE
     target text := pg_catalog.current_setting('gasha.installation_schema', true);
@@ -98,7 +112,7 @@ BEGIN
                 CASE WHEN outcome_kind = 'gasha'
                     THEN 'outcome.audit_anchor'
                     ELSE 'incumbent_outcome.audit_anchor' END,
-                'succeeded',
+                'observed',
                 'db-login-oid-sha256:' || pg_catalog.encode(pg_catalog.sha256(
                     pg_catalog.convert_to('gasha-db-login-audit-v1:' ||
                         login_oid::text, 'UTF8')), 'hex'),
@@ -111,11 +125,14 @@ BEGIN
                     pg_catalog.convert_to(outcome_event::text, 'UTF8')
                 ), 'hex'), ''
             ) RETURNING id INTO audit_id;
+            INSERT INTO %I.poc_outcome_audit_claims (
+                outcome_id, attempt_ref, audit_id
+            ) VALUES (p_outcome_id, p_attempt_ref, audit_id);
             RETURN audit_id;
         END;
         $body$;
         $ddl$,
-        target, target, target, target
+        target, target, target, target, target
     );
 END;
 $function$ LANGUAGE plpgsql;
