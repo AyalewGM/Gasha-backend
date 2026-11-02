@@ -728,6 +728,48 @@ def test_rls_separates_tenants_in_same_schema_and_revokes_open_login(
                 psycopg.connect(dsn_a, row_factory=dict_row) as tenant_a,
                 psycopg.connect(dsn_b, row_factory=dict_row) as tenant_b,
             ):
+                # Runtime-supplied tenant hints and search_path cannot
+                # replace the authenticated PostgreSQL LOGIN binding.
+                for runtime, role, other, expected, spoof in (
+                    (tenant_a, roles[0][0], roles[1][0], "bank-a", "bank-b"),
+                    (tenant_b, roles[1][0], roles[0][0], "bank-b", "bank-a"),
+                ):
+                    identity = runtime.execute(
+                        "SELECT session_user AS login, current_user AS effective"
+                    ).fetchone()
+                    assert identity == {"login": role, "effective": role}
+                    bound = sql.SQL(
+                        "SELECT {}.poc_outcome_bound_tenant() AS tenant"
+                    ).format(sql.Identifier(schema))
+                    assert runtime.execute(bound).fetchone()["tenant"] == expected
+                    runtime.execute(
+                        "SELECT set_config('gasha.tenant_id', %s, true)",
+                        (spoof,),
+                    )
+                    runtime.execute("SET LOCAL search_path TO pg_catalog")
+                    assert runtime.execute(bound).fetchone()["tenant"] == expected
+                    runtime.rollback()
+                    forbidden = (
+                        sql.SQL("SELECT * FROM {}.poc_outcome_runtime_tenants")
+                        .format(sql.Identifier(schema)),
+                        sql.SQL(
+                            "INSERT INTO {}.poc_outcome_runtime_tenants "
+                            "(login_role_oid, tenant_id) VALUES (0, 'bank-x')"
+                        ).format(sql.Identifier(schema)),
+                        sql.SQL(
+                            "UPDATE {}.poc_outcome_runtime_tenants "
+                            "SET tenant_id = 'bank-x'"
+                        ).format(sql.Identifier(schema)),
+                        sql.SQL(
+                            "DELETE FROM {}.poc_outcome_runtime_tenants"
+                        ).format(sql.Identifier(schema)),
+                        sql.SQL("SET ROLE {}").format(sql.Identifier(other)),
+                    )
+                    for statement in forbidden:
+                        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                            runtime.execute(statement)
+                        runtime.rollback()
+
                 a = writer(tenant_a, schema)
                 b = PostgresAtomicOutcomeWriter(
                     tenant_b, installation_schema=schema, tenant_id="bank-b",
@@ -815,3 +857,107 @@ def test_rls_separates_tenants_in_same_schema_and_revokes_open_login(
                     )
                 )
                 admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
+def test_rls_role_drop_and_recreate_does_not_restore_old_oid_binding(
+    schema: str,
+) -> None:
+    """Same login name and new DB OID must not inherit a departed tenant binding.
+
+    Synthetic PG only: does not prove Bank credential rotation, pool revocation
+    or independently administered privileges.
+    """
+    import secrets
+
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+    from psycopg.rows import dict_row
+
+    role = "gasha_rls_rotation_" + uuid4().hex[:12]
+    password = secrets.token_urlsafe(32)
+    table = sql.SQL("{}.poc_atomic_outcomes").format(sql.Identifier(schema))
+    helper = sql.SQL("{}.poc_outcome_bound_tenant()").format(sql.Identifier(schema))
+    with connect(schema) as owner:
+        assert writer(owner, schema).submit(
+            outcome(), principal=principal(Capability.OUTCOME_SUBMIT), now=NOW,
+        ).status is SubmissionStatus.ACCEPTED
+        owner.execute(
+            "SELECT set_config('gasha.installation_schema', %s, true)",
+            (schema,),
+        )
+        owner.execute(POC_RLS_MIGRATION.read_text())
+        owner.commit()
+
+    with psycopg.connect(DSN, autocommit=True) as admin:
+        create = sql.SQL(
+            "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE "
+            "NOREPLICATION NOINHERIT NOBYPASSRLS PASSWORD {}"
+        ).format(sql.Identifier(role), sql.Literal(password))
+        admin.execute(create)
+        try:
+            oid_query = "SELECT oid FROM pg_catalog.pg_roles WHERE rolname = %s"
+            old_oid = admin.execute(oid_query, (role,)).fetchone()[0]
+
+            def access(verb: str) -> None:
+                admin.execute(sql.SQL(
+                    f"{verb} USAGE ON SCHEMA {{}} " +
+                    ("TO" if verb == "GRANT" else "FROM") + " {}"
+                ).format(sql.Identifier(schema), sql.Identifier(role)))
+                admin.execute(sql.SQL(
+                    f"{verb} SELECT, INSERT ON TABLE {{}} " +
+                    ("TO" if verb == "GRANT" else "FROM") + " {}"
+                ).format(table, sql.Identifier(role)))
+                admin.execute(sql.SQL(
+                    f"{verb} EXECUTE ON FUNCTION {{}} " +
+                    ("TO" if verb == "GRANT" else "FROM") + " {}"
+                ).format(helper, sql.Identifier(role)))
+
+            with connect(schema) as owner:
+                owner.execute(
+                    "INSERT INTO poc_outcome_runtime_tenants "
+                    "(login_role_oid, tenant_id) VALUES (%s, %s)",
+                    (old_oid, "bank-a"),
+                )
+                owner.commit()
+            access("GRANT")
+            dsn = make_conninfo(DSN, user=role, password=password)
+            bound = sql.SQL("SELECT {} AS tenant").format(helper)
+            read = sql.SQL("SELECT tenant_id FROM {}").format(table)
+            with psycopg.connect(dsn, row_factory=dict_row) as runtime:
+                assert runtime.execute(bound).fetchone()["tenant"] == "bank-a"
+                assert [r["tenant_id"] for r in runtime.execute(read)] == [
+                    "bank-a"
+                ]
+            access("REVOKE")
+            admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+            admin.execute(create)
+            assert admin.execute(oid_query, (role,)).fetchone()[0] != old_oid
+            access("GRANT")
+            with psycopg.connect(dsn, row_factory=dict_row) as runtime:
+                assert runtime.execute(bound).fetchone()["tenant"] is None
+                assert list(runtime.execute(read)) == []
+                runtime.rollback()
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    runtime.execute(sql.SQL(
+                        "INSERT INTO {} (tenant_id, event_id, outcome_kind, "
+                        "record_digest, record_json, recorded_at) "
+                        "VALUES (%s, %s, %s, %s, %s::jsonb, %s)"
+                    ).format(table), (
+                        "bank-a", uuid4(), "gasha", "sha256:" + "0" * 64,
+                        "{}", NOW,
+                    ))
+                runtime.rollback()
+            with connect(schema) as owner:
+                assert counts(owner) == (1, 1)
+        finally:
+            # All synthetic grants are removed before dropping this test login.
+            for obj, privilege in (
+                (sql.SQL("SCHEMA {}").format(sql.Identifier(schema)), "USAGE"),
+                (sql.SQL("TABLE {}").format(table), "ALL"),
+                (sql.SQL("FUNCTION {}").format(helper), "ALL"),
+            ):
+                admin.execute(sql.SQL("REVOKE {} ON {} FROM {}").format(
+                    sql.SQL(privilege), obj, sql.Identifier(role),
+                ))
+            admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
