@@ -20,9 +20,9 @@ from gasha.poc.scenario_observations import (
     inspect_scenario_coverage,
 )
 
-_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\\Z")
-_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\\Z")
-_CURRENCY = re.compile(r"[A-Z]{3}\\Z")
+_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_CURRENCY = re.compile(r"[A-Z]{3}\Z")
 _MAX_AMOUNT = Decimal("1e18")
 
 
