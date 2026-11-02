@@ -185,7 +185,7 @@ def test_login_bound_audit_anchor_denies_raw_forgery_and_cross_tenant(installed)
                     ).format(sql.Identifier(schema)), (anchor_id,),
                 ).fetchone()
                 assert audit["action"] == "outcome.audit_anchor"
-                assert audit["result"] == "succeeded"
+                assert audit["result"] == "observed"
                 assert audit["reason"] == "persisted_outcome_exists"
                 assert audit["attempt_ref"] == attempt
                 assert audit["tenant_ref"] == sha256(tenant.encode()).hexdigest()
@@ -201,6 +201,86 @@ def test_login_bound_audit_anchor_denies_raw_forgery_and_cross_tenant(installed)
                 ).hexdigest()
                 assert tenant not in str(audit)
                 assert role not in str(audit)
+
+
+def test_anchor_claims_are_single_use_even_with_new_attempt_tokens(installed):
+    """One observed anchor per outcome, one outcome per token, no partial audit."""
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+
+    schema, roles, ids = installed
+    role, tenant, password = roles[0]
+    token = uuid4().hex
+    invoke = sql.SQL(
+        "SELECT {}.poc_append_db_outcome_audit(%s, %s)"
+    ).format(sql.Identifier(schema))
+    with (
+        psycopg.connect(make_conninfo(DSN, user=role, password=password)) as runtime,
+        psycopg.connect(DSN) as owner,
+    ):
+        first = runtime.execute(invoke, (ids[tenant], token)).fetchone()[0]
+        runtime.commit()
+
+        # The claim constraints must reject both a byte-for-byte replay and
+        # a fabricated fresh attempt ID for the same persisted outcome.
+        for duplicate in (token, uuid4().hex):
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                runtime.execute(invoke, (ids[tenant], duplicate))
+            runtime.rollback()
+
+        # Runtime credentials have no raw INSERT on the claim ledger.
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            runtime.execute(
+                sql.SQL(
+                    "INSERT INTO {}.poc_outcome_audit_claims "
+                    "(outcome_id, attempt_ref, audit_id) "
+                    "VALUES (%s, %s, %s)"
+                ).format(sql.Identifier(schema)),
+                (ids[tenant], uuid4().hex, first),
+            )
+        runtime.rollback()
+
+        # Even a different valid same-tenant outcome cannot reuse the token.
+        new_id = owner.execute(
+            sql.SQL(
+                "INSERT INTO {}.poc_atomic_outcomes "
+                "(tenant_id, event_id, outcome_kind, record_digest, "
+                "record_json, recorded_at) "
+                "VALUES (%s, %s, 'gasha', %s, %s::jsonb, "
+                "pg_catalog.clock_timestamp()) RETURNING id"
+            ).format(sql.Identifier(schema)),
+            (tenant, uuid4(), "sha256:" + "1" * 64, "{}"),
+        ).fetchone()[0]
+        owner.commit()
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            runtime.execute(invoke, (new_id, token))
+        runtime.rollback()
+
+        second_token = uuid4().hex
+        second = runtime.execute(invoke, (new_id, second_token)).fetchone()[0]
+        runtime.commit()
+        assert second != first
+        observed = owner.execute(
+            sql.SQL(
+                "SELECT id, result, attempt_ref FROM {}.security_audit_events "
+                "ORDER BY id"
+            ).format(sql.Identifier(schema))
+        ).fetchall()
+        claims = owner.execute(
+            sql.SQL(
+                "SELECT outcome_id, attempt_ref, audit_id "
+                "FROM {}.poc_outcome_audit_claims ORDER BY outcome_id"
+            ).format(sql.Identifier(schema))
+        ).fetchall()
+        assert observed == [
+            (first, "observed", token),
+            (second, "observed", second_token),
+        ]
+        assert claims == [
+            (ids[tenant], token, first),
+            (new_id, second_token, second),
+        ]
 
 
 def test_anchor_migration_is_transaction_scoped_and_idempotent(installed):
@@ -290,8 +370,18 @@ def test_audit_anchor_binding_and_execute_revocation_fail_closed(installed):
             runtime.rollback()
 
             owner.execute(grant)
+            new_outcome_id = owner.execute(
+                sql.SQL(
+                    "INSERT INTO {}.poc_atomic_outcomes "
+                    "(tenant_id, event_id, outcome_kind, record_digest, "
+                    "record_json, recorded_at) "
+                    "VALUES (%s, %s, 'gasha', %s, %s::jsonb, "
+                    "pg_catalog.clock_timestamp()) RETURNING id"
+                ).format(sql.Identifier(schema)),
+                (tenant, uuid4(), "sha256:" + "1" * 64, "{}"),
+            ).fetchone()[0]
             assert runtime.execute(
-                invocation, (ids[tenant], attempts[4])
+                invocation, (new_outcome_id, attempts[4])
             ).fetchone()[0] > 0
             runtime.commit()
             rows = owner.execute(
