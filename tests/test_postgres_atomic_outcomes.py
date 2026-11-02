@@ -80,6 +80,13 @@ def schema():
         admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(name)))
         try:
             with connect(name) as connection:
+                # The Bank migrator must supply the trusted installation
+                # schema in the same transaction; session search_path alone
+                # must never choose the destination of migration 013.
+                connection.execute(
+                    "SELECT set_config('gasha.installation_schema', %s, true)",
+                    (name,),
+                )
                 for filename in (
                     "010_security_audit_events.sql",
                     "013_poc_atomic_outcomes.sql",
@@ -300,4 +307,85 @@ def test_constructor_requires_opaque_installation_scope(schema: str) -> None:
         with pytest.raises(AtomicOutcomeRejected):
             PostgresAtomicOutcomeWriter(
                 connection, installation_schema=schema, tenant_id="bad tenant"
+            )
+
+
+
+@pytest.mark.parametrize("untrusted_schema", [
+    None, "", "public", "information_schema", "pg_catalog",
+    "pg_temp_7", "../public", "MixedCase", "schema;DROP",
+])
+def test_migration_fails_without_canonical_trusted_installation_schema(
+    schema: str, untrusted_schema: str | None,
+) -> None:
+    # A prior (legitimate) installation does not waive the requirement on
+    # repeated migration attempts. A bad search_path is not authority.
+    with connect(schema) as connection:
+        if untrusted_schema is not None:
+            connection.execute(
+                "SELECT set_config('gasha.installation_schema', %s, true)",
+                (untrusted_schema,),
+            )
+        with pytest.raises(Exception, match="trusted installation schema"):
+            connection.execute(
+                (MIGRATIONS / "013_poc_atomic_outcomes.sql").read_text()
+            )
+        connection.rollback()
+
+
+def test_migration_ignores_hostile_earlier_search_path_schema(
+    schema: str,
+) -> None:
+    import psycopg
+    from psycopg import sql
+
+    hostile = "gasha_spoof_" + uuid4().hex[:15]
+    with psycopg.connect(DSN, autocommit=True) as admin:
+        admin.execute(
+            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(hostile))
+        )
+        try:
+            with connect(schema) as connection:
+                connection.execute(
+                    sql.SQL("SET search_path TO {}, {}").format(
+                        sql.Identifier(hostile), sql.Identifier(schema)
+                    )
+                )
+                connection.execute(
+                    "SELECT set_config('gasha.installation_schema', %s, true)",
+                    (schema,),
+                )
+                connection.execute(
+                    (MIGRATIONS / "013_poc_atomic_outcomes.sql").read_text()
+                )
+                # Assert inside the transaction, before SET LOCAL resets.
+                assert connection.execute(
+                    "SELECT current_schema() AS name"
+                ).fetchone()["name"] == schema
+                redirected = connection.execute(
+                    """SELECT count(*) AS n FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = %s AND c.relname = 'poc_atomic_outcomes'""",
+                    (hostile,),
+                ).fetchone()["n"]
+                redirected_function = connection.execute(
+                    """SELECT count(*) AS n FROM pg_catalog.pg_proc p
+                    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                    WHERE n.nspname = %s
+                      AND p.proname = 'reject_poc_atomic_outcome_mutation'""",
+                    (hostile,),
+                ).fetchone()["n"]
+                assert redirected == 0
+                assert redirected_function == 0
+                connection.commit()
+            with connect(schema) as connection:
+                accepted = writer(connection, schema).submit(
+                    outcome(), principal=principal(Capability.OUTCOME_SUBMIT),
+                    now=NOW,
+                )
+                assert accepted.status is SubmissionStatus.ACCEPTED
+                assert counts(connection) == (1, 1)
+        finally:
+            admin.execute(
+                sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(hostile))
             )
