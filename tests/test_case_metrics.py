@@ -322,7 +322,7 @@ def test_dst_fold_offsets_use_utc_instants_for_backlog_and_alert_latency() -> No
         source_event_at=first - timedelta(minutes=2),
         alert_emitted_at=first - timedelta(minutes=1),
     )
-    report = _report(history, clocks=(clock,), as_of=later + timedelta(minutes=5))
+    report = _report(history, clocks=(clock,), as_of=later.astimezone(UTC) + timedelta(minutes=5))
     assert report["backlog_age"]["mean_seconds"] == 2100.0
     assert report["alert_latency"]["mean_seconds"] == 60.0
 
