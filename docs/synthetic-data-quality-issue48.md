@@ -32,3 +32,9 @@ No event ID, customer/account/beneficiary/device reference, raw payload, label s
 - Trusted #49 evidence registry and revocation-safe approvals; #54 remains **caller-asserted and advisory only**. Bank staging, deployment, payment enforcement and CBE acceptance remain blocked.
 
 The module is purposefully **not wired into** replay, scoring, protected API, worker, risk-list or readiness paths. A hash or green CI run does not attest source authenticity or accept historical KPI evidence. Only synthetic data is used in tests.
+
+## Synthetic source and malformed optional telemetry guard
+
+The reference inspector now rejects an empty, missing, noncanonical or malformed `source_system` as `invalid.source_system` even when an unchecked synthetic model copy bypassed the ingestion model validation. Such a quarantined row cannot reserve a same-UC event ID or affect accepted labels, alerts or signal-coverage denominators. A valid canonical source token establishes **shape, not source authentication**.
+
+An explicitly present `intelligence` value that is not a mapping records `invalid_optional.intelligence`, including explicit null; its provisional per-UC signals remain unavailable. Absence of the optional container is not a quality warning. This extends the existing report v2 check-code vocabulary without changing the machine-readable structure, use-case coverage matrix or Bank-readiness authority. No new bank adapter, historical replay, policy evaluation or deployment wiring is added.

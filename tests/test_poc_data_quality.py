@@ -576,3 +576,61 @@ def test_versioned_provisional_uc_coverage_exact_contract(
     assert tuple(row["optional_signals"]) == expected
     assert all(signal["available"]["count"] == 0 and signal["unavailable"] == 1
                for signal in row["optional_signals"].values())
+
+@pytest.mark.parametrize("invalid_source", [
+    None, "", " ", "bad source", "bad\\nsource", "vendor/source",
+    0, False, [], {}, "x" * 81, "\\u00e9",
+])
+def test_corrupt_reference_source_is_quarantined_without_poisoning_id(
+    invalid_source: object,
+) -> None:
+    """Unvalidated adapter updates cannot erase the synthetic source identity."""
+    valid = candidate(
+        "source-shared-id",
+        payload_changes={"intelligence": {"beneficiary_risk": 0.0}},
+        label=True, confirmed_at=AT + timedelta(days=1), alerted=True,
+    )
+    damaged = replace(
+        valid, event=valid.event.model_copy(update={"source_system": invalid_source}),
+    )
+    for observations in ((damaged, valid), (valid, damaged)):
+        row = result_for(*observations)
+        assert (row["total"], row["accepted"], row["rejected"]) == (2, 1, 1)
+        assert row["checks"] == {"invalid.source_system": 1}
+        assert row["labels"] == {"positive": 1, "negative": 0, "unlabelled": 0}
+        assert row["alerts"] == {"alerted": 1, "not_alerted": 0, "unknown": 0}
+        assert row["optional_signals"]["beneficiary_risk"]["available"]["count"] == 1
+
+
+@pytest.mark.parametrize("use_case", list(UseCase))
+@pytest.mark.parametrize("invalid_intelligence", [
+    None, "", [], ["untrusted"], 17, True,
+])
+def test_malformed_optional_telemetry_container_is_visible_but_not_fabricated(
+    use_case: UseCase, invalid_intelligence: object,
+) -> None:
+    """Malformed optional telemetry is unknown, not measured zero or a valid signal."""
+    valid = candidate("telemetry-valid-" + use_case.value, uc=use_case, alerted=True)
+    malformed = candidate(
+        "telemetry-invalid-" + use_case.value, uc=use_case,
+        payload_changes={"intelligence": invalid_intelligence}, alerted=False,
+    )
+    for observations in ((valid, malformed), (malformed, valid)):
+        row = result_for(*observations, uc=use_case)
+        assert (row["total"], row["accepted"], row["rejected"]) == (2, 2, 0)
+        assert row["checks"] == {"invalid_optional.intelligence": 1}
+        assert row["alerts"] == {"alerted": 1, "not_alerted": 1, "unknown": 0}
+        for coverage in row["optional_signals"].values():
+            assert coverage["available"]["count"] == 0
+            assert coverage["unavailable"] == 2
+
+
+def test_absent_optional_telemetry_has_no_false_malformed_warning() -> None:
+    row = result_for(candidate("no-telemetry"))
+    assert row["accepted"] == 1
+    assert row["checks"] == {}
+    assert all(
+        coverage["unavailable"] == 1
+        for coverage in row["optional_signals"].values()
+    )
+
