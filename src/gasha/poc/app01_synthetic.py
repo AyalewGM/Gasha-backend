@@ -264,7 +264,7 @@ def evaluate_app01_synthetic(
         and metrics.payment_amount
         >= metrics.baseline_typical_amount * policy.min_baseline_multiple
     ):
-        return result(APP01Status.AMOUNT_NOT_UNUSUAL, "below_both_proposed_thresholds",
+        return result(APP01Status.AMOUNT_NOT_UNUSUAL, "below_one_or_more_proposed_thresholds",
                       evaluated=True)
     available_optional = {
         field.name for field in observation.fields if field.state is FieldState.OBSERVED
