@@ -257,6 +257,14 @@ def evaluate_app01_synthetic(
         return result(APP01Status.BLOCKED_PAYMENT_STATE, "payment_not_eligible")
     if metrics.baseline_sample_count < policy.min_baseline_samples:
         return result(APP01Status.BLOCKED_METRICS, "customer_baseline_insufficient")
+    available_optional = {
+        field.name for field in observation.fields if field.state is FieldState.OBSERVED
+    }
+    if (
+        metrics.recurring_payment is not APP01Context.UNKNOWN
+        and "expected_recurring_payment" not in available_optional
+    ):
+        raise ScenarioContractError("known context without observed optional evidence")
     if metrics.prior_beneficiary_payments != 0:
         return result(APP01Status.BENEFICIARY_NOT_NEW, "prior_transfer_in_covered_history")
     if not (
@@ -266,14 +274,6 @@ def evaluate_app01_synthetic(
     ):
         return result(APP01Status.AMOUNT_NOT_UNUSUAL, "below_one_or_more_proposed_thresholds",
                       evaluated=True)
-    available_optional = {
-        field.name for field in observation.fields if field.state is FieldState.OBSERVED
-    }
-    if (
-        metrics.recurring_payment is not APP01Context.UNKNOWN
-        and "expected_recurring_payment" not in available_optional
-    ):
-        raise ScenarioContractError("known context without observed optional evidence")
     if metrics.recurring_payment is APP01Context.REPORTED:
         return result(APP01Status.CONTEXT_EXCEPTION_REPORTED,
                       "caller_reported_recurring_not_verified", evaluated=True)

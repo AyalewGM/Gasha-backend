@@ -123,6 +123,25 @@ def test_claimed_recurring_context_requires_observed_optional_evidence(
         evaluate(row, replace(metrics(row), recurring_payment=context))
 
 
+@pytest.mark.parametrize("context", [APP01Context.REPORTED, APP01Context.REPORTED_ABSENT])
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"prior_beneficiary_payments": 1},
+        {"payment_amount": Decimal(999)},
+        {"payment_amount": Decimal(1200), "baseline_typical_amount": Decimal(300)},
+    ],
+    ids=["beneficiary_not_new", "below_absolute", "below_relative"],
+)
+def test_unsubstantiated_recurring_context_cannot_return_clean_negative(
+    context: APP01Context, override: dict[str, object],
+) -> None:
+    row = packet()
+    values = replace(metrics(row), recurring_payment=context, **override)
+    with pytest.raises(ScenarioContractError, match="known context without observed"):
+        evaluate(row, values)
+
+
 @pytest.mark.parametrize("history", [APP01History.UNKNOWN, APP01History.INCOMPLETE])
 def test_missing_or_partial_beneficiary_history_is_blocked(history: APP01History) -> None:
     row = packet()
