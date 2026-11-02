@@ -9,13 +9,13 @@ The normal decision/worker/protected-API paths do not import this module.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 from json import dumps
 from types import MappingProxyType
-from typing import Mapping
 from uuid import UUID
 
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
