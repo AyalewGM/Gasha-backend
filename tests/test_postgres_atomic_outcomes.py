@@ -510,6 +510,7 @@ def test_nonowner_runtime_credential_is_schema_scoped(schema: str) -> None:
     password = secrets.token_urlsafe(32)
 
     with psycopg.connect(DSN, autocommit=True) as admin:
+        admin_user = admin.execute("SELECT current_user").fetchone()[0]
         admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(other)))
         try:
             with connect(other) as owner:
@@ -576,7 +577,7 @@ def test_nonowner_runtime_credential_is_schema_scoped(schema: str) -> None:
                         .format(sql.Identifier(other)),
                         sql.SQL("INSERT INTO {}.poc_atomic_outcomes DEFAULT VALUES")
                         .format(sql.Identifier(other)),
-                        sql.SQL("SET ROLE {}").format(sql.Identifier("gasha_test")),
+                        sql.SQL("SET ROLE {}").format(sql.Identifier(admin_user)),
                     )
                     for statement in forbidden:
                         with pytest.raises(psycopg.errors.InsufficientPrivilege):
