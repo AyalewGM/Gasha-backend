@@ -1059,3 +1059,61 @@ def test_protected_http_audit_actor_distinguishes_delimiter_shifted_identities(
     assert all(len(event.actor_ref) == 64 for event in verified + action)
     assert "bank\x00app" not in str(audit.events)
     assert "app\x00user" not in str(audit.events)
+
+
+@pytest.mark.parametrize("path", ["/v1/decisions", "/v1/evaluations"])
+@pytest.mark.parametrize("root_path", ["", "/bank"])
+@pytest.mark.parametrize(
+    ("collected", "expires", "clock", "expected_status"),
+    [
+        pytest.param((15, 0), (30, 0), (15, 1), 503, id="expired-in-later-fold"),
+        pytest.param((15, 1), (30, 1), (30, 0), 503, id="future-collected-in-later-fold"),
+        pytest.param((30, 0), (15, 1), (45, 0), 200, id="valid-across-fold"),
+    ],
+)
+def test_protected_context_freshness_uses_absolute_utc_during_dst_fold(
+    wired, monkeypatch: pytest.MonkeyPatch, path: str, root_path: str,
+    collected: tuple[int, int], expires: tuple[int, int],
+    clock: tuple[int, int], expected_status: int,
+) -> None:
+    """A shared ZoneInfo wall clock must not bypass or falsely reject context expiry."""
+    _, audit, store = wired
+    zone = ZoneInfo("America/New_York")
+
+    def local(instant: tuple[int, int]) -> datetime:
+        minute, fold = instant
+        return datetime(2026, 11, 1, 1, minute, tzinfo=zone, fold=fold)
+
+    class FoldContextProvider:
+        def resolve(self, transaction, principal):
+            return _dst_decision_context(
+                local(collected), local(expires), event_id=transaction.event_id,
+            )
+
+    app.state.decision_context_provider = FoldContextProvider()
+    # This synthetic injected clock is independent of the process's actual date.
+    monkeypatch.setattr("gasha.api.main.utcnow", lambda: local(clock))
+    payload = tx()
+    payload["occurred_at"] = local(clock).astimezone(UTC).isoformat()
+    response = TestClient(app, root_path=root_path).post(
+        f"{root_path}{path}", json={"transaction": payload}, headers=headers(),
+    )
+    assert response.status_code == expected_status
+    actions = [
+        event for event in audit.events
+        if event.action == Capability.DECISION_SUBMIT.value
+    ]
+    assert [event.result for event in actions] == (
+        ["authorized", "failed"] if expected_status == 503
+        else ["authorized", "succeeded"]
+    )
+    assert actions[0].attempt_ref == actions[1].attempt_ref
+    if expected_status == 503:
+        assert "X-Gasha-Context-Ref" not in response.headers
+        assert response.json()["detail"] in {"decision unavailable", "evaluation unavailable"}
+    else:
+        assert len(response.headers["X-Gasha-Context-Ref"]) == 64
+        if path.endswith("/evaluations"):
+            assert response.json()["operating_mode"] == "shadow"
+            assert response.json()["effective_action"] == "no_action_shadow"
+    assert store.store.outcomes("tenant-a", UUID(str(payload["event_id"]))) == ()
