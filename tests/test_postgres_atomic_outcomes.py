@@ -620,3 +620,198 @@ def test_nonowner_runtime_credential_is_schema_scoped(schema: str) -> None:
             admin.execute(
                 sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(other))
             )
+
+# The optional 014 migration is not part of default worker or Bank composition.
+# These real-PostgreSQL cases prove a candidate DB login -> role-OID -> tenant
+# mapping even when two tenants share one schema. No Bank IdP or real roles.
+POC_RLS_MIGRATION = (
+    MIGRATIONS.parent / "poc-migrations" / "014_poc_outcomes_login_rls.sql"
+)
+
+
+def test_opt_in_rls_requires_trusted_migrator_scope(schema: str) -> None:
+    with connect(schema) as connection:
+        # Merely selecting a session search_path cannot authorize installing
+        # row policies; a fresh trusted transaction-local value is required.
+        with pytest.raises(Exception, match="trusted installation schema"):
+            connection.execute(POC_RLS_MIGRATION.read_text())
+        connection.rollback()
+        connection.execute(
+            "SELECT set_config('gasha.installation_schema', %s, true)",
+            (schema,),
+        )
+        connection.execute(POC_RLS_MIGRATION.read_text())
+        connection.commit()
+        row = connection.execute(
+            """SELECT relrowsecurity FROM pg_catalog.pg_class
+            WHERE oid = 'poc_atomic_outcomes'::regclass"""
+        ).fetchone()
+        assert row["relrowsecurity"] is True
+
+
+def test_rls_separates_tenants_in_same_schema_and_revokes_open_login(
+    schema: str,
+) -> None:
+    """Only the authenticated LOGIN's database role-OID binding grants rows.
+
+    This is synthetic real-Postgres evidence; Bank role provisioning, IdP,
+    source provenance, HTTP terminal failures and readiness remain blocked.
+    """
+    import secrets
+
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+    from psycopg.rows import dict_row
+
+    roles = [
+        ("gasha_rls_a_" + uuid4().hex[:14], "bank-a", secrets.token_urlsafe(32)),
+        ("gasha_rls_b_" + uuid4().hex[:14], "bank-b", secrets.token_urlsafe(32)),
+    ]
+    with connect(schema) as owner:
+        owner.execute(
+            "SELECT set_config('gasha.installation_schema', %s, true)",
+            (schema,),
+        )
+        owner.execute(POC_RLS_MIGRATION.read_text())
+        # Reapply is safe and does not delete either a binding or a policy.
+        owner.commit()
+        owner.execute(
+            "SELECT set_config('gasha.installation_schema', %s, true)",
+            (schema,),
+        )
+        owner.execute(POC_RLS_MIGRATION.read_text())
+        owner.commit()
+
+    with psycopg.connect(DSN, autocommit=True) as admin:
+        for role, _, password in roles:
+            admin.execute(
+                sql.SQL(
+                    "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB "
+                    "NOCREATEROLE NOREPLICATION NOINHERIT NOBYPASSRLS PASSWORD {}"
+                ).format(sql.Identifier(role), sql.Literal(password))
+            )
+        try:
+            with connect(schema) as owner:
+                for role, tenant, _ in roles:
+                    owner.execute(
+                        """INSERT INTO poc_outcome_runtime_tenants
+                        (login_role_oid, tenant_id)
+                        SELECT oid, %s FROM pg_catalog.pg_roles WHERE rolname = %s""",
+                        (tenant, role),
+                    )
+                owner.commit()
+            for role, _, _ in roles:
+                admin.execute(
+                    sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                        sql.Identifier(schema), sql.Identifier(role)
+                    )
+                )
+                admin.execute(
+                    sql.SQL(
+                        "GRANT SELECT, INSERT ON TABLE {}.poc_atomic_outcomes TO {}"
+                    ).format(sql.Identifier(schema), sql.Identifier(role))
+                )
+                admin.execute(
+                    sql.SQL(
+                        "GRANT INSERT ON TABLE {}.security_audit_events TO {}"
+                    ).format(sql.Identifier(schema), sql.Identifier(role))
+                )
+                admin.execute(
+                    sql.SQL(
+                        "GRANT EXECUTE ON FUNCTION {}.poc_outcome_bound_tenant() TO {}"
+                    ).format(sql.Identifier(schema), sql.Identifier(role))
+                )
+            dsn_a = make_conninfo(DSN, user=roles[0][0], password=roles[0][2])
+            dsn_b = make_conninfo(DSN, user=roles[1][0], password=roles[1][2])
+            with (
+                psycopg.connect(dsn_a, row_factory=dict_row) as tenant_a,
+                psycopg.connect(dsn_b, row_factory=dict_row) as tenant_b,
+            ):
+                a = writer(tenant_a, schema)
+                b = PostgresAtomicOutcomeWriter(
+                    tenant_b, installation_schema=schema, tenant_id="bank-b",
+                )
+                assert a.submit(
+                    outcome(), principal=principal(Capability.OUTCOME_SUBMIT),
+                    now=NOW,
+                ).status is SubmissionStatus.ACCEPTED
+                b_record = outcome().model_copy(update={"tenant_id": "bank-b"})
+                assert b.submit(
+                    b_record,
+                    principal=principal(Capability.OUTCOME_SUBMIT, tenant="bank-b"),
+                    now=NOW,
+                ).status is SubmissionStatus.ACCEPTED
+                query = sql.SQL(
+                    "SELECT tenant_id FROM {}.poc_atomic_outcomes ORDER BY id"
+                ).format(sql.Identifier(schema))
+                assert [row["tenant_id"] for row in tenant_a.execute(query)] == [
+                    "bank-a"
+                ]
+                assert [row["tenant_id"] for row in tenant_b.execute(query)] == [
+                    "bank-b"
+                ]
+                # Direct SQL cannot evade row scope even if caller has table
+                # SELECT/INSERT. Wrong-tenant rows are hidden and writes fail.
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    tenant_a.execute(
+                        sql.SQL(
+                            "INSERT INTO {}.poc_atomic_outcomes "
+                            "(tenant_id, event_id, outcome_kind, record_digest, "
+                            "record_json, recorded_at) "
+                            "VALUES (%s, %s, %s, %s, %s::jsonb, %s)"
+                        ).format(sql.Identifier(schema)),
+                        ("bank-b", uuid4(), "gasha", "sha256:" + "0" * 64,
+                         "{}", NOW),
+                    )
+                tenant_a.rollback()
+                # A revoked mapping denies even an already-open LOGIN, once
+                # the next transaction sees committed trusted revocation.
+                with connect(schema) as owner:
+                    owner.execute(
+                        """DELETE FROM poc_outcome_runtime_tenants
+                        WHERE login_role_oid = (
+                            SELECT oid FROM pg_catalog.pg_roles WHERE rolname = %s
+                        )""",
+                        (roles[0][0],),
+                    )
+                    owner.commit()
+                assert list(tenant_a.execute(query)) == []
+                tenant_a.rollback()
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    a.submit(
+                        outcome(OutcomeType.CONFIRMED_LEGITIMATE),
+                        principal=principal(Capability.OUTCOME_SUBMIT), now=NOW,
+                    )
+                tenant_a.rollback()
+                assert [row["tenant_id"] for row in tenant_b.execute(query)] == [
+                    "bank-b"
+                ]
+            with connect(schema) as owner:
+                assert counts(owner) == (2, 2)
+        finally:
+            # Synthetic privileges are removed before dropping login roles;
+            # no Bank roles or secrets are present in this test.
+            for role, _, _ in roles:
+                for table in (
+                    "poc_atomic_outcomes", "security_audit_events",
+                    "poc_outcome_runtime_tenants",
+                ):
+                    admin.execute(
+                        sql.SQL("REVOKE ALL ON TABLE {}.{} FROM {}").format(
+                            sql.Identifier(schema), sql.Identifier(table),
+                            sql.Identifier(role),
+                        )
+                    )
+                admin.execute(
+                    sql.SQL(
+                        "REVOKE ALL ON FUNCTION {}.poc_outcome_bound_tenant() "
+                        "FROM {}"
+                    ).format(sql.Identifier(schema), sql.Identifier(role))
+                )
+                admin.execute(
+                    sql.SQL("REVOKE ALL ON SCHEMA {} FROM {}").format(
+                        sql.Identifier(schema), sql.Identifier(role)
+                    )
+                )
+                admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
