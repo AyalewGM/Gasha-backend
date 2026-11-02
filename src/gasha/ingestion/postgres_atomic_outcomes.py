@@ -70,9 +70,13 @@ def _snapshot(record: OutcomeRecord | IncumbentOutcomeRecord) -> dict[str, objec
         or type(validated.event_id) is not UUID
     ):
         raise AtomicOutcomeRejected("canonical tenant/source/event identity required")
+    snapshot = validated.model_dump(mode="json")
     if timestamp is not None:
-        _instant(timestamp)
-    return validated.model_dump(mode="json")
+        # Equal absolute timestamps must have one identity, even when a source
+        # resubmits the same outcome using a different UTC offset/DST fold.
+        clock_field = "confirmed_at" if type(validated) is OutcomeRecord else "recorded_at"
+        snapshot[clock_field] = _instant(timestamp).isoformat()
+    return snapshot
 
 
 def _fingerprint(kind: str, snapshot: Mapping[str, object]) -> str:
