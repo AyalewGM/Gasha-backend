@@ -47,14 +47,19 @@ def _instant(value: object) -> datetime:
 
 def _snapshot(record: OutcomeRecord | IncumbentOutcomeRecord) -> dict[str, object]:
     # Model copies can bypass validation; never persist a corrupted copy.
+    validated: OutcomeRecord | IncumbentOutcomeRecord
     if type(record) is OutcomeRecord:
-        validated = OutcomeRecord.model_validate(record.model_dump(mode="python"))
-        source = validated.outcome_source
-        timestamp = validated.confirmed_at
+        gasha_record = OutcomeRecord.model_validate(record.model_dump(mode="python"))
+        source = gasha_record.outcome_source
+        timestamp = gasha_record.confirmed_at
+        validated = gasha_record
     elif type(record) is IncumbentOutcomeRecord:
-        validated = IncumbentOutcomeRecord.model_validate(record.model_dump(mode="python"))
-        source = validated.source_system
-        timestamp = validated.recorded_at
+        incumbent_record = IncumbentOutcomeRecord.model_validate(
+            record.model_dump(mode="python")
+        )
+        source = incumbent_record.source_system
+        timestamp = incumbent_record.recorded_at
+        validated = incumbent_record
     else:
         raise AtomicOutcomeRejected("typed outcome record required")
     if (
