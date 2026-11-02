@@ -138,6 +138,7 @@ def _validate_request(request: POCGateRequest) -> None:
             raise TypeError(f"{name} must be a bool")
     if not isinstance(request.findings, tuple):
         raise TypeError("findings must be a tuple")
+    seen_finding_ids: set[str] = set()
     for finding in request.findings:
         if not isinstance(finding, SecurityFinding):
             raise TypeError("findings must contain SecurityFinding records")
@@ -153,5 +154,10 @@ def _validate_request(request: POCGateRequest) -> None:
             raise TypeError("severity must be a FindingSeverity enum")
         if type(finding.resolved) is not bool or type(finding.gasha_attributable) is not bool:
             raise TypeError("finding status and attribution must be bools")
+        # A finding's identity must denote one finding, not conflicting
+        # severities, owners or dispositions within the same claimed packet.
+        if finding.finding_id in seen_finding_ids:
+            raise ValueError("duplicate finding_id")
+        seen_finding_ids.add(finding.finding_id)
 
 
