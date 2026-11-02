@@ -226,3 +226,132 @@ def test_anchor_migration_is_transaction_scoped_and_idempotent(installed):
             "SELECT COUNT(*) FROM security_audit_events"
         ).fetchone()[0]
         assert count == 0
+
+
+def test_audit_anchor_binding_and_execute_revocation_fail_closed(installed):
+    """An existing LOGIN cannot use revoked, absent or wrong-tenant authority."""
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+
+    schema, roles, ids = installed
+    role, tenant, password = roles[0]
+    other_tenant = roles[1][1]
+    invocation = sql.SQL(
+        "SELECT {}.poc_append_db_outcome_audit(%s, %s)"
+    ).format(sql.Identifier(schema))
+    binding = sql.SQL(
+        "UPDATE {}.poc_outcome_runtime_tenants SET tenant_id = %s "
+        "WHERE login_role_oid = "
+        "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname = %s)"
+    ).format(sql.Identifier(schema))
+    remove = sql.SQL(
+        "DELETE FROM {}.poc_outcome_runtime_tenants WHERE login_role_oid = "
+        "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname = %s)"
+    ).format(sql.Identifier(schema))
+    restore = sql.SQL(
+        "INSERT INTO {}.poc_outcome_runtime_tenants (login_role_oid, tenant_id) "
+        "SELECT oid, %s FROM pg_catalog.pg_roles WHERE rolname = %s"
+    ).format(sql.Identifier(schema))
+    function = sql.SQL("{}.poc_append_db_outcome_audit(bigint, text)").format(
+        sql.Identifier(schema)
+    )
+    revoke = sql.SQL("REVOKE EXECUTE ON FUNCTION {} FROM {}").format(
+        function, sql.Identifier(role)
+    )
+    grant = sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(
+        function, sql.Identifier(role)
+    )
+    attempts = [uuid4().hex for _ in range(5)]
+    with (
+        psycopg.connect(DSN, autocommit=True) as owner,
+        psycopg.connect(make_conninfo(DSN, user=role, password=password)) as runtime,
+    ):
+        try:
+            assert runtime.execute(
+                invocation, (ids[tenant], attempts[0])
+            ).fetchone()[0] > 0
+            runtime.commit()
+
+            owner.execute(remove, (role,))
+            with pytest.raises(psycopg.errors.RaiseException):
+                runtime.execute(invocation, (ids[tenant], attempts[1]))
+            runtime.rollback()
+
+            owner.execute(restore, (other_tenant, role))
+            with pytest.raises(psycopg.errors.RaiseException):
+                runtime.execute(invocation, (ids[tenant], attempts[2]))
+            runtime.rollback()
+
+            owner.execute(binding, (tenant, role))
+            owner.execute(revoke)
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                runtime.execute(invocation, (ids[tenant], attempts[3]))
+            runtime.rollback()
+
+            owner.execute(grant)
+            assert runtime.execute(
+                invocation, (ids[tenant], attempts[4])
+            ).fetchone()[0] > 0
+            runtime.commit()
+            rows = owner.execute(
+                sql.SQL(
+                    "SELECT attempt_ref FROM {}.security_audit_events "
+                    "WHERE attempt_ref = ANY(%s) ORDER BY attempt_ref"
+                ).format(sql.Identifier(schema)),
+                (attempts,),
+            ).fetchall()
+            assert [item[0] for item in rows] == sorted(
+                (attempts[0], attempts[4])
+            )
+        finally:
+            owner.execute(grant)
+            owner.execute(remove, (role,))
+            owner.execute(restore, (tenant, role))
+
+
+def test_audit_anchor_reapply_preserves_record_and_execute_grant(installed):
+    """Reinstalling 015 must not erase history or runtime permissions."""
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+
+    schema, roles, ids = installed
+    role, tenant, password = roles[0]
+    attempt = uuid4().hex
+    invoke = sql.SQL(
+        "SELECT {}.poc_append_db_outcome_audit(%s, %s)"
+    ).format(sql.Identifier(schema))
+    audit_lookup = sql.SQL(
+        "SELECT id, action, result, actor_ref, tenant_ref, attempt_ref "
+        "FROM {}.security_audit_events WHERE attempt_ref = %s"
+    ).format(sql.Identifier(schema))
+    with (
+        psycopg.connect(DSN) as owner,
+        psycopg.connect(make_conninfo(DSN, user=role, password=password)) as runtime,
+    ):
+        audit_id = runtime.execute(
+            invoke, (ids[tenant], attempt)
+        ).fetchone()[0]
+        runtime.commit()
+        before = owner.execute(audit_lookup, (attempt,)).fetchone()
+        assert before is not None and before[0] == audit_id
+        owner.execute(
+            "SELECT set_config('gasha.installation_schema', %s, true)",
+            (schema,),
+        )
+        owner.execute(AUDIT_MIGRATION.read_text())
+        owner.commit()
+        assert owner.execute(audit_lookup, (attempt,)).fetchone() == before
+        assert owner.execute(
+            sql.SQL(
+                "SELECT COUNT(*) FROM {}.security_audit_events "
+                "WHERE attempt_ref = %s"
+            ).format(sql.Identifier(schema)),
+            (attempt,),
+        ).fetchone()[0] == 1
+        assert runtime.execute(
+            "SELECT pg_catalog.has_function_privilege("
+            "current_user, %s, 'EXECUTE')",
+            (f"{schema}.poc_append_db_outcome_audit(bigint, text)",),
+        ).fetchone()[0] is True
