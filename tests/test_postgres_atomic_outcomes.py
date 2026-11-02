@@ -390,3 +390,102 @@ def test_migration_ignores_hostile_earlier_search_path_schema(
             admin.execute(
                 sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(hostile))
             )
+
+
+def test_reapplying_opt_in_migration_preserves_history_and_trigger(
+    schema: str,
+) -> None:
+    # A repeat installation must neither erase an accepted outcome/audit nor
+    # silently disable immutability. The GUC is transaction-local every time.
+    with connect(schema) as connection:
+        identity = principal(Capability.OUTCOME_SUBMIT)
+        service = writer(connection, schema)
+        assert service.submit(
+            outcome(), principal=identity, now=NOW,
+        ).status is SubmissionStatus.ACCEPTED
+        connection.execute(
+            "SELECT set_config('gasha.installation_schema', %s, true)",
+            (schema,),
+        )
+        connection.execute(POC_MIGRATION.read_text())
+        connection.commit()
+        assert counts(connection) == (1, 1)
+        triggers = connection.execute(
+            """SELECT COUNT(*) AS n FROM pg_catalog.pg_trigger
+            WHERE tgrelid = 'poc_atomic_outcomes'::regclass
+              AND tgname = 'poc_atomic_outcomes_immutable'
+              AND NOT tgisinternal"""
+        ).fetchone()["n"]
+        assert triggers == 1
+        with pytest.raises(Exception, match="append-only"):
+            connection.execute(
+                "UPDATE poc_atomic_outcomes SET tenant_id = tenant_id"
+            )
+        connection.rollback()
+        assert service.submit(
+            outcome(), principal=identity, now=NOW,
+        ).status is SubmissionStatus.DUPLICATE
+        assert counts(connection) == (1, 2)
+
+
+def test_mid_migration_ddl_failure_rolls_back_new_objects_and_can_retry() -> None:
+    # A pre-existing incompatible function deliberately fails after CREATE
+    # TABLE/INDEX. The migrator must run all DDL in one transaction; a failed
+    # installation must leave neither partial outcome table nor orphan index.
+    import psycopg
+    from psycopg import sql
+
+    fresh = "gasha_partial_" + uuid4().hex[:15]
+    with psycopg.connect(DSN, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(fresh)))
+        try:
+            with connect(fresh) as connection:
+                connection.execute(
+                    (MIGRATIONS / "010_security_audit_events.sql").read_text()
+                )
+                connection.commit()
+                connection.execute(
+                    """CREATE FUNCTION reject_poc_atomic_outcome_mutation()
+                    RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$"""
+                )
+                connection.commit()
+                connection.execute(
+                    "SELECT set_config('gasha.installation_schema', %s, true)",
+                    (fresh,),
+                )
+                with pytest.raises(Exception, match="cannot change return type"):
+                    connection.execute(POC_MIGRATION.read_text())
+                connection.rollback()
+                partial = connection.execute(
+                    """SELECT COUNT(*) AS n FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = %s
+                      AND c.relname IN (
+                          'poc_atomic_outcomes',
+                          'poc_atomic_outcomes_history_idx'
+                      )""",
+                    (fresh,),
+                ).fetchone()["n"]
+                assert partial == 0
+                # Explicitly repair the injected fixture fault and retry
+                # using a newly installed transaction-local scope.
+                connection.execute(
+                    "DROP FUNCTION reject_poc_atomic_outcome_mutation()"
+                )
+                connection.commit()
+                connection.execute(
+                    "SELECT set_config('gasha.installation_schema', %s, true)",
+                    (fresh,),
+                )
+                connection.execute(POC_MIGRATION.read_text())
+                connection.commit()
+                accepted = writer(connection, fresh).submit(
+                    outcome(), principal=principal(Capability.OUTCOME_SUBMIT),
+                    now=NOW,
+                )
+                assert accepted.status is SubmissionStatus.ACCEPTED
+                assert counts(connection) == (1, 1)
+        finally:
+            admin.execute(
+                sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(fresh))
+            )
