@@ -27,6 +27,7 @@ from gasha.security.access import Capability, TrustedPrincipal
 DSN = os.environ.get("GASHA_TEST_POSTGRES_DSN")
 pytestmark = pytest.mark.skipif(not DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
 MIGRATIONS = Path(__file__).resolve().parent.parent / "db/migrations"
+POC_MIGRATION = MIGRATIONS.parent / "poc-migrations" / "013_poc_atomic_outcomes.sql"
 NOW = datetime(2026, 11, 2, 3, tzinfo=UTC)
 EVENT_ID = UUID(int=42)
 
@@ -87,11 +88,10 @@ def schema():
                     "SELECT set_config('gasha.installation_schema', %s, true)",
                     (name,),
                 )
-                for filename in (
-                    "010_security_audit_events.sql",
-                    "013_poc_atomic_outcomes.sql",
-                ):
-                    connection.execute((MIGRATIONS / filename).read_text())
+                connection.execute(
+                    (MIGRATIONS / "010_security_audit_events.sql").read_text()
+                )
+                connection.execute(POC_MIGRATION.read_text())
                 connection.commit()
             yield name
         finally:
@@ -320,6 +320,7 @@ def test_migration_fails_without_canonical_trusted_installation_schema(
 ) -> None:
     # A prior (legitimate) installation does not waive the requirement on
     # repeated migration attempts. A bad search_path is not authority.
+    assert not (MIGRATIONS / "013_poc_atomic_outcomes.sql").exists()
     with connect(schema) as connection:
         if untrusted_schema is not None:
             connection.execute(
@@ -328,7 +329,7 @@ def test_migration_fails_without_canonical_trusted_installation_schema(
             )
         with pytest.raises(Exception, match="trusted installation schema"):
             connection.execute(
-                (MIGRATIONS / "013_poc_atomic_outcomes.sql").read_text()
+                POC_MIGRATION.read_text()
             )
         connection.rollback()
 
@@ -356,7 +357,7 @@ def test_migration_ignores_hostile_earlier_search_path_schema(
                     (schema,),
                 )
                 connection.execute(
-                    (MIGRATIONS / "013_poc_atomic_outcomes.sql").read_text()
+                    POC_MIGRATION.read_text()
                 )
                 # Assert inside the transaction, before SET LOCAL resets.
                 assert connection.execute(
