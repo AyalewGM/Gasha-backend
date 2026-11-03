@@ -261,16 +261,16 @@ def test_unrelated_source_cannot_supply_one_field_of_a_correlated_event(
 def test_payment_before_change_is_blocked_not_labelled_as_fraud() -> None:
     after_payment = AT + timedelta(seconds=1)
     row = packet(change_at=after_payment)
-    candidate = replace(
-        metrics(row), change_at=after_payment,
-        baseline_observed_at=after_payment, baseline_available_at=after_payment,
-    )
+    candidate = replace(metrics(row), change_at=after_payment)
     result = evaluate(row, candidate)
     assert result["status"] == APP02Status.BLOCKED_FIELDS.value
     assert result["heuristic_evaluated"] is False
     # Even when the claimed metrics snapshot is later than the future change,
     # that post-payment event may not be used to classify the payment.
-    later_snapshot = replace(candidate, available_at=AT + timedelta(minutes=2))
+    later_snapshot = replace(
+        candidate, available_at=AT + timedelta(minutes=2),
+        baseline_observed_at=after_payment, baseline_available_at=after_payment,
+    )
     result = evaluate(row, later_snapshot)
     assert result["status"] == APP02Status.BLOCKED_CHRONOLOGY.value
     assert result["heuristic_evaluated"] is False
