@@ -17,7 +17,10 @@ object.__setattr__. Before fingerprinting, reporting unavailable telemetry or
 binding a synthetic IntelligenceSnapshot, the kernel now reconstructs and
 revalidates a detached copy of the full envelope and its signal records. Invalid
 post-cutoff observations, invalid clocks/sources, changed signal shapes and missing
-fields fail closed even after initially valid construction. Deleted required slotted\nfields (including the whole signals tuple or nested signal members) raise the fixed,\nredacted HistoricalLineageRejected at each public consumption point, rather than\nan AttributeError that a future adapter could mishandle. Valid value changes yield
+fields fail closed even after initially valid construction. Deleted required slotted
+fields (including the whole signals tuple or nested signal members) raise the fixed,
+redacted HistoricalLineageRejected at each public consumption point, rather than
+an AttributeError that a future adapter could mishandle. Valid value changes yield
 a different content fingerprint and must still match the decision input. This is
 defense-in-depth against malformed caller-held objects; it is **not** source
 authentication, Bank attestation, or replay integration.
