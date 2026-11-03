@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta, timezone
 from json import dumps
 from uuid import UUID
@@ -193,3 +193,59 @@ def test_scope_is_revalidated_and_output_omits_event_and_customer_refs() -> None
     assert EVIDENCE not in text
     assert "fraud_determined" not in result
     assert "alert_budget_approved" in result["downstream_evaluation"]
+
+
+def test_exported_report_mutation_cannot_rewrite_frozen_evidence() -> None:
+    """Regression for PO/Security/QA alias finding on a real batch report."""
+    scenario = ScenarioId.MM_02
+    missing_name = SCENARIO_FIELDS[scenario].required[0]
+    optional_name = SCENARIO_FIELDS[scenario].optional[0]
+    built = inspect_scenario_coverage_batch(
+        scope(),
+        (
+            observation(scenario, event_number=1, omit=missing_name),
+            observation(scenario, event_number=2),
+        ),
+    )
+    digest = built.batch_digest
+    canonical = built.to_dict()
+    canonical_json = dumps(canonical, sort_keys=True)
+
+    # Each exported level must be a new, disconnected JSON container.
+    altered = built.to_dict()
+    summaries = altered["scenarios"]
+    assert isinstance(summaries, list)
+    target = next(item for item in summaries if item["scenario_id"] == scenario.value)
+    target["input_events"] = 999
+    target["complete_required_events"] = 999
+    target["blocked_required_events"] = 999
+    target["required_coverage"]["numerator"] = 999
+    target["required_coverage"]["denominator"] = 999
+    target["required_coverage"]["value"] = 100.0
+    target["required_coverage"]["undefined_reason"] = "fake"
+    target["missing_required_counts"][missing_name] = 999
+    target["unavailable_optional_counts"][optional_name] = 999
+    summaries.clear()
+    altered["scope"]["tenant_ref"] = "other-tenant"
+    altered["downstream_evaluation"]["precision"] = 1.0
+    altered["limitations"].append("forged evidence")
+
+    assert dumps(built.to_dict(), sort_keys=True) == canonical_json
+    assert built.to_dict() == canonical
+    assert built.batch_digest == digest
+
+    # A caller cannot mutate the retained summary, nested rate, or count pairs.
+    retained = next(x for x in built.scenarios if x.scenario_id == scenario.value)
+    assert retained.complete_required_events == 1
+    assert retained.blocked_required_events == 1
+    assert retained.required_coverage.value == 0.5
+    with pytest.raises(FrozenInstanceError):
+        setattr(retained, "complete_required_events", 999)
+    with pytest.raises(FrozenInstanceError):
+        setattr(retained.required_coverage, "value", 100.0)
+    with pytest.raises(TypeError):
+        retained.missing_required_counts[0] = (missing_name, 999)
+    with pytest.raises(TypeError):
+        retained.unavailable_optional_counts[0] = (optional_name, 999)
+    assert built.to_dict() == canonical
+    assert built.batch_digest == digest
