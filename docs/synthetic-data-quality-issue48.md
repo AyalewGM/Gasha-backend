@@ -38,3 +38,24 @@ The module is purposefully **not wired into** replay, scoring, protected API, wo
 The reference inspector now rejects an empty, missing, noncanonical or malformed `source_system` as `invalid.source_system` even when an unchecked synthetic model copy bypassed the ingestion model validation. Such a quarantined row cannot reserve a same-UC event ID or affect accepted labels, alerts or signal-coverage denominators. A valid canonical source token establishes **shape, not source authentication**.
 
 An explicitly present `intelligence` value that is not a mapping records `invalid_optional.intelligence`, including explicit null; its provisional per-UC signals remain unavailable. Absence of the optional container is not a quality warning. This extends the existing report v2 check-code vocabulary without changing the machine-readable structure, use-case coverage matrix or Bank-readiness authority. No new bank adapter, historical replay, policy evaluation or deployment wiring is added.
+
+
+The separate eight-scenario `scenario_coverage_batch.py` reporter from already merged internal PR #98 is preserved. This legacy UC-01/02/03 report snapshot fix is independent; neither reporter establishes Bank provenance or UC-04/05 performance.
+
+## Report export ownership and integrity (synthetic-only)
+
+The retained `DataQualityReport.use_cases` now contains independent, recursively
+frozen mapping snapshots rather than caller-owned mutable dictionaries. Direct
+report construction also copies its input, rejects non-JSON/non-finite leaf
+values and revalidates the dataset scope. `to_dict()` allocates new nested
+maps and lists on every call, including accepted/rejected counts, checks,
+labels, alerts, acceptance and per-signal coverage. Regression tests mutate
+every exported level and the constructor's source maps and verify the
+retained report does not change.
+
+This corrects **in-process aggregate output aliasing only**; Python
+immutability does not authenticate evidence, independently verify a dataset
+digest, protect against privileged runtime mutation or authorize UC-04/UC-05
+metrics. The existing provisional UC matrix and non-authoritative flags
+remain unchanged. In particular #54 is still advisory and #49 still
+requires trusted verifier/approver provenance and revocation.

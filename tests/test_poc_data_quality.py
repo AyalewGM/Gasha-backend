@@ -13,6 +13,7 @@ import pytest
 
 from gasha.ingestion.contracts import InboundBankEvent
 from gasha.poc.data_quality import (
+    DataQualityReport,
     DataQualityScope,
     QualityObservation,
     UseCase,
@@ -688,6 +689,67 @@ def test_quality_report_retains_validated_scope_snapshot() -> None:
     object.__setattr__(original, "tenant_id", "raw@example.com")
     assert report.to_dict()["scope"]["tenant_id"] == "synthetic-tenant"
     assert report.to_dict()["use_cases"][0]["accepted"] == 1
+
+
+
+def test_quality_report_export_mutation_cannot_rewrite_retained_counts() -> None:
+    """Synthetic report integrity: nested exports must never alias retained rows."""
+    report = inspect_reference_quality(scope(), (
+        candidate(
+            "alias-valid", label=True, confirmed_at=AT + timedelta(days=1),
+            alerted=True, payload_changes={
+                "intelligence": {"beneficiary_risk": 0.0},
+            },
+        ),
+        candidate("alias-invalid", event_changes={"schema_version": "bad-schema"}),
+    ))
+    canonical = report.to_dict()
+    exported = report.to_dict()
+    row = exported["use_cases"][0]
+    row["total"] = 999
+    row["accepted"] = 999
+    row["checks"]["schema_mismatch"] = 999
+    row["labels"]["positive"] = 999
+    row["alerts"]["alerted"] = 999
+    row["acceptance"]["count"] = 999
+    row["acceptance"]["rate"] = 1.0
+    row["optional_signals"]["beneficiary_risk"]["available"]["count"] = 999
+    row["optional_signals"]["beneficiary_risk"]["available"]["denominator"] = 999
+    row["optional_signals"]["beneficiary_risk"]["unavailable"] = 999
+    exported["scope"]["tenant_id"] = "spoofed-tenant"
+    exported["use_cases"][1]["accepted"] = 999
+    exported["limitations"].clear()
+    assert report.to_dict() == canonical
+    assert report.to_dict() is not canonical
+    assert report.to_dict()["use_cases"][0] is not canonical["use_cases"][0]
+    json.dumps(report.to_dict(), allow_nan=False)
+
+    with pytest.raises(TypeError):
+        report.use_cases[0]["accepted"] = 999
+    with pytest.raises(TypeError):
+        report.use_cases[0]["labels"]["positive"] = 999
+    with pytest.raises(TypeError):
+        report.use_cases[0]["optional_signals"]["beneficiary_risk"]["available"]["count"] = 999
+
+
+def test_quality_report_direct_construction_copies_caller_owned_maps() -> None:
+    original = inspect_reference_quality(scope(), (candidate("direct-alias"),))
+    rows = original.to_dict()["use_cases"]
+    report = DataQualityReport(scope=scope(), use_cases=tuple(rows))
+    before = report.to_dict()
+    rows[0]["accepted"] = 999
+    rows[0]["labels"]["unlabelled"] = 999
+    rows[0]["optional_signals"]["beneficiary_risk"]["available"]["count"] = 999
+    assert report.to_dict() == before
+    assert report.to_dict() == original.to_dict()
+
+
+def test_quality_report_direct_construction_rejects_mutable_unknown_objects() -> None:
+    original = inspect_reference_quality(scope(), ())
+    rows = list(original.to_dict()["use_cases"])
+    rows[0]["custom"] = object()
+    with pytest.raises(ValueError, match="non-JSON"):
+        DataQualityReport(scope=scope(), use_cases=tuple(rows))
 
 
 @pytest.mark.parametrize(("field", "corrupt"), [
