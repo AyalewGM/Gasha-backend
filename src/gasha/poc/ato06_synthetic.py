@@ -7,7 +7,8 @@ No API, worker, case, readiness, scoring or enforcement integration is permitted
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, fields as dataclass_fields, replace
+from dataclasses import dataclass, replace
+from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
