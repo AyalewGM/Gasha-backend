@@ -14,6 +14,8 @@ import pytest
 from gasha.poc.mm01_synthetic import (
     MM01Context,
     MM01Direction,
+    MM01RelationshipEvidence,
+    MM01RelationshipKind,
     MM01Status,
     MM01SyntheticMetrics,
     MM01SyntheticPolicy,
@@ -67,6 +69,21 @@ def policy() -> MM01SyntheticPolicy:
 
 
 def metrics(row: ScenarioObservation) -> MM01SyntheticMetrics:
+    relation = next(
+        (field for field in row.fields if field.name == "own_account_relationship"
+         and field.state is FieldState.OBSERVED), None
+    )
+    relationship = (
+        MM01RelationshipEvidence(
+            kind=MM01RelationshipKind.DISTINCT_OWNERS,
+            source_ref=relation.source_ref, source_version=relation.source_version,
+            evidence_digest=relation.evidence_digest,
+            snapshot_digest=row.fingerprint(), installation_ref=row.installation_ref,
+            tenant_ref=row.tenant_ref, dataset_digest=row.dataset_digest,
+            observed_at=relation.observed_at, available_at=relation.available_at,
+            permitted_purpose="synthetic_mm01_own_account_exclusion",
+        ) if relation is not None else None
+    )
     return MM01SyntheticMetrics(
         observation_digest=row.fingerprint(), policy_version="synthetic-v1",
         account_ref="synthetic-acct", inbound_account_ref="synthetic-acct",
@@ -80,7 +97,7 @@ def metrics(row: ScenarioObservation) -> MM01SyntheticMetrics:
         inbound_available_at=AT - timedelta(minutes=2),
         outbound_available_at=AT,
         inbound_amount=Decimal(1000), outbound_amount=Decimal(800),
-        currency="ETB",
+        currency="ETB", own_account_relationship=relationship,
     )
 
 
@@ -128,6 +145,11 @@ def test_explicit_observed_exception_absence_yields_only_synthetic_hypothesis() 
 def test_known_legitimate_or_reversal_context_excludes_hypothesis(name: str) -> None:
     row = packet(include_context=True)
     vals = replace(metrics(row), **{name: MM01Context.REPORTED})
+    if name == "own_account_context":
+        assert vals.own_account_relationship is not None
+        vals = replace(vals, own_account_relationship=replace(
+            vals.own_account_relationship, kind=MM01RelationshipKind.SAME_OWNER,
+        ))
     assert evaluate(row, values=vals)["status"] == MM01Status.CONTEXT_EXCLUSION.value
 
 
@@ -384,3 +406,69 @@ def test_exact_micro_unit_ratio_comparison_and_max_amount() -> None:
     assert evaluate(row, values=lower, thresholds=replace(
         policy(), min_credit_amount=tiny, min_outbound_ratio=Decimal(1),
     ))["status"] == MM01Status.SYNTHETIC_HYPOTHESIS.value
+
+
+def test_counterparty_identifier_alone_cannot_authorize_same_owner_exclusion() -> None:
+    row = packet(include_context=True)
+    row = replace(row, fields=tuple(
+        field for field in row.fields if field.name != "own_account_relationship"
+    ))
+    vals = replace(metrics(row), own_account_context=MM01Context.REPORTED)
+    assert "counterparty_pseudonym" in {field.name for field in row.fields}
+    with pytest.raises(ScenarioContractError, match="without observed evidence"):
+        evaluate(row, values=vals)
+
+
+@pytest.mark.parametrize("change", [
+    {"source_version": "different"},
+    {"source_ref": "spliced-source"},
+    {"evidence_digest": "sha256:" + "c" * 64},
+    {"tenant_ref": "foreign-tenant"},
+    {"dataset_digest": "sha256:" + "d" * 64},
+    {"snapshot_digest": "sha256:" + "e" * 64},
+    {"permitted_purpose": "general_analytics"},
+    {"available_at": AT + timedelta(seconds=1)},
+])
+def test_claimed_relationship_rejects_scope_or_provenance_splicing(
+    change: dict[str, object],
+) -> None:
+    row = packet(include_context=True)
+    vals = metrics(row)
+    assert vals.own_account_relationship is not None
+    vals = replace(vals, own_account_context=MM01Context.REPORTED_ABSENT,
+                   own_account_relationship=replace(vals.own_account_relationship, **change))
+    with pytest.raises(ScenarioContractError):
+        evaluate(row, values=vals)
+
+
+def test_same_owner_claim_requires_consistent_explicit_classification() -> None:
+    row = packet(include_context=True)
+    vals = replace(metrics(row), own_account_context=MM01Context.REPORTED)
+    with pytest.raises(ScenarioContractError, match="classification mismatch"):
+        evaluate(row, values=vals)
+    assert vals.own_account_relationship is not None
+    same = replace(vals, own_account_relationship=replace(
+        vals.own_account_relationship, kind=MM01RelationshipKind.SAME_OWNER,
+    ))
+    assert evaluate(row, values=same)["status"] == MM01Status.CONTEXT_EXCLUSION.value
+
+
+def test_claimed_relationship_rejects_unavailable_or_late_evidence() -> None:
+    row = packet(include_context=True)
+    changed = replace(row, fields=tuple(
+        FieldEvidence(name=field.name, state=FieldState.UNAVAILABLE,
+                      unavailable_reason="not_authorized")
+        if field.name == "own_account_relationship" else field for field in row.fields
+    ))
+    vals = replace(metrics(changed), own_account_context=MM01Context.REPORTED)
+    with pytest.raises(ScenarioContractError):
+        evaluate(changed, values=vals)
+    vals = metrics(row)
+    assert vals.own_account_relationship is not None
+    late = replace(vals, own_account_context=MM01Context.REPORTED_ABSENT,
+                   own_account_relationship=replace(
+                       vals.own_account_relationship,
+                       available_at=AT + timedelta(seconds=1),
+                   ))
+    with pytest.raises(ScenarioContractError):
+        evaluate(row, values=late)
