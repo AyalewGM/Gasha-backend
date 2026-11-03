@@ -39,3 +39,28 @@ always false. Existing #54 evaluator remains advisory. Existing #52/#53
 persistence/transport code is untouched. Independent Product Owner,
 Security/Architecture, Fraud Intelligence, and QA review required at exact
 commit before any internal integration; separate Bank release controls remain.
+
+## Synthetic value binding and snapshot revision
+
+This revision requires exact immutable input types before any dataclass copy,
+including post-construction mutations of frozen slotted records. Malformed or
+deleted members raise a redacted ScenarioContractError rather than a raw
+TypeError/AttributeError. Every observed transfer and any claimed optional
+context must be available by the metrics snapshot timestamp, itself no later
+than the decision cutoff. Exact equality is permitted; a later fact rejects.
+
+Required MM-02 field semantics and any claimed optional baseline/payroll
+context now carry snapshot-scoped field claims with source ref/version,
+evidence digest, canonical semantic value digest, dataset/mapping/tenant/
+installation references and observed/available times. Transfer source metadata
+must match the observed transfer-status source. Missing, duplicate, spliced,
+stale-value, wrong-scope and late claims reject before classification.
+The output includes a deterministic effective-input digest over policy,
+snapshot, canonical deduplicated transfer facts, context, field claims and
+window. Equivalent ordering or UTC offsets do not change the digest;
+material changes do. No raw sender/beneficiary refs are included in results.
+
+All these values, their source metadata and their digests remain **synthetic
+caller-created assertions**, not authenticated Bank evidence or verification.
+Bank-approved thresholds/cohorts, actual source integrity, tenant identity,
+installed adapter/CI readiness, #49 approval and enforcement remain blocked.

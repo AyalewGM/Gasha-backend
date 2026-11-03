@@ -11,6 +11,7 @@ import pytest
 
 from gasha.poc.mm02_synthetic import (
     MM02Context,
+    MM02FieldClaim,
     MM02Institution,
     MM02Status,
     MM02SyntheticMetrics,
@@ -18,6 +19,7 @@ from gasha.poc.mm02_synthetic import (
     MM02Transfer,
     MM02TransferStatus,
     evaluate_mm02_synthetic,
+    mm02_field_value_digest,
 )
 from gasha.poc.scenario_observations import (
     SCENARIO_FIELDS,
@@ -63,12 +65,12 @@ def transfer(
         event_ref=event, sender_ref=sender, beneficiary_ref=beneficiary,
         status=status, occurred_at=time, available_at=AT,
         source_ref="synthetic-ledger", source_version="1",
-        evidence_digest="sha256:" + "c" * 64,
+        evidence_digest="sha256:" + "b" * 64,
     )
 
 
 def metrics(row: ScenarioObservation) -> MM02SyntheticMetrics:
-    return MM02SyntheticMetrics(
+    return bind(row, MM02SyntheticMetrics(
         observation_digest=row.fingerprint(), policy_version="synthetic-p1",
         installation_ref="synthetic-install", tenant_ref="synthetic-tenant",
         dataset_digest=DATASET, beneficiary_ref="common",
@@ -80,13 +82,37 @@ def metrics(row: ScenarioObservation) -> MM02SyntheticMetrics:
             transfer("sender-b", event="two", time=AT - timedelta(minutes=20)),
             transfer("sender-c", event="three", time=AT - timedelta(hours=1)),
         ),
-    )
+    ))
+
+
+def bind(row: ScenarioObservation, value: MM02SyntheticMetrics) -> MM02SyntheticMetrics:
+    """Make an explicit, caller-generated test packet (not a trusted attestation)."""
+    names = list(SCENARIO_FIELDS[ScenarioId.MM_02].required)
+    if value.sender_baseline is not MM02Context.UNKNOWN:
+        names.append("sender_baseline")
+    if value.payroll_merchant_exclusion is not MM02Context.UNKNOWN:
+        names.append("payroll_merchant_exclusion")
+    sources = {f.name: f for f in row.fields if f.state is FieldState.OBSERVED}
+    claims = tuple(MM02FieldClaim(
+        name=name, source_ref=sources[name].source_ref or "",
+        source_version=sources[name].source_version or "",
+        evidence_digest=sources[name].evidence_digest or "",
+        value_digest=mm02_field_value_digest(name, value),
+        snapshot_digest=row.fingerprint(),
+        installation_ref=row.installation_ref, tenant_ref=row.tenant_ref,
+        dataset_digest=row.dataset_digest, mapping_version=row.mapping_version,
+        observed_at=sources[name].observed_at or AT,
+        available_at=sources[name].available_at or AT,
+    ) for name in sorted(names) if name in sources)
+    return replace(value, field_claims=claims)
 
 
 def evaluate(row: ScenarioObservation, value: MM02SyntheticMetrics | None,
-             rule: MM02SyntheticPolicy | None = None) -> dict[str, object]:
+             rule: MM02SyntheticPolicy | None = None, *,
+             rebind: bool = True) -> dict[str, object]:
     return evaluate_mm02_synthetic(
-        row, policy=policy() if rule is None else rule, metrics=value,
+        row, policy=policy() if rule is None else rule,
+        metrics=bind(row, value) if value is not None and rebind else value,
         expected_installation="synthetic-install", expected_tenant="synthetic-tenant",
         expected_dataset_digest=DATASET,
     ).to_dict()
@@ -252,7 +278,7 @@ def test_mutated_frozen_inputs_are_revalidated() -> None:
     values = metrics(row)
     object.__setattr__(values.transfers[1], "status", "settled")
     with pytest.raises(ScenarioContractError):
-        evaluate(row, values)
+        evaluate(row, values, rebind=False)
     rule = policy()
     object.__setattr__(rule, "min_unique_senders", True)
     with pytest.raises(ScenarioContractError):
@@ -265,3 +291,109 @@ def test_mutated_frozen_inputs_are_revalidated() -> None:
 ])
 def test_no_operational_or_readiness_wiring(path: str) -> None:
     assert "mm02_synthetic" not in Path(path).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("kind", ["list", "none", "bad_element", "deleted", "nested_deleted"])
+def test_postconstruction_shape_corruption_is_redacted(kind: str) -> None:
+    row = packet(contexts=True)
+    value = metrics(row)
+    if kind == "list":
+        object.__setattr__(value, "transfers", list(value.transfers))
+    elif kind == "none":
+        object.__setattr__(value, "transfers", None)
+    elif kind == "bad_element":
+        object.__setattr__(value, "transfers", ("unexpected",))
+    elif kind == "deleted":
+        object.__delattr__(value, "transfers")
+    else:
+        object.__delattr__(value.transfers[0], "sender_ref")
+    with pytest.raises(ScenarioContractError):
+        evaluate(row, value, rebind=False)
+
+
+@pytest.mark.parametrize("scope", ["target", "contributor", "sender_baseline",
+                                     "payroll_merchant_exclusion"])
+def test_snapshot_causality_blocks_later_available_claims(scope: str) -> None:
+    row = replace(packet(contexts=True), decision_cutoff=AT + timedelta(seconds=2))
+    value = metrics(row)
+    if scope in ("target", "contributor"):
+        index = 0 if scope == "target" else 1
+        transfers = list(value.transfers)
+        transfers[index] = replace(transfers[index], available_at=AT + timedelta(seconds=1))
+        value = replace(value, transfers=tuple(transfers))
+    else:
+        row = replace(row, fields=tuple(
+            replace(f, available_at=AT + timedelta(seconds=1))
+            if f.name == scope else f for f in row.fields
+        ))
+        value = replace(value, **{scope: MM02Context.REPORTED_ABSENT})
+    with pytest.raises(ScenarioContractError):
+        evaluate(row, value)
+    if scope in ("target", "contributor"):
+        assert evaluate(row, metrics(row))["status"] == MM02Status.CONTEXT_REVIEW_REQUIRED.value
+
+
+@pytest.mark.parametrize("corruption", ["missing", "duplicate", "stale_value",
+                                         "wrong_source", "wrong_tenant", "late_claim",
+                                         "wrong_transfer_source"])
+def test_synthetic_field_claims_fail_closed(corruption: str) -> None:
+    row = packet(contexts=True)
+    value = bind(row, replace(
+        metrics(row), sender_baseline=MM02Context.REPORTED_ABSENT,
+        payroll_merchant_exclusion=MM02Context.REPORTED_ABSENT,
+    ))
+    claims = value.field_claims
+    first = claims[0]
+    if corruption == "missing":
+        value = replace(value, field_claims=claims[1:])
+    elif corruption == "duplicate":
+        value = replace(value, field_claims=claims + (first,))
+    elif corruption == "stale_value":
+        value = replace(value, transfers=(
+            replace(value.transfers[0], sender_ref="forged"), *value.transfers[1:],
+        ))
+    elif corruption == "wrong_transfer_source":
+        value = replace(value, transfers=(
+            replace(value.transfers[0], source_version="forged"), *value.transfers[1:],
+        ))
+    else:
+        change: dict[str, object] = {
+            "wrong_source": {"source_ref": "forged"},
+            "wrong_tenant": {"tenant_ref": "forged"},
+            "late_claim": {"available_at": AT + timedelta(seconds=1)},
+        }[corruption]
+        value = replace(value, field_claims=(replace(first, **change), *claims[1:]))
+    with pytest.raises(ScenarioContractError):
+        evaluate(row, value, rebind=False)
+
+
+def test_effective_digest_binds_inputs_and_is_order_timezone_invariant() -> None:
+    row = packet(contexts=True)
+    base = replace(metrics(row), sender_baseline=MM02Context.REPORTED_ABSENT,
+                   payroll_merchant_exclusion=MM02Context.REPORTED_ABSENT)
+    original = evaluate(row, base)
+    digest = original["effective_input_digest"]
+    assert isinstance(digest, str) and digest.startswith("sha256:")
+    assert evaluate(row, replace(base, transfers=tuple(reversed(base.transfers))))[
+        "effective_input_digest"
+    ] == digest
+    duplicate = replace(base, transfers=base.transfers + (base.transfers[1],))
+    assert evaluate(row, duplicate)["effective_input_digest"] == digest
+    zone = ZoneInfo("America/New_York")
+    shifted = replace(base.transfers[1],
+                      available_at=base.transfers[1].available_at.astimezone(zone))
+    assert evaluate(row, replace(base, transfers=(base.transfers[0], shifted,
+                                       base.transfers[2])))["effective_input_digest"] == digest
+    for changed in (
+        replace(base, transfers=(replace(base.transfers[1], status=MM02TransferStatus.PENDING),
+                                 base.transfers[0], base.transfers[2])),
+        replace(base, transfers=(replace(base.transfers[0], sender_ref="other-sender"),
+                                 *base.transfers[1:])),
+        replace(base, payroll_merchant_exclusion=MM02Context.REPORTED),
+        replace(base, external_institution=MM02Institution.INTERNAL),
+    ):
+        assert evaluate(row, changed)["effective_input_digest"] != digest
+    assert evaluate(row, base, replace(policy(), min_unique_senders=4))[
+        "effective_input_digest"
+    ] != digest
+    assert "sender-a" not in str(original) and "common" not in str(original)
