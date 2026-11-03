@@ -347,9 +347,10 @@ def test_change_must_strictly_precede_payment(
 ) -> None:
     changed_at = AT + timedelta(seconds=offset_seconds)
     row = packet(maintenance=True, change_at=changed_at)
+    end = min(changed_at, AT)  # baseline must never extend past payment
     candidate = replace(
         metrics(row), change_at=changed_at,
-        baseline_start=changed_at - timedelta(days=31), baseline_end=changed_at,
+        baseline_start=end - timedelta(days=31), baseline_end=end,
         baseline_observed_at=changed_at, baseline_available_at=changed_at,
         available_at=AT + timedelta(seconds=2),
         maintenance_context=APP02MaintenanceContext.REPORTED_ABSENT,
