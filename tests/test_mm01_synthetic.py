@@ -342,7 +342,7 @@ def test_unsubstantiated_optional_claim_never_escapes_early_return(
 @pytest.mark.parametrize("name", ["inbound_amount", "outbound_amount"])
 @pytest.mark.parametrize("bad", [
     Decimal("1e-1000000"), Decimal("0.0000001"), Decimal("1.0000000"),
-    Decimal("1e19"), Decimal("1e1000000"), Decimal("12345678901234567890123456"),
+    Decimal("1e19"), Decimal("1e1000000"), Decimal(12345678901234567890123456),
 ])
 def test_synthetic_v1_amount_domain_rejects_unrepresentable_claims(
     name: str, bad: Decimal,
