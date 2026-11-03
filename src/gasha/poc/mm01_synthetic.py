@@ -52,6 +52,11 @@ class MM01Context(StrEnum):
     REPORTED = "reported"
 
 
+class MM01RelationshipKind(StrEnum):
+    SAME_OWNER = "same_authorized_owner"
+    DISTINCT_OWNERS = "distinct_authorized_owners"
+
+
 class MM01Status(StrEnum):
     BLOCKED_REQUIRED_FIELDS = "blocked_required_fields"
     BLOCKED_POLICY = "blocked_policy"
@@ -143,6 +148,38 @@ class MM01SyntheticPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class MM01RelationshipEvidence:
+    """Explicit *caller-asserted* same-owner relationship; not Bank attestation."""
+
+    kind: MM01RelationshipKind
+    source_ref: str
+    source_version: str
+    evidence_digest: str
+    snapshot_digest: str
+    installation_ref: str
+    tenant_ref: str
+    dataset_digest: str
+    observed_at: datetime
+    available_at: datetime
+    permitted_purpose: str
+
+    def __post_init__(self) -> None:
+        if type(self.kind) is not MM01RelationshipKind:
+            raise ScenarioContractError("strict synthetic relationship kind required")
+        for name in ("source_ref", "source_version", "installation_ref",
+                     "tenant_ref", "permitted_purpose"):
+            _token(name, getattr(self, name))
+        for name in ("evidence_digest", "snapshot_digest", "dataset_digest"):
+            digest = getattr(self, name)
+            if type(digest) is not str or _DIGEST.fullmatch(digest) is None:
+                raise ScenarioContractError("invalid synthetic relationship digest")
+        for name in ("observed_at", "available_at"):
+            object.__setattr__(self, name, _instant(name, getattr(self, name)))
+        if self.observed_at > self.available_at:
+            raise ScenarioContractError("relationship observed after availability")
+
+
+@dataclass(frozen=True, slots=True)
 class MM01SyntheticMetrics:
     """Caller-asserted flow pair; coincidence is not proof of funds tracing."""
 
@@ -166,6 +203,7 @@ class MM01SyntheticMetrics:
     currency: str
     own_account_context: MM01Context = MM01Context.UNKNOWN
     reversal_context: MM01Context = MM01Context.UNKNOWN
+    own_account_relationship: MM01RelationshipEvidence | None = None
 
     def __post_init__(self) -> None:
         if type(self.observation_digest) is not str or _DIGEST.fullmatch(
@@ -189,6 +227,11 @@ class MM01SyntheticMetrics:
                 raise ScenarioContractError(f"{name}: strict typed enum required")
         if type(self.currency) is not str or _CURRENCY.fullmatch(self.currency) is None:
             raise ScenarioContractError("canonical flow currency required")
+        if (
+            self.own_account_relationship is not None
+            and type(self.own_account_relationship) is not MM01RelationshipEvidence
+        ):
+            raise ScenarioContractError("strict synthetic relationship evidence required")
         _amount("inbound amount", self.inbound_amount)
         _amount("outbound amount", self.outbound_amount)
         for name in (
@@ -283,6 +326,12 @@ def evaluate_mm01_synthetic(
         if type(metrics) is not MM01SyntheticMetrics:
             raise ScenarioContractError("typed MM-01 metrics required")
         _present(metrics)
+        if metrics.own_account_relationship is not None:
+            if type(metrics.own_account_relationship) is not MM01RelationshipEvidence:
+                raise ScenarioContractError("strict synthetic relationship evidence required")
+            metrics = replace(
+                metrics, own_account_relationship=replace(metrics.own_account_relationship)
+            )
         metrics = replace(metrics)
     digest = _input_digest(policy, metrics) if policy is not None and metrics is not None else None
 
@@ -326,12 +375,50 @@ def evaluate_mm01_synthetic(
     available_optional = {
         f.name for f in observation.fields if f.state is FieldState.OBSERVED
     }
-    for name, context in (
-        ("counterparty_pseudonym", metrics.own_account_context),
-        ("reversal_status", metrics.reversal_context),
+    # Counterparty identifier presence does NOT show authorized shared ownership.
+    if (
+        metrics.own_account_context is not MM01Context.UNKNOWN
+        and "own_account_relationship" not in available_optional
     ):
-        if context is not MM01Context.UNKNOWN and name not in available_optional:
-            raise ScenarioContractError("claimed optional context without observed evidence")
+        raise ScenarioContractError("claimed optional context without observed evidence")
+    if (
+        metrics.reversal_context is not MM01Context.UNKNOWN
+        and "reversal_status" not in available_optional
+    ):
+        raise ScenarioContractError("claimed optional context without observed evidence")
+
+    relation = metrics.own_account_relationship
+    if metrics.own_account_context is not MM01Context.UNKNOWN and relation is None:
+        raise ScenarioContractError("own-account classification requires relationship evidence")
+    if relation is not None:
+        source = next(
+            (field for field in observation.fields
+             if field.name == "own_account_relationship"), None
+        )
+        if source is None or source.state is not FieldState.OBSERVED:
+            raise ScenarioContractError("relationship source unavailable")
+        if (
+            relation.source_ref != source.source_ref
+            or relation.source_version != source.source_version
+            or relation.evidence_digest != source.evidence_digest
+            or relation.observed_at != source.observed_at
+            or relation.available_at != source.available_at
+            or relation.snapshot_digest != coverage.observation_digest
+            or relation.installation_ref != observation.installation_ref
+            or relation.tenant_ref != observation.tenant_ref
+            or relation.dataset_digest != observation.dataset_digest
+            or relation.permitted_purpose != "synthetic_mm01_own_account_exclusion"
+            or relation.available_at > observation.decision_cutoff
+            or relation.available_at > metrics.outbound_occurred_at
+        ):
+            raise ScenarioContractError("relationship source, purpose or snapshot mismatch")
+        if (
+            (metrics.own_account_context is MM01Context.REPORTED
+             and relation.kind is not MM01RelationshipKind.SAME_OWNER)
+            or (metrics.own_account_context is MM01Context.REPORTED_ABSENT
+                and relation.kind is not MM01RelationshipKind.DISTINCT_OWNERS)
+        ):
+            raise ScenarioContractError("relationship classification mismatch")
     if (
         metrics.inbound_account_ref != metrics.account_ref
         or metrics.outbound_account_ref != metrics.account_ref
