@@ -83,11 +83,10 @@ currency minor units, FX behavior or Bank policy. Values outside this domain
 reject before evaluation. Ratio comparison uses bounded 64-digit Decimal
 multiplication instead of potentially overflowing division.
 
-Not yet closed in this correction: PO/Security requested explicit
-authorized same-owner relationship evidence and field-level semantic
-source/digest/snapshot binding. Counterparty-pseudonym presence remains only
-identifier presence; this PR must not be merged until those separate
-corrections, regression tests and independent exact-head reviews pass.
+The subsequent synthetic relationship and field-value/source/snapshot
+consistency corrections are now implemented below; they are not a trusted
+Bank source/authorization service. They do not by themselves close Issues
+#42/#48/#49 or permit a merge without exact-head independent review.
 
 ## Explicit synthetic ownership relationship (bounded correction)
 
@@ -134,3 +133,34 @@ their digests may originate with the same caller. This addresses internal
 consistency and stale/substituted claims; a separately authenticated Bank
 adapter, authorized source registry and immutable evidence provenance are
 still required before replay or Bank acceptance. No operational wiring.
+
+## Event-specific causal evidence timing (synthetic event-clock-v1)
+
+For an inbound credit at `inbound_occurred_at`, an OBSERVED
+`inbound_credit_status` may not have `observed_at` before the credit
+event. For an outbound debit at `outbound_occurred_at`, the OBSERVED
+`outbound_debit_status`, combined direction, amount, currency and flow-window
+claims may not precede the debit event. A claimed reversal context likewise
+cannot be observed before the debit. Both POSTED and SETTLED statuses obey
+this rule; it also prevents falsely knowing another transfer status before
+its event. Observations must still be available no earlier than their
+observation and no later than the decision cutoff.
+
+Pre-existing account identities and pre-issued credit/debit reference
+identifiers **may** legitimately be observed before the event; the code does
+not infer that an identifier's presence proves a posted transfer. The inbound
+reference and status fields must be available by the debit event. Claimed
+`inbound_available_at` also must not exceed that debit time. Violations are
+rejected as `ScenarioContractError` before any negative, exclusion, review
+or favorable hypothesis classification; they are **not** treated as safe or
+counted as verified alerts. Positive synthetic fixtures now use per-field,
+causally ordered clocks instead of assigning all evidence pre-debit times.
+Tests cover one second before, equal to, and after the event for both status
+types; late inbound and post-cutoff sources; and event-derived joined fields.
+
+This version is deliberately an internal consistency contract. Even a
+causally valid field digest can be manufactured by a caller: it is not
+authenticated Bank posting evidence, independent source provenance, proof
+that the credited funds were forwarded, or authorization to activate
+historical/shadow/inline readiness. Independent PO, Security/Architecture,
+Fraud Intelligence and QA exact-head assessment remains required.
