@@ -315,7 +315,7 @@ def test_mm01_not_wired_into_bank_runtime_or_readiness(path: str) -> None:
 
 
 @pytest.mark.parametrize("context_name,field_name", [
-    ("own_account_context", "counterparty_pseudonym"),
+    ("own_account_context", "own_account_relationship"),
     ("reversal_context", "reversal_status"),
 ])
 @pytest.mark.parametrize("source_state", ["missing", "unavailable"])
