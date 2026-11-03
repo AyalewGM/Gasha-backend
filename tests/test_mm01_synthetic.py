@@ -14,6 +14,8 @@ import pytest
 from gasha.poc.mm01_synthetic import (
     MM01Context,
     MM01Direction,
+    MM01FieldClaim,
+    mm01_field_value_digest,
     MM01RelationshipEvidence,
     MM01RelationshipKind,
     MM01Status,
@@ -68,6 +70,31 @@ def policy() -> MM01SyntheticPolicy:
     )
 
 
+def _bound_claims(
+    row: ScenarioObservation, values: MM01SyntheticMetrics,
+) -> MM01SyntheticMetrics:
+    """Fixture generation only; creating hashes does not prove Bank provenance."""
+    needed = set(SCENARIO_FIELDS[ScenarioId.MM_01].required)
+    if values.own_account_context is not MM01Context.UNKNOWN:
+        needed.add("own_account_relationship")
+    if values.reversal_context is not MM01Context.UNKNOWN:
+        needed.add("reversal_status")
+    return replace(values, field_claims=tuple(
+        MM01FieldClaim(
+            name=field.name, source_ref=field.source_ref,
+            source_version=field.source_version,
+            evidence_digest=field.evidence_digest,
+            value_digest=mm01_field_value_digest(field.name, values),
+            snapshot_digest=row.fingerprint(),
+            installation_ref=row.installation_ref, tenant_ref=row.tenant_ref,
+            dataset_digest=row.dataset_digest, mapping_version=row.mapping_version,
+            observed_at=field.observed_at, available_at=field.available_at,
+        )
+        for field in row.fields
+        if field.name in needed and field.state is FieldState.OBSERVED
+    ))
+
+
 def metrics(row: ScenarioObservation) -> MM01SyntheticMetrics:
     relation = next(
         (field for field in row.fields if field.name == "own_account_relationship"
@@ -84,7 +111,7 @@ def metrics(row: ScenarioObservation) -> MM01SyntheticMetrics:
             permitted_purpose="synthetic_mm01_own_account_exclusion",
         ) if relation is not None else None
     )
-    return MM01SyntheticMetrics(
+    return _bound_claims(row, MM01SyntheticMetrics(
         observation_digest=row.fingerprint(), policy_version="synthetic-v1",
         account_ref="synthetic-acct", inbound_account_ref="synthetic-acct",
         outbound_account_ref="synthetic-acct", inbound_event_ref="credit-event-1",
@@ -98,7 +125,7 @@ def metrics(row: ScenarioObservation) -> MM01SyntheticMetrics:
         outbound_available_at=AT,
         inbound_amount=Decimal(1000), outbound_amount=Decimal(800),
         currency="ETB", own_account_relationship=relationship,
-    )
+    ))
 
 
 def evaluate(
@@ -106,6 +133,14 @@ def evaluate(
     values: MM01SyntheticMetrics | None,
     thresholds: MM01SyntheticPolicy | None = None,
 ) -> dict[str, object]:
+    # Existing scenario variation tests construct a *new* synthetic claim packet
+    # when the metric values change. New security tests call the raw evaluator
+    # directly to prove that un-rebound assertions are rejected.
+    if values is not None and values.observation_digest == row.fingerprint():
+        try:
+            values = _bound_claims(row, values)
+        except AttributeError:
+            pass  # The actual evaluator must fail closed on deleted dataclass fields.
     return evaluate_mm01_synthetic(
         row, policy=policy() if thresholds is None else thresholds, metrics=values,
         expected_installation="synthetic-install",
@@ -472,3 +507,89 @@ def test_claimed_relationship_rejects_unavailable_or_late_evidence() -> None:
                    ))
     with pytest.raises(ScenarioContractError):
         evaluate(row, values=late)
+
+
+def raw_evaluate(
+    row: ScenarioObservation, vals: MM01SyntheticMetrics,
+) -> dict[str, object]:
+    return evaluate_mm01_synthetic(
+        row, policy=policy(), metrics=vals,
+        expected_installation="synthetic-install",
+        expected_tenant="synthetic-tenant", expected_dataset_digest=DATASET,
+    ).to_dict()
+
+
+@pytest.mark.parametrize("name,value", [
+    ("inbound_amount", Decimal(99)),
+    ("outbound_amount", Decimal(1)),
+    ("inbound_event_ref", "other-credit-event"),
+    ("inbound_status", MM01TransferStatus.FAILED),
+    ("outbound_status", MM01TransferStatus.REVERSED),
+    ("account_ref", "different-account"),
+    ("currency", "USD"),
+])
+def test_stale_field_claims_reject_changed_values_before_any_negative_result(
+    name: str, value: object,
+) -> None:
+    row = packet(include_context=True)
+    vals = replace(metrics(row), **{name: value})
+    with pytest.raises(ScenarioContractError, match="semantic field source/value"):
+        raw_evaluate(row, vals)
+
+
+@pytest.mark.parametrize("change", [
+    {"source_ref": "spliced-ledger"},
+    {"source_version": "stale-version"},
+    {"evidence_digest": "sha256:" + "f" * 64},
+    {"value_digest": "sha256:" + "e" * 64},
+    {"snapshot_digest": "sha256:" + "c" * 64},
+    {"tenant_ref": "other-tenant"},
+    {"installation_ref": "other-install"},
+    {"dataset_digest": "sha256:" + "d" * 64},
+    {"mapping_version": "other-version"},
+    {"available_at": AT + timedelta(seconds=1)},
+])
+def test_per_field_source_and_snapshot_substitution_fails_closed(
+    change: dict[str, object],
+) -> None:
+    row = packet()
+    vals = metrics(row)
+    first = replace(vals.field_claims[0], **change)
+    bad = replace(vals, field_claims=(first, *vals.field_claims[1:]))
+    with pytest.raises(ScenarioContractError):
+        raw_evaluate(row, bad)
+
+
+def test_missing_duplicate_and_extra_field_claims_rejected() -> None:
+    row = packet()
+    vals = metrics(row)
+    for claims in (
+        (),
+        vals.field_claims[:-1],
+        vals.field_claims + (vals.field_claims[0],),
+    ):
+        with pytest.raises(ScenarioContractError, match="semantic field claim"):
+            raw_evaluate(row, replace(vals, field_claims=claims))
+
+
+def test_semantic_binding_cannot_be_spliced_across_source_versions() -> None:
+    row = packet()
+    changed = replace(row, fields=tuple(
+        replace(field, source_version="other")
+        if field.name == "inbound_credit_status" else field
+        for field in row.fields
+    ))
+    vals = metrics(changed)
+    with pytest.raises(ScenarioContractError, match="semantic sources spliced"):
+        raw_evaluate(changed, vals)
+
+
+def test_reported_reversal_context_binds_optional_semantic_field() -> None:
+    row = packet(include_context=True)
+    vals = _bound_claims(row, replace(
+        metrics(row), reversal_context=MM01Context.REPORTED,
+    ))
+    assert raw_evaluate(row, vals)["status"] == MM01Status.CONTEXT_EXCLUSION.value
+    bad = replace(vals, reversal_context=MM01Context.REPORTED_ABSENT)
+    with pytest.raises(ScenarioContractError, match="semantic field source/value"):
+        raw_evaluate(row, bad)
