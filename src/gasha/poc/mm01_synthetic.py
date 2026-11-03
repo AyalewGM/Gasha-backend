@@ -20,6 +20,7 @@ from gasha.poc.scenario_observations import (
     ScenarioContractError,
     ScenarioId,
     ScenarioObservation,
+    SCENARIO_FIELDS,
     inspect_scenario_coverage,
 )
 
@@ -113,7 +114,10 @@ def _ratio(value: object) -> Decimal:
     return value
 
 
-def _present(obj: MM01SyntheticPolicy | MM01SyntheticMetrics) -> None:
+def _present(
+    obj: MM01SyntheticPolicy | MM01SyntheticMetrics
+    | MM01RelationshipEvidence | MM01FieldClaim,
+) -> None:
     """Convert deleted required frozen-slot members to a redacted rejection."""
     for item in fields(obj):
         try:
@@ -179,6 +183,84 @@ class MM01RelationshipEvidence:
             raise ScenarioContractError("relationship observed after availability")
 
 
+# Synthetic semantic value groupings, NOT a ledger adapter or Bank provenance.
+_MM01_SEMANTIC_FIELDS: dict[str, tuple[str, ...]] = {
+    "account_pseudonym": (
+        "account_ref", "inbound_account_ref", "outbound_account_ref",
+    ),
+    "inbound_credit_reference": (
+        "inbound_event_ref", "inbound_occurred_at", "inbound_available_at",
+    ),
+    "inbound_credit_status": ("inbound_status",),
+    "outbound_debit_reference": (
+        "outbound_event_ref", "outbound_occurred_at", "outbound_available_at",
+    ),
+    "outbound_debit_status": ("outbound_status",),
+    "flow_direction": ("inbound_direction", "outbound_direction"),
+    "transfer_amount": ("inbound_amount", "outbound_amount"),
+    "transfer_currency": ("currency",),
+    "flow_window": ("inbound_occurred_at", "outbound_occurred_at"),
+    "reversal_status": ("reversal_context",),
+    "own_account_relationship": ("own_account_context",),
+}
+
+
+def mm01_field_value_digest(name: str, metrics: MM01SyntheticMetrics) -> str:
+    """Digest a declared semantic value tuple; no source trust is implied."""
+    names = _MM01_SEMANTIC_FIELDS.get(name)
+    if names is None:
+        raise ScenarioContractError("unknown MM-01 semantic field")
+    payload: dict[str, str] = {}
+    for key in names:
+        value = getattr(metrics, key)
+        if isinstance(value, datetime):
+            payload[key] = value.astimezone(UTC).isoformat()
+        elif isinstance(value, StrEnum):
+            payload[key] = value.value
+        else:
+            payload[key] = str(value)
+    if name == "own_account_relationship" and metrics.own_account_relationship is not None:
+        payload["relationship_kind"] = metrics.own_account_relationship.kind.value
+        payload["permitted_purpose"] = metrics.own_account_relationship.permitted_purpose
+    wire = dumps(
+        {"domain": "mm01-synthetic-field-values-v1", "name": name, "payload": payload},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
+    return "sha256:" + sha256(wire.encode("ascii")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class MM01FieldClaim:
+    """Per-field semantic binding to a caller-asserted observation snapshot."""
+
+    name: str
+    source_ref: str
+    source_version: str
+    evidence_digest: str
+    value_digest: str
+    snapshot_digest: str
+    installation_ref: str
+    tenant_ref: str
+    dataset_digest: str
+    mapping_version: str
+    observed_at: datetime
+    available_at: datetime
+
+    def __post_init__(self) -> None:
+        for name in ("name", "source_ref", "source_version", "installation_ref",
+                     "tenant_ref", "mapping_version"):
+            _token(name, getattr(self, name))
+        for name in ("evidence_digest", "value_digest", "snapshot_digest",
+                     "dataset_digest"):
+            value = getattr(self, name)
+            if type(value) is not str or _DIGEST.fullmatch(value) is None:
+                raise ScenarioContractError("invalid semantic binding digest")
+        for name in ("observed_at", "available_at"):
+            object.__setattr__(self, name, _instant(name, getattr(self, name)))
+        if self.observed_at > self.available_at:
+            raise ScenarioContractError("semantic evidence observed after availability")
+
+
 @dataclass(frozen=True, slots=True)
 class MM01SyntheticMetrics:
     """Caller-asserted flow pair; coincidence is not proof of funds tracing."""
@@ -204,6 +286,7 @@ class MM01SyntheticMetrics:
     own_account_context: MM01Context = MM01Context.UNKNOWN
     reversal_context: MM01Context = MM01Context.UNKNOWN
     own_account_relationship: MM01RelationshipEvidence | None = None
+    field_claims: tuple[MM01FieldClaim, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.observation_digest) is not str or _DIGEST.fullmatch(
@@ -232,6 +315,11 @@ class MM01SyntheticMetrics:
             and type(self.own_account_relationship) is not MM01RelationshipEvidence
         ):
             raise ScenarioContractError("strict synthetic relationship evidence required")
+        if (
+            type(self.field_claims) is not tuple
+            or any(type(claim) is not MM01FieldClaim for claim in self.field_claims)
+        ):
+            raise ScenarioContractError("strict immutable semantic field claims required")
         _amount("inbound amount", self.inbound_amount)
         _amount("outbound amount", self.outbound_amount)
         for name in (
@@ -300,6 +388,55 @@ def _input_digest(policy: MM01SyntheticPolicy, metrics: MM01SyntheticMetrics) ->
     return "sha256:" + sha256(wire.encode("ascii")).hexdigest()
 
 
+def _validate_field_claims(
+    observation: ScenarioObservation, metrics: MM01SyntheticMetrics,
+    snapshot_digest: str,
+) -> None:
+    """Reject unbound or source-spliced synthetic semantics before any outcome."""
+    needed = set(SCENARIO_FIELDS[ScenarioId.MM_01].required)
+    if metrics.own_account_context is not MM01Context.UNKNOWN:
+        needed.add("own_account_relationship")
+    if metrics.reversal_context is not MM01Context.UNKNOWN:
+        needed.add("reversal_status")
+    claims = metrics.field_claims
+    if len(claims) != len(needed) or {claim.name for claim in claims} != needed:
+        raise ScenarioContractError("missing, duplicate or extra semantic field claim")
+    evidence = {
+        field.name: field for field in observation.fields
+        if field.state is FieldState.OBSERVED
+    }
+    by_name = {claim.name: claim for claim in claims}
+    for claim in claims:
+        source = evidence.get(claim.name)
+        if source is None:
+            raise ScenarioContractError("semantic field source unavailable")
+        if (
+            claim.source_ref != source.source_ref
+            or claim.source_version != source.source_version
+            or claim.evidence_digest != source.evidence_digest
+            or claim.observed_at != source.observed_at
+            or claim.available_at != source.available_at
+            or claim.snapshot_digest != snapshot_digest
+            or claim.installation_ref != observation.installation_ref
+            or claim.tenant_ref != observation.tenant_ref
+            or claim.dataset_digest != observation.dataset_digest
+            or claim.mapping_version != observation.mapping_version
+            or claim.value_digest != mm01_field_value_digest(claim.name, metrics)
+            or claim.available_at > observation.decision_cutoff
+        ):
+            raise ScenarioContractError("semantic field source/value/snapshot mismatch")
+    for left, right in (
+        ("inbound_credit_reference", "inbound_credit_status"),
+        ("outbound_debit_reference", "outbound_debit_status"),
+    ):
+        a, b = by_name[left], by_name[right]
+        if a.source_ref != b.source_ref or a.source_version != b.source_version:
+            raise ScenarioContractError("event and status semantic sources spliced")
+    for name in ("inbound_credit_reference", "inbound_credit_status"):
+        if by_name[name].available_at > metrics.outbound_occurred_at:
+            raise ScenarioContractError("inbound evidence unavailable at debit")
+
+
 def evaluate_mm01_synthetic(
     observation: ScenarioObservation, *,
     policy: MM01SyntheticPolicy | None,
@@ -329,10 +466,19 @@ def evaluate_mm01_synthetic(
         if metrics.own_account_relationship is not None:
             if type(metrics.own_account_relationship) is not MM01RelationshipEvidence:
                 raise ScenarioContractError("strict synthetic relationship evidence required")
+            _present(metrics.own_account_relationship)
             metrics = replace(
                 metrics, own_account_relationship=replace(metrics.own_account_relationship)
             )
-        metrics = replace(metrics)
+        if type(metrics.field_claims) is not tuple:
+            raise ScenarioContractError("strict immutable semantic field claims required")
+        for claim in metrics.field_claims:
+            if type(claim) is not MM01FieldClaim:
+                raise ScenarioContractError("strict typed semantic claim required")
+            _present(claim)
+        metrics = replace(metrics, field_claims=tuple(
+            replace(claim) for claim in metrics.field_claims
+        ))
     digest = _input_digest(policy, metrics) if policy is not None and metrics is not None else None
 
     def result(
@@ -419,6 +565,7 @@ def evaluate_mm01_synthetic(
                 and relation.kind is not MM01RelationshipKind.DISTINCT_OWNERS)
         ):
             raise ScenarioContractError("relationship classification mismatch")
+    _validate_field_claims(observation, metrics, coverage.observation_digest)
     if (
         metrics.inbound_account_ref != metrics.account_ref
         or metrics.outbound_account_ref != metrics.account_ref
