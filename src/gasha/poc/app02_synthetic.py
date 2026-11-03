@@ -321,18 +321,31 @@ def evaluate_app02_synthetic(
         ):
             return result(APP02Status.BLOCKED_FIELDS,
                           f"required_evidence_after_metrics_snapshot:{name}")
-    change_evidence = available["authorized_change_event"]
-    change_clock = available["change_occurred_at"]
+    # Reject stitched-together change and payment facts from unrelated sources.
+    # A digest matching the overall observation does not authenticate an
+    # individual field's source, so enforce claimed group-level lineage here.
+    change_fields = (
+        "authorized_change_event", "change_kind", "change_source",
+        "change_occurred_at",
+    )
+    for name in change_fields:
+        evidence = available[name]
+        if (
+            evidence.observed_at != metrics.change_at
+            or evidence.source_ref != metrics.change_source_ref
+            or evidence.source_version != metrics.change_source_version
+        ):
+            raise ScenarioContractError("change or payment source/time evidence mismatch")
     payment_evidence = available["payment_event"]
-    if (
-        change_evidence.observed_at != metrics.change_at
-        or change_clock.observed_at != metrics.change_at
-        or change_evidence.source_ref != metrics.change_source_ref
-        or change_evidence.source_version != metrics.change_source_version
-        or change_clock.source_ref != metrics.change_source_ref
-        or change_clock.source_version != metrics.change_source_version
-        or payment_evidence.observed_at != metrics.payment_at
-    ):
+    for name in ("payment_status", "payment_amount", "payment_currency"):
+        evidence = available[name]
+        if (
+            evidence.observed_at != metrics.payment_at
+            or evidence.source_ref != payment_evidence.source_ref
+            or evidence.source_version != payment_evidence.source_version
+        ):
+            raise ScenarioContractError("change or payment source/time evidence mismatch")
+    if payment_evidence.observed_at != metrics.payment_at:
         raise ScenarioContractError("change or payment source/time evidence mismatch")
     if metrics.maintenance_context is not APP02MaintenanceContext.UNKNOWN:
         maintenance = available.get("approved_maintenance_reset")
