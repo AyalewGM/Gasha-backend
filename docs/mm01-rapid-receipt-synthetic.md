@@ -104,6 +104,33 @@ All assertions remain synthetic and caller-originated. In particular, a
 claimed purpose token does not constitute a Bank-granted permission, and even
 an internally consistent claim does not independently verify beneficial
 ownership. Missing relationships stay UNKNOWN; no safe inference from missing
-data. **PO/Security correction #4 remains open:** bind source- and value-level
-credit/debit/account/exception field groups to the same snapshot before
-independent acceptance of this PR.
+data. **PO/Security correction #4 now has a bounded synthetic implementation**:
+required account, inbound, outbound, amount, currency and window fields plus
+claimed exceptions must carry typed per-field source/version/evidence digests,
+canonical semantic-value digest, availability, dataset/tenant/installation,
+mapping version and exact snapshot identity. Inbound reference and status,
+and outbound reference and status must retain one source/version per pair.
+Missing, duplicated, late, substituted or inconsistent claims reject before
+any result classification. This is a claim-consistency guard only, not an
+authenticated ledger value, Bank attestation, signed source record, trusted
+source approval or proof of funds movement. Independent exact-head review and
+Bank evidence authority remain mandatory.
+
+## Synthetic field-claim value and source bindings
+
+Each required MM-01 field is bound to a snapshot-scoped `MM01FieldClaim`
+claim with observed/available timestamps, dataset/tenant/mapping scope,
+evidence source/version/digest and a canonical domain-tagged digest over the
+corresponding semantic metric attributes. Claimed reversal or own-account
+exceptions must also include the appropriate optional field binding.
+At every evaluation, the code revalidates the frozen objects and compares
+claims against the current observation fields and effective metric values.
+Unbound, duplicated, cross-source/status, changed-value and cross-snapshot
+packets reject *before* linkage/status/threshold outcomes.
+
+The field-claim value digest is constructed from **untrusted synthetic claims**,
+not independently extracted or verified ledger values. Both source claims and
+their digests may originate with the same caller. This addresses internal
+consistency and stale/substituted claims; a separately authenticated Bank
+adapter, authorized source registry and immutable evidence provenance are
+still required before replay or Bank acceptance. No operational wiring.
