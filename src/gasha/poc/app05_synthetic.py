@@ -55,7 +55,7 @@ class APP05Status(StrEnum):
     AMOUNTS_NOT_ESCALATING = "amounts_not_escalating"
     RETRY_CONTEXT_REVIEW = "technical_retry_context_review_required"
     TECHNICAL_RETRY_REPORTED = "technical_retry_reported"
-    SYNTHETIC_HYPOTHESIS = "synthetic_rapid_escalating_attempts_hypothesis"
+    SYNTHETIC_HYPOTHESIS = "synthetic_repeated_or_escalating_attempts_hypothesis"
 
 
 def _token(name: str, value: object) -> str:

@@ -102,6 +102,7 @@ def test_positive_exact_boundary_requires_observed_absent_retry_context() -> Non
     value = replace(sequence(row), technical_retry=APP05RetryContext.REPORTED_ABSENT)
     result = evaluate(row, value)
     assert result["status"] == APP05Status.SYNTHETIC_HYPOTHESIS.value
+    assert result["status"] == "synthetic_repeated_or_escalating_attempts_hypothesis"
     assert result["reasons"] == ["rapid_escalating_attempts", "rapid_repeated_attempts"]
     assert result["heuristic_evaluated"] is True
     assert result == evaluate(row, value)
@@ -168,6 +169,7 @@ def test_equal_falling_substep_or_submultiple_amounts_match_repeated_only(
     ))
     outcome = evaluate(row, seq)
     assert outcome["status"] == APP05Status.SYNTHETIC_HYPOTHESIS.value
+    assert outcome["status"] == "synthetic_repeated_or_escalating_attempts_hypothesis"
     assert outcome["reasons"] == ["rapid_repeated_attempts"]
 
 
@@ -463,6 +465,7 @@ def test_pattern_determinism_100_repeated_fixtures(
     first = evaluate(row, candidate)
     assert first["reasons"] == expected_reasons
     assert first["status"] == APP05Status.SYNTHETIC_HYPOTHESIS.value
+    assert first["status"] == "synthetic_repeated_or_escalating_attempts_hypothesis"
     for _ in range(100):
         assert evaluate(row, candidate) == first
 
