@@ -16,11 +16,11 @@ from hashlib import sha256
 from json import dumps
 
 from gasha.poc.scenario_observations import (
+    SCENARIO_FIELDS,
     FieldState,
     ScenarioContractError,
     ScenarioId,
     ScenarioObservation,
-    SCENARIO_FIELDS,
     inspect_scenario_coverage,
 )
 
