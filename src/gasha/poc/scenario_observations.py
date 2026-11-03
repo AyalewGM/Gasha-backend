@@ -70,7 +70,7 @@ SCENARIO_FIELDS: Mapping[ScenarioId, ScenarioFields] = MappingProxyType({
         "account_pseudonym", "inbound_credit_reference", "inbound_credit_status",
         "outbound_debit_reference", "outbound_debit_status", "flow_direction",
         "transfer_amount", "transfer_currency", "flow_window",
-    ), ("counterparty_pseudonym", "reversal_status")),
+    ), ("counterparty_pseudonym", "reversal_status", "own_account_relationship")),
     ScenarioId.MM_02: ScenarioFields("UC-02", (
         "sender_pseudonym", "beneficiary_pseudonym", "transfer_status",
         "observation_window", "window_completeness", "deduplicated_event_set",
