@@ -213,6 +213,7 @@ class ScenarioObservation:
 
     def fingerprint(self) -> str:
         """Stable source-value-shape identity; not Bank provenance or approval."""
+        checked = _revalidated_observation(self)
         fields = [{
             "name": field.name, "state": field.state.value,
             "source_ref": field.source_ref, "source_version": field.source_version,
@@ -220,21 +221,41 @@ class ScenarioObservation:
             "observed_at": field.observed_at.isoformat() if field.observed_at else None,
             "available_at": field.available_at.isoformat() if field.available_at else None,
             "unavailable_reason": field.unavailable_reason,
-        } for field in sorted(self.fields, key=lambda item: item.name)]
+        } for field in sorted(checked.fields, key=lambda item: item.name)]
         payload = {
             "domain": SCENARIO_MAPPING_VERSION,
-            "scenario_id": self.scenario_id.value, "installation_ref": self.installation_ref,
-            "tenant_ref": self.tenant_ref, "dataset_digest": self.dataset_digest,
-            "event_id": str(self.event_id), "source_system": self.source_system,
-            "source_schema_version": self.source_schema_version,
-            "mapping_version": self.mapping_version,
-            "configuration_version": self.configuration_version,
-            "occurred_at": self.occurred_at.isoformat(),
-            "received_at": self.received_at.isoformat(),
-            "decision_cutoff": self.decision_cutoff.isoformat(), "fields": fields,
+            "scenario_id": checked.scenario_id.value, "installation_ref": checked.installation_ref,
+            "tenant_ref": checked.tenant_ref, "dataset_digest": checked.dataset_digest,
+            "event_id": str(checked.event_id), "source_system": checked.source_system,
+            "source_schema_version": checked.source_schema_version,
+            "mapping_version": checked.mapping_version,
+            "configuration_version": checked.configuration_version,
+            "occurred_at": checked.occurred_at.isoformat(),
+            "received_at": checked.received_at.isoformat(),
+            "decision_cutoff": checked.decision_cutoff.isoformat(), "fields": fields,
         }
         canonical = dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return "sha256:" + sha256(canonical.encode("ascii")).hexdigest()
+
+
+def _revalidated_observation(observation: ScenarioObservation) -> ScenarioObservation:
+    """Snapshot and recheck a caller-held synthetic evidence packet on consumption.
+
+    Frozen slotted dataclasses can still be mutated with object.__setattr__,
+    object.__delattr__, or unchecked deserialization. No direct fingerprint
+    should certify malformed or post-cutoff field claims even by shape.
+    """
+    if type(observation) is not ScenarioObservation:
+        raise ScenarioContractError("typed scenario observation required")
+    try:
+        evidence = observation.fields
+        if type(evidence) is not tuple:
+            raise ScenarioContractError("fields must be an immutable tuple")
+        if any(type(field) is not FieldEvidence for field in evidence):
+            raise ScenarioContractError("untyped field evidence")
+        return replace(observation, fields=tuple(replace(field) for field in evidence))
+    except AttributeError:
+        raise ScenarioContractError("missing required scenario evidence attribute") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,18 +290,8 @@ def inspect_scenario_coverage(
     expected_tenant: str, expected_dataset_digest: str,
 ) -> ScenarioCoverage:
     """Coverage only: required absence BLOCKS; cannot promote #54 readiness."""
-    if type(observation) is not ScenarioObservation:
-        raise ScenarioContractError("typed scenario observation required")
-    # Frozen dataclasses can still be forged by object.__setattr__ or a
-    # deserializer. Re-run all field and packet invariants at the use boundary:
-    # unchecked timestamps or mutated evidence must not turn into coverage.
-    if type(observation.fields) is not tuple:
-        raise ScenarioContractError("fields must be an immutable tuple")
-    if any(type(field) is not FieldEvidence for field in observation.fields):
-        raise ScenarioContractError("untyped field evidence")
-    observation = replace(
-        observation, fields=tuple(replace(field) for field in observation.fields)
-    )
+    # Use the same revalidation for direct digests and coverage consumption.
+    observation = _revalidated_observation(observation)
     _token("expected_installation", expected_installation)
     _token("expected_tenant", expected_tenant)
     _digest("expected_dataset_digest", expected_dataset_digest)
