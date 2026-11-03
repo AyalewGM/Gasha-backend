@@ -10,12 +10,22 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from gasha.poc.mm02_synthetic import (
-    MM02Context, MM02Institution, MM02Status, MM02SyntheticMetrics,
-    MM02SyntheticPolicy, MM02Transfer, MM02TransferStatus, evaluate_mm02_synthetic,
+    MM02Context,
+    MM02Institution,
+    MM02Status,
+    MM02SyntheticMetrics,
+    MM02SyntheticPolicy,
+    MM02Transfer,
+    MM02TransferStatus,
+    evaluate_mm02_synthetic,
 )
 from gasha.poc.scenario_observations import (
-    SCENARIO_FIELDS, FieldEvidence, FieldState, ScenarioContractError,
-    ScenarioId, ScenarioObservation,
+    SCENARIO_FIELDS,
+    FieldEvidence,
+    FieldState,
+    ScenarioContractError,
+    ScenarioId,
+    ScenarioObservation,
 )
 
 AT = datetime(2026, 11, 3, 12, tzinfo=UTC)
