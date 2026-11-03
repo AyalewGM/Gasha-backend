@@ -240,9 +240,9 @@ def test_exported_report_mutation_cannot_rewrite_frozen_evidence() -> None:
     assert retained.blocked_required_events == 1
     assert retained.required_coverage.value == 0.5
     with pytest.raises(FrozenInstanceError):
-        setattr(retained, "complete_required_events", 999)
+        retained.complete_required_events = 999
     with pytest.raises(FrozenInstanceError):
-        setattr(retained.required_coverage, "value", 100.0)
+        retained.required_coverage.value = 100.0
     with pytest.raises(TypeError):
         retained.missing_required_counts[0] = (missing_name, 999)
     with pytest.raises(TypeError):
