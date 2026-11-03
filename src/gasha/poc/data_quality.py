@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -150,6 +150,20 @@ def _inspect(scope: DataQualityScope, observation: QualityObservation) -> _Resul
     payload = event.payload
     codes: set[str] = set()
     warnings: set[str] = set()
+    # Frozen records can be modified with object.__setattr__ after validation.
+    # Malformed labels/alerts must not contaminate claimed KPI populations.
+    if (
+        observation.confirmed_fraud is not None
+        and type(observation.confirmed_fraud) is not bool
+    ):
+        codes.add("invalid.confirmed_fraud")
+    if observation.alerted is not None and type(observation.alerted) is not bool:
+        codes.add("invalid.alerted")
+    confirmed_at = observation.confirmed_at
+    if confirmed_at is not None and (
+        not isinstance(confirmed_at, datetime) or confirmed_at.utcoffset() is None
+    ):
+        codes.add("invalid.confirmed_at")
     # Normal construction validates a mapping, but Pydantic model_copy(update=...)
     # can bypass that contract in a synthetic adapter. Quarantine the whole
     # invalid body instead of raising during required-field or signal checks.
@@ -232,9 +246,10 @@ def _inspect(scope: DataQualityScope, observation: QualityObservation) -> _Resul
             if name in signals:
                 warnings.add(f"invalid_optional.{name}")
     if (
-        observation.confirmed_at is not None
+        confirmed_at is not None
+        and "invalid.confirmed_at" not in codes
         and occurred is not None
-        and _utc(observation.confirmed_at) < occurred
+        and _utc(confirmed_at) < occurred
     ):
         codes.add("invalid.label_order")
     return _Result(tuple(sorted(codes)), tuple(sorted(warnings)), event_id, occurred,
@@ -292,6 +307,9 @@ def inspect_reference_quality(
     """
     if type(scope) is not DataQualityScope:
         raise ValueError("expected validated DataQualityScope")
+    # Revalidate and retain a snapshot so forged/changed caller scope fields
+    # cannot silently affect the report after the constructor has run.
+    scope = replace(scope)
     counters: dict[UseCase, Counter[str]] = {uc: Counter() for uc in UseCase}
     failures: dict[UseCase, Counter[str]] = {uc: Counter() for uc in UseCase}
     coverage: dict[UseCase, Counter[str]] = {uc: Counter() for uc in UseCase}
@@ -299,6 +317,11 @@ def inspect_reference_quality(
     for observation in observations:
         if type(observation) is not QualityObservation:
             raise ValueError("expected validated QualityObservation")
+        if (
+            type(observation.use_case) is not UseCase
+            or not isinstance(observation.event, InboundBankEvent)
+        ):
+            raise ValueError("invalid quality observation type")
         uc = observation.use_case
         stats = counters[uc]
         stats["total"] += 1

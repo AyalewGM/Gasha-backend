@@ -634,3 +634,70 @@ def test_absent_optional_telemetry_has_no_false_malformed_warning() -> None:
         for coverage in row["optional_signals"].values()
     )
 
+
+@pytest.mark.parametrize(("field", "corrupt", "check"), [
+    ("confirmed_fraud", "true", "invalid.confirmed_fraud"),
+    ("confirmed_fraud", 1, "invalid.confirmed_fraud"),
+    ("confirmed_fraud", [], "invalid.confirmed_fraud"),
+    ("alerted", "false", "invalid.alerted"),
+    ("alerted", 1, "invalid.alerted"),
+    ("alerted", {}, "invalid.alerted"),
+    ("confirmed_at", "2026-01-01T12:00:00Z", "invalid.confirmed_at"),
+    ("confirmed_at", datetime(2026, 1, 1, 12), "invalid.confirmed_at"),
+    ("confirmed_at", False, "invalid.confirmed_at"),
+])
+def test_post_construction_quality_assertion_tamper_quarantined(
+    field: str, corrupt: object, check: str,
+) -> None:
+    """Forged label and alert data must not contaminate valid KPI populations."""
+    good = candidate(
+        "tampered-quality-label", label=True,
+        confirmed_at=AT + timedelta(days=1), alerted=True,
+        payload_changes={"intelligence": {"beneficiary_risk": 0.0}},
+    )
+    bad = replace(good)
+    object.__setattr__(bad, field, corrupt)
+    for rows in ((bad, good), (good, bad)):
+        row = result_for(*rows)
+        assert (row["total"], row["accepted"], row["rejected"]) == (2, 1, 1)
+        assert row["checks"] == {check: 1}
+        assert "duplicate.event_id" not in row["checks"]
+        assert row["labels"] == {"positive": 1, "negative": 0, "unlabelled": 0}
+        assert row["alerts"] == {"alerted": 1, "not_alerted": 0, "unknown": 0}
+        assert row["optional_signals"]["beneficiary_risk"]["available"]["count"] == 1
+
+
+@pytest.mark.parametrize(("field", "corrupt"), [
+    ("tenant_id", "raw@example.com"),
+    ("dataset_digest", "A" * 64),
+    ("window_start", AT + timedelta(days=7)),
+    ("label_cutoff", "invalid-date"),
+])
+def test_tampered_quality_scope_rejected_before_report(
+    field: str, corrupt: object,
+) -> None:
+    forged = scope()
+    object.__setattr__(forged, field, corrupt)
+    with pytest.raises(ValueError):
+        inspect_reference_quality(forged, (candidate(),))
+
+
+def test_quality_report_retains_validated_scope_snapshot() -> None:
+    original = scope()
+    report = inspect_reference_quality(original, (candidate(),))
+    object.__setattr__(original, "tenant_id", "raw@example.com")
+    assert report.to_dict()["scope"]["tenant_id"] == "synthetic-tenant"
+    assert report.to_dict()["use_cases"][0]["accepted"] == 1
+
+
+@pytest.mark.parametrize(("field", "corrupt"), [
+    ("use_case", "UC-01"),
+    ("event", "not-an-InboundBankEvent"),
+])
+def test_corrupted_quality_observation_type_rejected(
+    field: str, corrupt: object,
+) -> None:
+    forged = candidate()
+    object.__setattr__(forged, field, corrupt)
+    with pytest.raises(ValueError):
+        inspect_reference_quality(scope(), (forged,))
