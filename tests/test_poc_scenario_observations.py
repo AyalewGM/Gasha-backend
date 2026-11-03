@@ -286,3 +286,66 @@ def test_chronology_naive_timestamp_and_wrong_dataset_shapes_rejected() -> None:
 )
 def test_contract_not_wired_to_protected_or_authoritative_paths(path: str) -> None:
     assert "scenario_observations" not in Path(path).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "attribute,bad",
+    [
+        ("available_at", AT + timedelta(seconds=1)),
+        ("observed_at", AT + timedelta(seconds=1)),
+        ("evidence_digest", "forged"),
+        ("source_version", "untrusted source"),
+        ("state", "observed"),
+    ],
+)
+def test_direct_fingerprint_rejects_mutated_field_evidence(
+    attribute: str, bad: object,
+) -> None:
+    row = observation(ScenarioId.MM_02)
+    object.__setattr__(row.fields[0], attribute, bad)
+    with pytest.raises(ScenarioContractError):
+        row.fingerprint()
+
+
+@pytest.mark.parametrize(
+    "attribute,bad",
+    [
+        ("decision_cutoff", AT - timedelta(seconds=1)),
+        ("mapping_version", "bad version"),
+        ("tenant_ref", "other tenant"),
+    ],
+)
+def test_direct_fingerprint_revalidates_mutated_packet(
+    attribute: str, bad: object,
+) -> None:
+    row = observation(ScenarioId.ATO_02)
+    object.__setattr__(row, attribute, bad)
+    if attribute == "tenant_ref":
+        # A changed but well-formed tenant reference is a *different* digest;
+        # scope authentication belongs to coverage's expected_tenant check.
+        assert row.fingerprint() != observation(ScenarioId.ATO_02).fingerprint()
+    else:
+        with pytest.raises(ScenarioContractError):
+            row.fingerprint()
+
+
+def test_direct_fingerprint_rejects_mutated_field_container() -> None:
+    row = observation(ScenarioId.APP_05)
+    object.__setattr__(row, "fields", list(row.fields))
+    with pytest.raises(ScenarioContractError, match="immutable"):
+        row.fingerprint()
+
+
+@pytest.mark.parametrize("target,attribute", [
+    ("packet", "tenant_ref"), ("packet", "fields"),
+    ("field", "observed_at"), ("field", "evidence_digest"),
+])
+def test_missing_slotted_attributes_fail_closed_at_digest_and_coverage(
+    target: str, attribute: str,
+) -> None:
+    row = observation(ScenarioId.MM_02)
+    object.__delattr__(row if target == "packet" else row.fields[0], attribute)
+    with pytest.raises(ScenarioContractError, match="missing required"):
+        row.fingerprint()
+    with pytest.raises(ScenarioContractError, match="missing required"):
+        inspect(row)
