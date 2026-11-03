@@ -56,8 +56,10 @@ def packet(
                 name=name, state=FieldState.OBSERVED,
                 source_ref="change-system" if name in CHANGE_FIELDS else "payment-system",
                 source_version="1", evidence_digest="sha256:" + "b" * 64,
-                observed_at=change_at if name in CHANGE_FIELDS else payment_at,
-                available_at=change_at if name in CHANGE_FIELDS else payment_at,
+                observed_at=(change_at if name in CHANGE_FIELDS or name == "payment_baseline"
+                             else payment_at),
+                available_at=(change_at if name in CHANGE_FIELDS or name == "payment_baseline"
+                              else payment_at),
             ) for name in names
         ),
     )
@@ -65,16 +67,17 @@ def packet(
 
 def policy() -> APP02SyntheticPolicy:
     return APP02SyntheticPolicy(
-        version="proposed-1", configuration_version="1",
+        version="proposed-2", configuration_version="1",
         max_change_to_payment_seconds=300, min_baseline_days=30,
-        min_baseline_samples=10, min_payment_amount=Decimal(50),
+        min_baseline_samples=10, max_baseline_gap_seconds=60,
+        min_payment_amount=Decimal(50),
         min_baseline_multiple=Decimal(3), payment_currency="ETB",
     )
 
 
 def metrics(row: ScenarioObservation) -> APP02SyntheticMetrics:
     return APP02SyntheticMetrics(
-        observation_digest=row.fingerprint(), policy_version="proposed-1",
+        observation_digest=row.fingerprint(), policy_version="proposed-2",
         payment_event_id=EVENT, change_ref="change-pseudonym",
         change_kind=APP02ChangeKind.DEVICE, change_at=CHANGE,
         change_source_ref="change-system", change_source_version="1",
@@ -82,7 +85,11 @@ def metrics(row: ScenarioObservation) -> APP02SyntheticMetrics:
         payment_amount=Decimal(100), payment_currency="ETB",
         baseline_typical_amount=Decimal(10), baseline_currency="ETB",
         baseline_samples=20, baseline_start=CHANGE - timedelta(days=31),
-        baseline_end=CHANGE, baseline_complete=True, available_at=AT,
+        baseline_end=CHANGE, baseline_complete=True,
+        baseline_source_ref="payment-system", baseline_source_version="1",
+        baseline_evidence_digest="sha256:" + "b" * 64,
+        baseline_observed_at=CHANGE, baseline_available_at=CHANGE,
+        available_at=AT,
     )
 
 
@@ -156,6 +163,8 @@ def test_negative_and_blocked_cases(
         candidate = replace(
             candidate, baseline_end=candidate.change_at,
             baseline_start=candidate.change_at - timedelta(days=31),
+            baseline_observed_at=candidate.change_at,
+            baseline_available_at=candidate.change_at,
         )
     result = evaluate(row, candidate)
     assert result["status"] == expected.value
@@ -252,7 +261,10 @@ def test_unrelated_source_cannot_supply_one_field_of_a_correlated_event(
 def test_payment_before_change_is_blocked_not_labelled_as_fraud() -> None:
     after_payment = AT + timedelta(seconds=1)
     row = packet(change_at=after_payment)
-    candidate = replace(metrics(row), change_at=after_payment)
+    candidate = replace(
+        metrics(row), change_at=after_payment,
+        baseline_observed_at=after_payment, baseline_available_at=after_payment,
+    )
     result = evaluate(row, candidate)
     assert result["status"] == APP02Status.BLOCKED_FIELDS.value
     assert result["heuristic_evaluated"] is False
@@ -323,6 +335,117 @@ def test_frozen_postconstruction_mutation_is_rechecked() -> None:
     with pytest.raises(ScenarioContractError, match="strict bounded"):
         evaluate(row, metrics(row), proposed)
 
+
+
+@pytest.mark.parametrize(("offset_seconds", "expected"), [
+    (-1, APP02Status.SYNTHETIC_HYPOTHESIS),
+    (0, APP02Status.BLOCKED_CHRONOLOGY),
+    (1, APP02Status.BLOCKED_CHRONOLOGY),
+])
+def test_change_must_strictly_precede_payment(
+    offset_seconds: int, expected: APP02Status,
+) -> None:
+    changed_at = AT + timedelta(seconds=offset_seconds)
+    row = packet(maintenance=True, change_at=changed_at)
+    candidate = replace(
+        metrics(row), change_at=changed_at,
+        baseline_start=changed_at - timedelta(days=31), baseline_end=changed_at,
+        baseline_observed_at=changed_at, baseline_available_at=changed_at,
+        available_at=AT + timedelta(seconds=2),
+        maintenance_context=APP02MaintenanceContext.REPORTED_ABSENT,
+        maintenance_source_ref="payment-system", maintenance_source_version="1",
+        maintenance_observed_at=AT, maintenance_available_at=AT,
+    )
+    result = evaluate(row, candidate)
+    assert result["status"] == expected.value
+    assert result["heuristic_evaluated"] is (offset_seconds == -1)
+    shifted = timezone(timedelta(hours=3))
+    equivalent = replace(candidate, change_at=changed_at.astimezone(shifted))
+    assert evaluate(row, equivalent) == result
+
+
+@pytest.mark.parametrize(("gap_seconds", "expected"), [
+    (0, APP02Status.SYNTHETIC_HYPOTHESIS),
+    (60, APP02Status.SYNTHETIC_HYPOTHESIS),
+    (61, APP02Status.BLOCKED_HISTORY),
+    (30 * 86_400, APP02Status.BLOCKED_HISTORY),
+    (-1, APP02Status.BLOCKED_HISTORY),
+])
+def test_versioned_baseline_gap_closure(
+    gap_seconds: int, expected: APP02Status,
+) -> None:
+    row = packet(maintenance=True)
+    end = CHANGE - timedelta(seconds=gap_seconds)
+    candidate = replace(
+        metrics(row), baseline_end=end, baseline_start=end - timedelta(days=31),
+        maintenance_context=APP02MaintenanceContext.REPORTED_ABSENT,
+        maintenance_source_ref="payment-system", maintenance_source_version="1",
+        maintenance_observed_at=AT, maintenance_available_at=AT,
+    )
+    result = evaluate(row, candidate)
+    assert result["status"] == expected.value
+    assert result["heuristic_evaluated"] is (gap_seconds in (0, 60))
+
+
+@pytest.mark.parametrize("mutated", [
+    {"baseline_source_ref": "unrelated-source"},
+    {"baseline_source_version": "other-version"},
+    {"baseline_evidence_digest": "sha256:" + "c" * 64},
+    {"baseline_observed_at": CHANGE - timedelta(seconds=1)},
+    {"baseline_observed_at": CHANGE - timedelta(seconds=1),
+     "baseline_available_at": CHANGE - timedelta(seconds=1)},
+])
+def test_baseline_claim_lineage_substitution_rejected(
+    mutated: dict[str, object],
+) -> None:
+    row = packet()
+    with pytest.raises(ScenarioContractError, match="baseline source/version/snapshot"):
+        evaluate(row, replace(metrics(row), **mutated))
+
+
+def test_baseline_field_substitution_and_late_snapshot_block() -> None:
+    row = packet()
+    swapped = replace(row, fields=tuple(
+        replace(item, source_version="substituted")
+        if item.name == "payment_baseline" else item for item in row.fields
+    ))
+    candidate = replace(metrics(swapped), observation_digest=swapped.fingerprint())
+    with pytest.raises(ScenarioContractError, match="baseline source/version/snapshot"):
+        evaluate(swapped, candidate)
+
+    # History is not point-in-time safe if only available after the change.
+    late = CHANGE + timedelta(seconds=1)
+    delayed = replace(row, fields=tuple(
+        replace(item, observed_at=late, available_at=late)
+        if item.name == "payment_baseline" else item for item in row.fields
+    ))
+    candidate = replace(
+        metrics(delayed), observation_digest=delayed.fingerprint(),
+        baseline_observed_at=late, baseline_available_at=late,
+    )
+    result = evaluate(delayed, candidate)
+    assert result["status"] == APP02Status.BLOCKED_HISTORY.value
+    assert result["heuristic_evaluated"] is False
+
+
+@pytest.mark.parametrize("bad_gap", [-1, True, 604_801])
+def test_invalid_proposed_baseline_gap_rejected(bad_gap: object) -> None:
+    with pytest.raises(ScenarioContractError, match="maximum baseline gap"):
+        replace(policy(), max_baseline_gap_seconds=bad_gap)
+
+
+def test_proposed_gap_and_equivalent_baseline_clocks_affect_identity() -> None:
+    row = packet()
+    candidate = metrics(row)
+    original = evaluate(row, candidate)
+    assert original["effective_input_digest"] != evaluate(
+        row, candidate, replace(policy(), max_baseline_gap_seconds=61),
+    )["effective_input_digest"]
+    shifted = timezone(timedelta(hours=3))
+    assert evaluate(row, replace(
+        candidate, baseline_observed_at=CHANGE.astimezone(shifted),
+        baseline_available_at=CHANGE.astimezone(shifted),
+    )) == original
 
 def test_no_protected_runtime_imports_of_offline_app02() -> None:
     root = Path(__file__).resolve().parents[1] / "src" / "gasha"
