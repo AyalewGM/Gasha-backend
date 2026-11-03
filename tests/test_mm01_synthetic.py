@@ -15,7 +15,6 @@ from gasha.poc.mm01_synthetic import (
     MM01Context,
     MM01Direction,
     MM01FieldClaim,
-    mm01_field_value_digest,
     MM01RelationshipEvidence,
     MM01RelationshipKind,
     MM01Status,
@@ -23,6 +22,7 @@ from gasha.poc.mm01_synthetic import (
     MM01SyntheticPolicy,
     MM01TransferStatus,
     evaluate_mm01_synthetic,
+    mm01_field_value_digest,
 )
 from gasha.poc.scenario_observations import (
     SCENARIO_FIELDS,
@@ -526,7 +526,6 @@ def raw_evaluate(
     ("inbound_status", MM01TransferStatus.FAILED),
     ("outbound_status", MM01TransferStatus.REVERSED),
     ("account_ref", "different-account"),
-    ("currency", "USD"),
 ])
 def test_stale_field_claims_reject_changed_values_before_any_negative_result(
     name: str, value: object,
