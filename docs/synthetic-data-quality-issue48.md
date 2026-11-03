@@ -40,6 +40,8 @@ The reference inspector now rejects an empty, missing, noncanonical or malformed
 An explicitly present `intelligence` value that is not a mapping records `invalid_optional.intelligence`, including explicit null; its provisional per-UC signals remain unavailable. Absence of the optional container is not a quality warning. This extends the existing report v2 check-code vocabulary without changing the machine-readable structure, use-case coverage matrix or Bank-readiness authority. No new bank adapter, historical replay, policy evaluation or deployment wiring is added.
 
 
+The separate eight-scenario `scenario_coverage_batch.py` reporter from already merged internal PR #98 is preserved. This legacy UC-01/02/03 report snapshot fix is independent; neither reporter establishes Bank provenance or UC-04/05 performance.
+
 ## Report export ownership and integrity (synthetic-only)
 
 The retained `DataQualityReport.use_cases` now contains independent, recursively
