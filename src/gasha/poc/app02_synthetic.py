@@ -82,7 +82,7 @@ class APP02Status(StrEnum):
     BLOCKED_HISTORY = "blocked_point_in_time_amount_baseline"
     BLOCKED_PAYMENT = "blocked_payment_state"
     BLOCKED_CURRENCY = "blocked_currency_comparison"
-    BLOCKED_CHRONOLOGY = "blocked_future_change"
+    BLOCKED_CHRONOLOGY = "blocked_change_not_before_payment"
     OUTSIDE_WINDOW = "change_outside_proposed_window"
     AMOUNT_ORDINARY = "amount_not_unusual"
     MAINTENANCE_EXCEPTION = "reported_approved_maintenance_context"
@@ -99,6 +99,7 @@ class APP02SyntheticPolicy:
     max_change_to_payment_seconds: int
     min_baseline_days: int
     min_baseline_samples: int
+    max_baseline_gap_seconds: int
     min_payment_amount: Decimal
     min_baseline_multiple: Decimal
     payment_currency: str
@@ -110,6 +111,8 @@ class APP02SyntheticPolicy:
                maximum=86_400)
         _count("baseline days", self.min_baseline_days, minimum=1, maximum=36_500)
         _count("baseline samples", self.min_baseline_samples, minimum=1)
+        _count("maximum baseline gap", self.max_baseline_gap_seconds,
+               minimum=0, maximum=604_800)
         _amount("minimum payment", self.min_payment_amount)
         _amount("baseline multiple", self.min_baseline_multiple)
         if self.min_baseline_multiple <= 1:
@@ -142,6 +145,11 @@ class APP02SyntheticMetrics:
     baseline_start: datetime
     baseline_end: datetime
     baseline_complete: bool
+    baseline_source_ref: str
+    baseline_source_version: str
+    baseline_evidence_digest: str
+    baseline_observed_at: datetime
+    baseline_available_at: datetime
     available_at: datetime
     maintenance_context: APP02MaintenanceContext = APP02MaintenanceContext.UNKNOWN
     maintenance_source_ref: str | None = None
@@ -157,8 +165,15 @@ class APP02SyntheticMetrics:
         _token("metrics policy", self.policy_version)
         if type(self.payment_event_id) is not UUID:
             raise ScenarioContractError("typed payment event id required")
-        for name in ("change_ref", "change_source_ref", "change_source_version"):
+        for name in (
+            "change_ref", "change_source_ref", "change_source_version",
+            "baseline_source_ref", "baseline_source_version",
+        ):
             _token(name, getattr(self, name))
+        if type(self.baseline_evidence_digest) is not str or _DIGEST.fullmatch(
+            self.baseline_evidence_digest
+        ) is None:
+            raise ScenarioContractError("canonical baseline evidence digest required")
         if type(self.change_kind) is not APP02ChangeKind:
             raise ScenarioContractError("typed change kind required")
         if type(self.payment_status) is not APP02PaymentStatus:
@@ -175,11 +190,13 @@ class APP02SyntheticMetrics:
         _amount("baseline typical amount", self.baseline_typical_amount)
         _count("baseline samples", self.baseline_samples)
         for name in (
-            "change_at", "payment_at", "baseline_start", "baseline_end", "available_at",
+            "change_at", "payment_at", "baseline_start", "baseline_end",
+            "baseline_observed_at", "baseline_available_at", "available_at",
         ):
             object.__setattr__(self, name, _instant(name, getattr(self, name)))
         if not (
             self.baseline_start < self.baseline_end <= self.payment_at <= self.available_at
+            and self.baseline_observed_at <= self.baseline_available_at <= self.available_at
         ):
             raise ScenarioContractError("invalid baseline/payment chronology")
         context = (
@@ -347,6 +364,17 @@ def evaluate_app02_synthetic(
             raise ScenarioContractError("change or payment source/time evidence mismatch")
     if payment_evidence.observed_at != metrics.payment_at:
         raise ScenarioContractError("change or payment source/time evidence mismatch")
+    # Bind every baseline claim to its declared source and point-in-time snapshot.
+    # This is internal consistency, NOT Bank authentication or source attestation.
+    baseline_evidence = available["payment_baseline"]
+    if (
+        baseline_evidence.source_ref != metrics.baseline_source_ref
+        or baseline_evidence.source_version != metrics.baseline_source_version
+        or baseline_evidence.evidence_digest != metrics.baseline_evidence_digest
+        or baseline_evidence.observed_at != metrics.baseline_observed_at
+        or baseline_evidence.available_at != metrics.baseline_available_at
+    ):
+        raise ScenarioContractError("baseline source/version/snapshot mismatch")
     if metrics.maintenance_context is not APP02MaintenanceContext.UNKNOWN:
         maintenance = available.get("approved_maintenance_reset")
         if (
@@ -358,12 +386,16 @@ def evaluate_app02_synthetic(
             or maintenance.available_at > metrics.available_at
         ):
             raise ScenarioContractError("maintenance claim not bound to optional source")
-    if metrics.change_at > metrics.payment_at:
+    if metrics.change_at >= metrics.payment_at:
         return result(APP02Status.BLOCKED_CHRONOLOGY,
-                      "change_after_payment_cannot_be_historical_feature")
+                      "change_not_strictly_before_payment")
     if (
         not metrics.baseline_complete
         or metrics.baseline_end > metrics.change_at
+        or metrics.baseline_available_at > metrics.change_at
+        or metrics.change_at - metrics.baseline_end > timedelta(
+            seconds=policy.max_baseline_gap_seconds
+        )
         or metrics.baseline_end - metrics.baseline_start < timedelta(
             days=policy.min_baseline_days
         )
