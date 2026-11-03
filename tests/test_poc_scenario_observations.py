@@ -349,3 +349,18 @@ def test_missing_slotted_attributes_fail_closed_at_digest_and_coverage(
         row.fingerprint()
     with pytest.raises(ScenarioContractError, match="missing required"):
         inspect(row)
+
+def test_mm01_optional_relationship_survives_reconciliation_and_digest_checks() -> None:
+    """Merged MM-01 relationship mapping remains usable and PIT-validated."""
+    assert "own_account_relationship" in SCENARIO_FIELDS[ScenarioId.MM_01].optional
+    row = observation(ScenarioId.MM_01)
+    relationship = measured("own_account_relationship")
+    with_relationship = replace(row, fields=row.fields + (relationship,))
+    assert "own_account_relationship" in inspect(row)["unavailable_optional"]
+    assert "own_account_relationship" not in inspect(with_relationship)["unavailable_optional"]
+    assert with_relationship.fingerprint() != row.fingerprint()
+    object.__setattr__(relationship, "available_at", AT + timedelta(seconds=1))
+    with pytest.raises(ScenarioContractError, match="post-cutoff"):
+        with_relationship.fingerprint()
+    with pytest.raises(ScenarioContractError, match="post-cutoff"):
+        inspect(with_relationship)
