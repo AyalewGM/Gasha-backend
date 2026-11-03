@@ -32,7 +32,9 @@ AT = datetime(2026, 11, 2, 12, tzinfo=UTC)
 CHANGE = AT - timedelta(minutes=5)
 DATASET = "sha256:" + "a" * 64
 EVENT = UUID("3e201ab7-08ea-4c41-b074-84f1ae0f151c")
-CHANGE_FIELDS = {"authorized_change_event", "change_occurred_at"}
+CHANGE_FIELDS = {
+    "authorized_change_event", "change_kind", "change_source", "change_occurred_at",
+}
 
 
 def packet(
@@ -228,6 +230,23 @@ def test_reported_approved_maintenance_excludes_only_qualifying_candidate() -> N
     without = packet()
     with pytest.raises(ScenarioContractError, match="maintenance claim"):
         evaluate(without, replace(candidate, observation_digest=without.fingerprint()))
+
+
+@pytest.mark.parametrize("tampered_field", [
+    "change_kind", "change_source", "payment_status", "payment_amount",
+    "payment_currency",
+])
+def test_unrelated_source_cannot_supply_one_field_of_a_correlated_event(
+    tampered_field: str,
+) -> None:
+    row = packet()
+    swapped = replace(row, fields=tuple(
+        replace(item, source_ref="unrelated-source")
+        if item.name == tampered_field else item for item in row.fields
+    ))
+    candidate = replace(metrics(swapped), observation_digest=swapped.fingerprint())
+    with pytest.raises(ScenarioContractError, match="source/time"):
+        evaluate(swapped, candidate)
 
 
 def test_payment_before_change_is_blocked_not_labelled_as_fraud() -> None:
