@@ -1,0 +1,19 @@
+# ATO-06: unusual beneficiary addition followed by rapid transfer — inactive synthetic contract
+
+**Scope:** Dashen Annex A ATO-06, UC-01, Issue #48. This module evaluates caller-asserted offline pseudonymous candidate signals only. It is not in the protected API/worker/decision/case/readiness/payment path; it does not establish account takeover, social engineering, Bank evidence, risk scoring, prevention, false-positive reduction, or Bank acceptance.
+
+## Proposed candidate semantics and scope
+
+1. A scenario observation binds tenant/install/dataset IDs, event identity, required evidence-presence fields, mapping/config version and decision cutoff. Synthetic metrics and policy must match. Observed beneficiary-addition evidence must be available by the metrics snapshot; post-cutoff evidence is rejected.
+2. The amount floor has an **explicit currency**. Raw amount is compared only when the proposed policy currency matches the transfer currency. No FX conversion is supported; missing unit fails validation and mismatched units block, not a clean negative.
+3. The caller-asserted complete prior-addition-frequency baseline must have `history_end == beneficiary_created_at` and span at least the proposed duration. Even a one-second history gap blocks. There is **no first-known-payment or lifetime-new-beneficiary claim**: pre-creation history does not cover intervening payments between creation and this attempt.
+4. The rapid-addition window is measured **creation/addition → transfer attempt** (inclusive), never activation → attempt. Beneficiary must be claimed active, transfer attempted/executed/settled. Execution/settlement additionally require corresponding observed optional fields and eligible timestamps. An attempted transfer is not an executed, settled, prevented or fraudulent payment.
+5. The attempt must be **reported deduplicated**. Unverified uniqueness blocks; a reported technical retry is a contextual exclusion. Unknown retry context remains explicitly unassessed. These are untrusted caller claims, not proven event-lineage integrity.
+6. Maintenance context is typed: planned setup, approved migration/import, payroll/vendor enrollment, Bank correction, reported absent, or unknown. Applicable reported context gives explicit contextual exclusion; reported absence requires a source reference/version matching the scenario observation and an observed/available timestamp by the attempt. Unknown is explicitly qualified and cannot support any UC-05 false-positive-reduction claim. Caller-reported absence is not Bank proof.
+7. Redacted `effective_input_digest` is a domain-separated canonical SHA-256 digest of the validated observation digest, **all** policy thresholds/units and **all** metrics/context values, so changed inputs with repeated version strings produce distinct replay identities. It is not a signature, Bank attestation, authorized policy or approval. Result contains no raw amount/beneficiary ID and all Bank, fraud, readiness and enforcement flags remain false.
+
+## Unresolved Bank-owned gates
+
+Authenticated beneficiary/payment/context source events; authorized historical data, history coverage and event deduplication; trusted effective-value provenance; approved units/FX/baselines; independently sourced status, trusted negative context, labelled cohorts and performance; installed IdP/proxy/DB/broker/image isolation; and Issue #49 trusted evidence, independent verifier/approver, revocation and Bank release authority. Merged PR #54 is caller-asserted advisory only. Merged #52/#53 remain unchanged. No stage promotion or payment HOLD/BLOCK is authorized.
+
+**Review sequence:** Product Owner → Security/Architecture → Fraud Intelligence → Independent QA exact-head → separate Unified Engineering Lead internal-only decision. Do not self-approve, merge, deploy, or represent this offline hypothesis as Bank-verified detection.
