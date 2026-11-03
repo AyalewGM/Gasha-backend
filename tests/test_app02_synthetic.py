@@ -145,7 +145,9 @@ def test_positive_when_source_reports_no_maintenance_and_amount_unusual(
 def test_negative_and_blocked_cases(
     changes: dict[str, object], expected: APP02Status,
 ) -> None:
-    row = packet(change_at=changes.get("change_at", CHANGE))
+    candidate_change = changes.get("change_at", CHANGE)
+    assert isinstance(candidate_change, datetime)
+    row = packet(change_at=candidate_change)
     candidate = replace(metrics(row), **changes)
     # Keep claimed baseline no later than the changed event for true window negatives.
     if "change_at" in changes:
@@ -160,19 +162,18 @@ def test_negative_and_blocked_cases(
 
 def test_time_and_amount_threshold_boundaries() -> None:
     row = packet()
-    base = metrics(row)
-    exact = replace(base, payment_amount=Decimal("50"))
-    assert evaluate(row, exact)["status"] == APP02Status.CONTEXT_UNASSESSED.value
-    assert evaluate(row, replace(exact, payment_amount=Decimal("49.99")))[
+    proposed = replace(policy(), min_payment_amount=Decimal("30"))
+    exact = replace(metrics(row), payment_amount=Decimal("30"))
+    assert evaluate(row, exact, proposed)["status"] == APP02Status.CONTEXT_UNASSESSED.value
+    assert evaluate(row, replace(exact, payment_amount=Decimal("29.99")), proposed)[
         "status"
     ] == APP02Status.AMOUNT_ORDINARY.value
-    assert evaluate(row, replace(exact, baseline_typical_amount=Decimal("50") / 3))[
+    assert evaluate(row, replace(exact, baseline_typical_amount=Decimal("10")), proposed)[
         "status"
     ] == APP02Status.CONTEXT_UNASSESSED.value
-    assert evaluate(row, replace(exact, baseline_typical_amount=Decimal("50") / 3
-                                 + Decimal("0.01")))["status"] == (
-        APP02Status.AMOUNT_ORDINARY.value
-    )
+    assert evaluate(
+        row, replace(exact, baseline_typical_amount=Decimal("10.01")), proposed,
+    )["status"] == APP02Status.AMOUNT_ORDINARY.value
 
 
 @pytest.mark.parametrize("field_name", SCENARIO_FIELDS[ScenarioId.APP_02].required)
