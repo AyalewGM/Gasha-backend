@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from hashlib import sha256
-from json import dumps
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from hashlib import sha256
+from json import dumps
 
 from gasha.poc.scenario_observations import (
+    SCENARIO_FIELDS,
     FieldState,
     ScenarioContractError,
     ScenarioId,
@@ -260,8 +261,6 @@ def _validate_claims(
     snapshot_digest: str,
 ) -> None:
     """Reject absent, late, spliced or stale caller claims before classification."""
-    from gasha.poc.scenario_observations import SCENARIO_FIELDS
-
     needed = set(SCENARIO_FIELDS[ScenarioId.MM_02].required)
     for name, context in (
         ("sender_baseline", metrics.sender_baseline),
@@ -306,7 +305,7 @@ def _validate_claims(
             or transfer.evidence_digest != transfer_source.evidence_digest
             or transfer.available_at > metrics.available_at
         ):
-            raise ScenarioContractError("unbound or post-snapshot transfer evidence")
+            raise ScenarioContractError("late transfer evidence or source mismatch")
 
 
 def _effective_digest(

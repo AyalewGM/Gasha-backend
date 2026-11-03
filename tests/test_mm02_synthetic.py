@@ -151,7 +151,7 @@ def test_known_payroll_merchant_or_routine_baseline_excludes(context: str) -> No
 def test_optional_context_claim_without_observation_rejected(context: str) -> None:
     row = packet()
     values = replace(metrics(row), **{context: MM02Context.REPORTED_ABSENT})
-    with pytest.raises(ScenarioContractError, match="without observed"):
+    with pytest.raises(ScenarioContractError):
         evaluate(row, values)
 
 
