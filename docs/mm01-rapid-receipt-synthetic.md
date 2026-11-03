@@ -88,3 +88,22 @@ authorized same-owner relationship evidence and field-level semantic
 source/digest/snapshot binding. Counterparty-pseudonym presence remains only
 identifier presence; this PR must not be merged until those separate
 corrections, regression tests and independent exact-head reviews pass.
+
+## Explicit synthetic ownership relationship (bounded correction)
+
+`counterparty_pseudonym` is an identifier-presence signal, **not** an
+authorized same-owner relationship. Own-account exclusion requires the new
+optional `own_account_relationship` field to be OBSERVED, plus a typed
+`MM01RelationshipEvidence` assertion with explicit same-owner vs distinct-
+owner classification, permitted-purpose token, source/version, field evidence
+digest, observed/available instants, dataset/tenant/installation scope, and
+exact observation snapshot fingerprint. Source or purpose substitutions,
+post-cutoff claims, absent evidence and classification contradictions reject.
+
+All assertions remain synthetic and caller-originated. In particular, a
+claimed purpose token does not constitute a Bank-granted permission, and even
+an internally consistent claim does not independently verify beneficial
+ownership. Missing relationships stay UNKNOWN; no safe inference from missing
+data. **PO/Security correction #4 remains open:** bind source- and value-level
+credit/debit/account/exception field groups to the same snapshot before
+independent acceptance of this PR.
