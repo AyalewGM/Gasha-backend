@@ -10,6 +10,18 @@ All times are normalized to UTC *before comparison and hashing*, including dayli
 
 The deterministic SHA-256 content fingerprint binds source version, exact historical timing, and all policy/mapping/cohort/dataset references. It is **not** a cryptographic attestation or bank approval. Neither labels nor post-event outcomes may be inserted as feature sources. No real customer/account/device values belong in provenance IDs or tests.
 
+## Post-construction mutation boundary
+
+Although lineage dataclasses are frozen, caller code can bypass that protection with
+object.__setattr__. Before fingerprinting, reporting unavailable telemetry or
+binding a synthetic IntelligenceSnapshot, the kernel now reconstructs and
+revalidates a detached copy of the full envelope and its signal records. Invalid
+post-cutoff observations, invalid clocks/sources, changed signal shapes and missing
+fields fail closed even after initially valid construction. Deleted required slotted\nfields (including the whole signals tuple or nested signal members) raise the fixed,\nredacted HistoricalLineageRejected at each public consumption point, rather than\nan AttributeError that a future adapter could mishandle. Valid value changes yield
+a different content fingerprint and must still match the decision input. This is
+defense-in-depth against malformed caller-held objects; it is **not** source
+authentication, Bank attestation, or replay integration.
+
 ## Still required for Issues #48 and #49
 
 Bank-approved field mappings and source/decision cutoff semantics; secure collection of source timestamps; independently attested immutable dataset and model lineage; verified label maturity and time-separated cohort selection; missing-data quality report and clear signal coverage; integration into a fail-closed historical adapter; independent Fraud/Security/QA exact-SHA review and CBE acceptance. The current numeric-only replay must **not** be described as point-in-time-safe merely because this module exists. There are no bank data, deployment or payment interventions in this patch.

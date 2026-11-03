@@ -248,3 +248,89 @@ def test_lineage_helper_is_not_imported_or_consulted_by_live_paths() -> None:
         if any(marker in source for marker in forbidden):
             consumers.append(candidate.relative_to(root).as_posix())
     assert consumers == [], f"Unreviewed production lineage integration: {consumers}"
+
+
+@pytest.mark.parametrize(("field", "bad"), [
+    ("available_at", CUTOFF + timedelta(microseconds=1)),
+    ("as_of", CUTOFF + timedelta(microseconds=1)),
+    ("as_of", EVENT_TIME + timedelta(seconds=1)),  # later than availability
+    ("source_version", "bad\nsource"),
+    ("value", 2.0),
+    ("value", float("nan")),
+    ("value", True),
+    ("unavailable_reason", "invented"),
+])
+def test_tampered_signal_is_revalidated_at_every_consumer(
+    field: str, bad: Any,
+) -> None:
+    original = envelope()
+    object.__setattr__(original.signals[0], field, bad)
+    with pytest.raises(HistoricalLineageRejected):
+        original.fingerprint()
+    with pytest.raises(HistoricalLineageRejected):
+        original.unavailable_signals()
+    with pytest.raises(HistoricalLineageRejected):
+        validate(original)
+
+
+@pytest.mark.parametrize(("field", "bad"), [
+    ("tenant_id", "bad\ntenant"),
+    ("decision_cutoff", EVENT_TIME - timedelta(microseconds=1)),
+    ("signals", ("untyped",)),
+    ("signals", ()),
+])
+def test_tampered_envelope_cannot_bypass_historical_assertion(
+    field: str, bad: Any,
+) -> None:
+    original = envelope()
+    object.__setattr__(original, field, bad)
+    with pytest.raises(HistoricalLineageRejected):
+        original.fingerprint()
+    with pytest.raises(HistoricalLineageRejected):
+        validate(original)
+
+
+
+@pytest.mark.parametrize("consumer", ["fingerprint", "unavailable_signals", "snapshot_binding"])
+@pytest.mark.parametrize(("kind", "field"), [
+    ("envelope", "signals"),
+    ("envelope", "tenant_id"),
+    ("envelope", "event_id"),
+    ("envelope", "dataset_digest"),
+    ("envelope", "decision_cutoff"),
+    ("envelope", "occurred_at"),
+    ("envelope", "policy_version"),
+    ("signal", "name"),
+    ("signal", "value"),
+    ("signal", "source_ref"),
+    ("signal", "source_version"),
+    ("signal", "as_of"),
+    ("signal", "available_at"),
+    ("signal", "unavailable_reason"),
+])
+def test_deleted_slotted_fields_reject_at_every_consumer(
+    kind: str, field: str, consumer: str,
+) -> None:
+    """A deleted required member cannot escape expected quarantine as AttributeError."""
+    original = envelope()
+    record = original if kind == "envelope" else original.signals[0]
+    object.__delattr__(record, field)
+    with pytest.raises(
+        HistoricalLineageRejected, match="missing required historical lineage field",
+    ) as rejected:
+        if consumer == "fingerprint":
+            original.fingerprint()
+        elif consumer == "unavailable_signals":
+            original.unavailable_signals()
+        else:
+            validate(original)
+    assert "synthetic-tenant" not in str(rejected.value)
+    assert "synthetic-source" not in str(rejected.value)
+
+def test_valid_low_level_score_change_gets_new_identity_but_not_trusted_replay() -> None:
+    original = envelope()
+    original_fingerprint = original.fingerprint()
+    object.__setattr__(original.signals[0], "value", 0.3)
+    assert original.fingerprint() != original_fingerprint
+    with pytest.raises(HistoricalLineageRejected, match="value contradicts"):
+        validate(original)

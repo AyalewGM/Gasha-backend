@@ -8,7 +8,7 @@ The existing historical replay path is deliberately not wired to this helper.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from json import dumps
@@ -148,26 +148,61 @@ class HistoricalFeatureEnvelope:
             raise HistoricalLineageRejected("missing explicit available/unavailable signal lineage")
 
     def unavailable_signals(self) -> tuple[str, ...]:
-        return tuple(sorted(signal.name for signal in self.signals if signal.value is None))
+        checked = _validated_copy(self)
+        return tuple(sorted(signal.name for signal in checked.signals if signal.value is None))
 
     def fingerprint(self) -> str:
         """Stable payload identity only, not a trusted data-source attestation."""
+        validated = _validated_copy(self)
         payload = {
             "domain": "gasha-historical-feature-lineage-v1",
-            "tenant_id": self.tenant_id,
-            "event_id": str(self.event_id),
-            "dataset_digest": self.dataset_digest,
-            "cohort_version": self.cohort_version,
-            "mapping_version": self.mapping_version,
-            "configuration_version": self.configuration_version,
-            "policy_version": self.policy_version,
-            "signal_policy_version": self.signal_policy_version,
-            "occurred_at": _iso(self.occurred_at),
-            "decision_cutoff": _iso(self.decision_cutoff),
-            "signals": [s._identity() for s in sorted(self.signals, key=lambda item: item.name)],
+            "tenant_id": validated.tenant_id,
+            "event_id": str(validated.event_id),
+            "dataset_digest": validated.dataset_digest,
+            "cohort_version": validated.cohort_version,
+            "mapping_version": validated.mapping_version,
+            "configuration_version": validated.configuration_version,
+            "policy_version": validated.policy_version,
+            "signal_policy_version": validated.signal_policy_version,
+            "occurred_at": _iso(validated.occurred_at),
+            "decision_cutoff": _iso(validated.decision_cutoff),
+            "signals": [s._identity() for s in sorted(validated.signals, key=lambda item: item.name)],
         }
         canonical = dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
         return "sha256:" + sha256(canonical.encode("ascii")).hexdigest()
+
+
+
+def _assert_fields_present(record: HistoricalFeatureEnvelope | SignalLineage) -> None:
+    """Normalize missing slotted fields without masking unrelated programming errors."""
+    for field in fields(record):
+        try:
+            object.__getattribute__(record, field.name)
+        except AttributeError:
+            raise HistoricalLineageRejected("missing required historical lineage field") from None
+
+
+def _validated_copy(envelope: HistoricalFeatureEnvelope) -> HistoricalFeatureEnvelope:
+    """Recheck caller-held frozen objects and snapshot their validated values.
+
+    Frozen dataclasses do not prohibit object.__setattr__ or an adapter
+    bypassing construction validation. Rebuilding every child and the envelope
+    prevents post-construction mutation from smuggling future/unavailable
+    risk data into a historical assertion or yielding a misleading digest.
+    The resulting copy is caller-asserted, never Bank-attested.
+    """
+    if type(envelope) is not HistoricalFeatureEnvelope:
+        raise HistoricalLineageRejected("typed historical envelope required")
+    _assert_fields_present(envelope)
+    if type(envelope.signals) is not tuple:
+        raise HistoricalLineageRejected("signals must be an immutable tuple")
+    checked_signals: list[SignalLineage] = []
+    for signal in envelope.signals:
+        if type(signal) is not SignalLineage:
+            raise HistoricalLineageRejected("untyped signal lineage")
+        _assert_fields_present(signal)
+        checked_signals.append(replace(signal))
+    return replace(envelope, signals=tuple(checked_signals))
 
 
 def assert_historical_snapshot_bound(
@@ -189,6 +224,7 @@ def assert_historical_snapshot_bound(
         or not isinstance(snapshot, IntelligenceSnapshot)
     ):
         raise HistoricalLineageRejected("typed envelope, transaction and snapshot required")
+    envelope = _validated_copy(envelope)
     _tag("expected_tenant", expected_tenant)
     if (
         type(expected_dataset_digest) is not str
