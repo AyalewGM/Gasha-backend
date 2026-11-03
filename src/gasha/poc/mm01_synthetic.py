@@ -432,9 +432,28 @@ def _validate_field_claims(
         a, b = by_name[left], by_name[right]
         if a.source_ref != b.source_ref or a.source_version != b.source_version:
             raise ScenarioContractError("event and status semantic sources spliced")
+    # MM-01 synthetic event-clock-v1: pre-issued account/event identifiers may
+    # predate a debit. An event's status, or joined values describing the debit,
+    # cannot be *observed* before the corresponding event exists. These clocks
+    # remain caller claims and are NOT authenticated Bank posting timestamps.
+    event_derived = {
+        "inbound_credit_status": metrics.inbound_occurred_at,
+        "outbound_debit_status": metrics.outbound_occurred_at,
+        "flow_direction": metrics.outbound_occurred_at,
+        "transfer_amount": metrics.outbound_occurred_at,
+        "transfer_currency": metrics.outbound_occurred_at,
+        "flow_window": metrics.outbound_occurred_at,
+    }
+    if metrics.reversal_context is not MM01Context.UNKNOWN:
+        event_derived["reversal_status"] = metrics.outbound_occurred_at
+    for name, occurred_at in event_derived.items():
+        if by_name[name].observed_at < occurred_at:
+            raise ScenarioContractError("event-derived evidence predates event")
     for name in ("inbound_credit_reference", "inbound_credit_status"):
         if by_name[name].available_at > metrics.outbound_occurred_at:
             raise ScenarioContractError("inbound evidence unavailable at debit")
+    if metrics.inbound_available_at > metrics.outbound_occurred_at:
+        raise ScenarioContractError("claimed inbound event unavailable at debit")
 
 
 def evaluate_mm01_synthetic(
