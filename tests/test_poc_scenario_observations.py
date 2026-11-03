@@ -312,7 +312,7 @@ def test_direct_fingerprint_rejects_mutated_field_evidence(
     [
         ("decision_cutoff", AT - timedelta(seconds=1)),
         ("mapping_version", "bad version"),
-        ("tenant_ref", "other tenant"),
+        ("tenant_ref", "other-tenant"),
     ],
 )
 def test_direct_fingerprint_revalidates_mutated_packet(
