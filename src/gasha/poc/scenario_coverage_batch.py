@@ -64,12 +64,61 @@ class ScenarioBatchScope:
 
 
 @dataclass(frozen=True, slots=True)
+class ScenarioCoverageRate:
+    """Immutable denominator evidence, including an explicit undefined state."""
+
+    numerator: int
+    denominator: int
+    value: float | None
+    undefined_reason: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "numerator": self.numerator,
+            "denominator": self.denominator,
+            "value": self.value,
+            "undefined_reason": self.undefined_reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioCoverageSummary:
+    """Immutable snapshot; tuples prevent mutation through the public attribute."""
+
+    scenario_id: str
+    use_case: str
+    input_events: int
+    complete_required_events: int
+    blocked_required_events: int
+    required_coverage: ScenarioCoverageRate
+    missing_required_counts: tuple[tuple[str, int], ...]
+    unavailable_optional_counts: tuple[tuple[str, int], ...]
+    status: str
+    bank_evaluable: bool
+
+    def to_dict(self) -> dict[str, object]:
+        """Allocate every exported container independently of stored evidence."""
+        return {
+            "scenario_id": self.scenario_id,
+            "use_case": self.use_case,
+            "input_events": self.input_events,
+            "complete_required_events": self.complete_required_events,
+            "blocked_required_events": self.blocked_required_events,
+            "required_coverage": self.required_coverage.to_dict(),
+            "missing_required_counts": dict(self.missing_required_counts),
+            "unavailable_optional_counts": dict(self.unavailable_optional_counts),
+            "status": self.status,
+            "bank_evaluable": self.bank_evaluable,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ScenarioBatchCoverageReport:
     scope: ScenarioBatchScope
     input_rows: int
     duplicate_rows: int
     batch_digest: str
-    scenarios: tuple[dict[str, object], ...]
+    scenarios: tuple[ScenarioCoverageSummary, ...]
 
     def to_dict(self) -> dict[str, object]:
         """Fixed schema and aggregate keys only; never raw event or customer IDs."""
@@ -92,7 +141,7 @@ class ScenarioBatchCoverageReport:
             "input_rows": self.input_rows,
             "unique_scenario_events": self.input_rows - self.duplicate_rows,
             "duplicate_rows": self.duplicate_rows,
-            "scenarios": list(self.scenarios),
+            "scenarios": [scenario.to_dict() for scenario in self.scenarios],
             "downstream_evaluation": {
                 "UC-04_alert_prioritization": "blocked_no_analyst_outcome_and_alert_budget",
                 "UC-05_false_positive_reduction": "blocked_no_matured_labels_and_comparator",
@@ -117,13 +166,13 @@ class ScenarioBatchCoverageReport:
         }
 
 
-def _rate(numerator: int, denominator: int) -> dict[str, object]:
-    return {
-        "numerator": numerator,
-        "denominator": denominator,
-        "value": numerator / denominator if denominator else None,
-        "undefined_reason": None if denominator else "no_scenario_events",
-    }
+def _rate(numerator: int, denominator: int) -> ScenarioCoverageRate:
+    return ScenarioCoverageRate(
+        numerator=numerator,
+        denominator=denominator,
+        value=numerator / denominator if denominator else None,
+        undefined_reason=None if denominator else "no_scenario_events",
+    )
 
 
 def inspect_scenario_coverage_batch(
@@ -190,7 +239,7 @@ def inspect_scenario_coverage_batch(
         missing[row.scenario_id].update(coverage.missing_required)
         optional[row.scenario_id].update(coverage.unavailable_optional)
 
-    summaries: list[dict[str, object]] = []
+    summaries: list[ScenarioCoverageSummary] = []
     for scenario in ScenarioId:
         mapping = SCENARIO_FIELDS[scenario]
         total = counts[scenario]["unique"]
@@ -201,22 +250,22 @@ def inspect_scenario_coverage_batch(
             "blocked_by_data" if not complete else
             "partial_synthetic_coverage" if blocked else "synthetic_coverage_only"
         )
-        summaries.append({
-            "scenario_id": scenario.value,
-            "use_case": mapping.use_case,
-            "input_events": total,
-            "complete_required_events": complete,
-            "blocked_required_events": blocked,
-            "required_coverage": _rate(complete, total),
-            "missing_required_counts": {
-                name: missing[scenario][name] for name in mapping.required
-            },
-            "unavailable_optional_counts": {
-                name: optional[scenario][name] for name in mapping.optional
-            },
-            "status": status,
-            "bank_evaluable": False,
-        })
+        summaries.append(ScenarioCoverageSummary(
+            scenario_id=scenario.value,
+            use_case=mapping.use_case,
+            input_events=total,
+            complete_required_events=complete,
+            blocked_required_events=blocked,
+            required_coverage=_rate(complete, total),
+            missing_required_counts=tuple(
+                (name, missing[scenario][name]) for name in mapping.required
+            ),
+            unavailable_optional_counts=tuple(
+                (name, optional[scenario][name]) for name in mapping.optional
+            ),
+            status=status,
+            bank_evaluable=False,
+        ))
 
     canonical = dumps(
         {
