@@ -385,8 +385,8 @@ def test_effective_input_fingerprint_binds_values_thresholds_and_context() -> No
     first = evaluate(row, base)
     assert first == evaluate(row, base)
     cases = [
-        (replace(base, transfer_amount=Decimal("501")), policy()),
-        (base, replace(policy(), min_transfer_amount=Decimal("499"))),
+        (replace(base, transfer_amount=Decimal(501)), policy()),
+        (base, replace(policy(), min_transfer_amount=Decimal(499))),
         (replace(base, retry_context=ATO06RetryContext.REPORTED_NOT_RETRY), policy()),
         (replace(base, transfer_currency="USD"), policy()),
         (replace(base, beneficiary_activated_at=AT - timedelta(minutes=1)), policy()),
