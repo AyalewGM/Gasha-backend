@@ -39,10 +39,19 @@ DATASET = "sha256:" + "a" * 64
 
 
 def evidence(name: str) -> FieldEvidence:
+    # Pre-existing account/relationship and inbound references may be known
+    # before the debit. Joined debit/status/amount/window facts cannot be.
+    debit_derived = {
+        "outbound_debit_reference", "outbound_debit_status",
+        "flow_direction", "transfer_amount", "transfer_currency",
+        "flow_window", "reversal_status",
+    }
+    observed_at = AT if name in debit_derived else AT - timedelta(minutes=3)
+    available_at = AT if name in debit_derived else AT - timedelta(minutes=1)
     return FieldEvidence(
         name=name, state=FieldState.OBSERVED, source_ref="synthetic-source",
         source_version="1", evidence_digest="sha256:" + "b" * 64,
-        observed_at=AT - timedelta(minutes=3), available_at=AT - timedelta(minutes=1),
+        observed_at=observed_at, available_at=available_at,
     )
 
 
@@ -218,6 +227,12 @@ def test_matched_negative_and_exact_amount_boundaries(
 
 def test_credit_at_same_instant_as_debit_is_not_onward_movement() -> None:
     row = packet()
+    # The inbound status cannot be known before the amended inbound event.
+    row = replace(row, fields=tuple(
+        replace(field, observed_at=AT, available_at=AT)
+        if field.name == "inbound_credit_status" else field
+        for field in row.fields
+    ))
     vals = replace(
         metrics(row), inbound_occurred_at=AT, inbound_available_at=AT,
     )
@@ -592,3 +607,103 @@ def test_reported_reversal_context_binds_optional_semantic_field() -> None:
     bad = replace(vals, reversal_context=MM01Context.REPORTED_ABSENT)
     with pytest.raises(ScenarioContractError, match="semantic field source/value"):
         raw_evaluate(row, bad)
+
+# Causal-status regressions for synthetic event-clock-v1. A caller's hash
+# cannot turn an impossible pre-event observation into legitimate evidence.
+@pytest.mark.parametrize("name,event_at", [
+    ("inbound_credit_status", AT - timedelta(minutes=3)),
+    ("outbound_debit_status", AT),
+])
+@pytest.mark.parametrize("offset_seconds", [-1, 0, 1])
+def test_posted_status_observation_causal_boundary(
+    name: str, event_at: datetime, offset_seconds: int,
+) -> None:
+    row = packet(include_context=True)
+    observed_at = event_at + timedelta(seconds=offset_seconds)
+    default_available_at = next(
+        field.available_at for field in row.fields if field.name == name
+    )
+    available_at = max(default_available_at, observed_at)
+    row = replace(
+        row, decision_cutoff=AT + timedelta(seconds=10),
+        fields=tuple(
+            replace(field, observed_at=observed_at, available_at=available_at)
+            if field.name == name else field for field in row.fields
+        ),
+    )
+    vals = replace(
+        metrics(row), own_account_context=MM01Context.REPORTED_ABSENT,
+        reversal_context=MM01Context.REPORTED_ABSENT,
+    )
+    if offset_seconds < 0:
+        with pytest.raises(ScenarioContractError, match="predates event"):
+            evaluate(row, values=vals)
+    else:
+        assert evaluate(row, values=vals)["status"] == (
+            MM01Status.SYNTHETIC_HYPOTHESIS.value
+        )
+
+
+@pytest.mark.parametrize("name", [
+    "flow_direction", "transfer_amount", "transfer_currency", "flow_window",
+    "reversal_status",
+])
+def test_event_derived_flow_claim_before_debit_rejected(name: str) -> None:
+    row = packet(include_context=True)
+    row = replace(row, fields=tuple(
+        replace(field, observed_at=AT - timedelta(seconds=1))
+        if field.name == name else field for field in row.fields
+    ))
+    vals = replace(
+        metrics(row), own_account_context=MM01Context.REPORTED_ABSENT,
+        reversal_context=MM01Context.REPORTED_ABSENT,
+    )
+    with pytest.raises(ScenarioContractError, match="predates event"):
+        evaluate(row, values=vals)
+
+
+@pytest.mark.parametrize("name", [
+    "inbound_credit_reference", "inbound_credit_status",
+])
+def test_inbound_evidence_arriving_after_debit_rejected(name: str) -> None:
+    row = packet(include_context=True)
+    row = replace(
+        row, decision_cutoff=AT + timedelta(seconds=10),
+        fields=tuple(
+            replace(field, available_at=AT + timedelta(seconds=1))
+            if field.name == name else field for field in row.fields
+        ),
+    )
+    vals = metrics(row)
+    with pytest.raises(ScenarioContractError, match="unavailable at debit"):
+        evaluate(row, values=vals)
+
+
+def test_claimed_inbound_availability_after_debit_rejected() -> None:
+    row = packet()
+    row = replace(row, decision_cutoff=AT + timedelta(seconds=10))
+    vals = replace(metrics(row), inbound_available_at=AT + timedelta(seconds=1))
+    with pytest.raises(ScenarioContractError, match="unavailable at debit"):
+        evaluate(row, values=vals)
+
+
+def test_status_evidence_after_cutoff_rejected_at_coverage_boundary() -> None:
+    row = packet()
+    # Force a changed frozen-field snapshot to exercise use-time validation.
+    status = next(f for f in row.fields if f.name == "outbound_debit_status")
+    object.__setattr__(status, "available_at", AT + timedelta(seconds=1))
+    with pytest.raises(ScenarioContractError, match="post-cutoff"):
+        evaluate(row, values=None)
+
+
+@pytest.mark.parametrize("status", [
+    MM01TransferStatus.POSTED, MM01TransferStatus.SETTLED,
+])
+def test_both_confirmed_status_types_respect_event_clocks(
+    status: MM01TransferStatus,
+) -> None:
+    row = packet()
+    vals = replace(
+        metrics(row), inbound_status=status, outbound_status=status,
+    )
+    assert evaluate(row, values=vals)["status"] == MM01Status.CONTEXT_REVIEW.value
