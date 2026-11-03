@@ -65,8 +65,8 @@ def policy() -> APP02SyntheticPolicy:
     return APP02SyntheticPolicy(
         version="proposed-1", configuration_version="1",
         max_change_to_payment_seconds=300, min_baseline_days=30,
-        min_baseline_samples=10, min_payment_amount=Decimal("50"),
-        min_baseline_multiple=Decimal("3"), payment_currency="ETB",
+        min_baseline_samples=10, min_payment_amount=Decimal(50),
+        min_baseline_multiple=Decimal(3), payment_currency="ETB",
     )
 
 
@@ -77,8 +77,8 @@ def metrics(row: ScenarioObservation) -> APP02SyntheticMetrics:
         change_kind=APP02ChangeKind.DEVICE, change_at=CHANGE,
         change_source_ref="change-system", change_source_version="1",
         payment_at=AT, payment_status=APP02PaymentStatus.POSTED,
-        payment_amount=Decimal("100"), payment_currency="ETB",
-        baseline_typical_amount=Decimal("10"), baseline_currency="ETB",
+        payment_amount=Decimal(100), payment_currency="ETB",
+        baseline_typical_amount=Decimal(10), baseline_currency="ETB",
         baseline_samples=20, baseline_start=CHANGE - timedelta(days=31),
         baseline_end=CHANGE, baseline_complete=True, available_at=AT,
     )
@@ -138,8 +138,8 @@ def test_positive_when_source_reports_no_maintenance_and_amount_unusual(
     ({"baseline_samples": 9}, APP02Status.BLOCKED_HISTORY),
     ({"baseline_start": CHANGE - timedelta(days=29)}, APP02Status.BLOCKED_HISTORY),
     ({"baseline_end": CHANGE + timedelta(seconds=1)}, APP02Status.BLOCKED_HISTORY),
-    ({"payment_amount": Decimal("49")}, APP02Status.AMOUNT_ORDINARY),
-    ({"baseline_typical_amount": Decimal("34")}, APP02Status.AMOUNT_ORDINARY),
+    ({"payment_amount": Decimal(49)}, APP02Status.AMOUNT_ORDINARY),
+    ({"baseline_typical_amount": Decimal(34)}, APP02Status.AMOUNT_ORDINARY),
     ({"change_at": AT - timedelta(seconds=301)}, APP02Status.OUTSIDE_WINDOW),
 ])
 def test_negative_and_blocked_cases(
@@ -162,13 +162,13 @@ def test_negative_and_blocked_cases(
 
 def test_time_and_amount_threshold_boundaries() -> None:
     row = packet()
-    proposed = replace(policy(), min_payment_amount=Decimal("30"))
-    exact = replace(metrics(row), payment_amount=Decimal("30"))
+    proposed = replace(policy(), min_payment_amount=Decimal(30))
+    exact = replace(metrics(row), payment_amount=Decimal(30))
     assert evaluate(row, exact, proposed)["status"] == APP02Status.CONTEXT_UNASSESSED.value
     assert evaluate(row, replace(exact, payment_amount=Decimal("29.99")), proposed)[
         "status"
     ] == APP02Status.AMOUNT_ORDINARY.value
-    assert evaluate(row, replace(exact, baseline_typical_amount=Decimal("10")), proposed)[
+    assert evaluate(row, replace(exact, baseline_typical_amount=Decimal(10)), proposed)[
         "status"
     ] == APP02Status.CONTEXT_UNASSESSED.value
     assert evaluate(
@@ -187,7 +187,7 @@ def test_required_evidence_after_metrics_snapshot_blocks_before_base_negatives(
     ))
     candidate = replace(
         metrics(changed), observation_digest=changed.fingerprint(),
-        payment_amount=Decimal("1"),
+        payment_amount=Decimal(1),
     )
     result = evaluate(changed, candidate)
     assert result["status"] == APP02Status.BLOCKED_FIELDS.value
@@ -217,7 +217,7 @@ def test_reported_approved_maintenance_excludes_only_qualifying_candidate() -> N
     }
     candidate = replace(metrics(row), **maintenance)
     assert evaluate(row, candidate)["status"] == APP02Status.MAINTENANCE_EXCEPTION.value
-    assert evaluate(row, replace(candidate, payment_amount=Decimal("1")))[
+    assert evaluate(row, replace(candidate, payment_amount=Decimal(1)))[
         "status"
     ] == APP02Status.AMOUNT_ORDINARY.value
     assert evaluate(row, replace(candidate, payment_status=APP02PaymentStatus.FAILED))[
