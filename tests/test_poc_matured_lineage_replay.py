@@ -74,7 +74,7 @@ def sample(
         transaction=CanonicalTransaction(
             tenant_id="synthetic-tenant", event_id=event_id,
             occurred_at=AT, channel="mobile", transaction_type="transfer",
-            amount=Decimal("10"), currency="ETB",
+            amount=Decimal(10), currency="ETB",
             sender_customer_id="private-customer-123",
             sender_account_id="private-account-123",
             beneficiary_id="private-beneficiary-123",
@@ -299,3 +299,32 @@ def test_malformed_batch_scope_and_time_are_rejected() -> None:
         scope(label_cutoff=AT)
     with pytest.raises(HistoricalLineageRejected, match="immutable"):
         replay_offline_matured_lineage(scope(), [], (), policy())  # type: ignore[arg-type]
+
+
+def test_label_confirmation_clock_and_cutoff_are_part_of_cohort_identity() -> None:
+    current = sample(1, confirmed_at=AT + timedelta(days=2))
+    changed = sample(1, confirmed_at=AT + timedelta(days=3))
+    original = check(current)
+    assert check(changed)["cohort_digest"] != original["cohort_digest"]
+    extended = replay_offline_matured_lineage(
+        scope(label_cutoff=AT + timedelta(days=11)),
+        (current[0],), (current[1],), policy(),
+    ).to_dict()
+    assert extended["cohort_digest"] != original["cohort_digest"]
+
+
+def test_deleted_lineage_field_fails_before_decision_execution() -> None:
+    event, lineage = sample()
+    object.__delattr__(lineage, "cohort_version")
+    calls = 0
+
+    def decision_clock() -> datetime:
+        nonlocal calls
+        calls += 1
+        return AT
+
+    with pytest.raises(HistoricalLineageRejected, match="missing required"):
+        replay_offline_matured_lineage(
+            scope(), (event,), (lineage,), policy(), clock=decision_clock,
+        )
+    assert calls == 0
