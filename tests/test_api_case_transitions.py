@@ -18,8 +18,10 @@ from gasha.cases.timeline import (
     CaseDisposition,
     CaseEvent,
     CaseOperation,
+    CaseReason,
     VerifiedEvaluation,
     advance_case,
+    case_command_fingerprints,
 )
 from gasha.security.access import (
     AuthorizationRejected,
@@ -345,6 +347,61 @@ def test_malformed_writer_response_never_grants_execution_authority(wired, forge
     assert response.json() == {"detail": "case transition unavailable"}
     assert writer.history == {}
     assert any(e.reason == "case_transition_unavailable" for e in audit.events)
+
+
+
+@pytest.mark.parametrize("forged_fields", [
+    ("reason_code",),
+    ("idempotency_key",),
+    ("source_event_id",),
+    ("reason_code", "idempotency_key", "source_event_id"),
+])
+def test_writer_cannot_rebind_validated_client_command(wired, forged_fields):
+    """Writer-mutable fields and internally matching digests do not confer success."""
+    client, audit, writer = wired
+    original = writer.apply
+
+    def misconfigured_writer(**kwargs):
+        # Simulate a writer that first handles the accepted command and then
+        # illicitly mutates its *own* Pydantic proposal, even bypassing frozen.
+        event = original(**kwargs)
+        received = kwargs["proposal"]
+        mutations = {
+            "reason_code": CaseReason.ANALYST_TRIAGE,
+            "idempotency_key": "e" * 32,
+            "source_event_id": uuid4(),
+        }
+        for field in forged_fields:
+            object.__setattr__(received, field, mutations[field])
+        altered = CaseCommand(
+            tenant_id=kwargs["tenant_id"], case_id=kwargs["case_id"],
+            source_event_id=received.source_event_id,
+            operation=kwargs["operation"],
+            expected_revision=received.expected_revision,
+            idempotency_key=received.idempotency_key,
+            reason_code=received.reason_code,
+            disposition=received.disposition,
+        )
+        key_ref, command_ref = case_command_fingerprints(
+            altered, actor_ref=kwargs["principal"].audit_actor,
+        )
+        return replace(
+            event, source_event_id=received.source_event_id,
+            reason_code=received.reason_code,
+            idempotency_ref=key_ref, command_ref=command_ref,
+        )
+
+    writer.apply = misconfigured_writer
+    response = client.post(
+        url("create"), json=body(key="a" * 32), headers=token(),
+    )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "case transition unavailable"}
+    assert "revision" not in response.json()
+    assert any(e.reason == "case_transition_unavailable" for e in audit.events)
+    # Synthetic writer already committed its original event. An HTTP guard
+    # can reject a false success response but cannot undo writer side effects.
+    assert len(writer.history[CASE]) == 1
 
 
 def test_writer_missing_assignee_response_does_not_claim_success(wired):
