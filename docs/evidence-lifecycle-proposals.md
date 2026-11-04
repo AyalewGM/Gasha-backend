@@ -13,3 +13,22 @@ The new lifecycle object reconstructs a frozen, packet-digest-bound sequence of 
 - Bank-specific installation permission, reviewer accreditation, independent-human approval, security/privacy/compliance vetoes, bank inline authorization, concurrent DB races, credential revocation, installed proxy/IdP verification and CBE acceptance are **out of scope**. The module never produces ready, enforcement_activated or bank release authority.
 
 This draft is an implementation of bounded domain transition guards against merged, inert #67; it grants no Bank authority. Full Issue #49 remains blocked; PO → Security/Architecture → Independent QA → Unified Lead must review the exact SHA before inactive internal integration. Previously merged PRs #52/#53 are untouched.
+
+
+## Transition replay type-integrity hardening (bounded #49 follow-up)
+
+The history replay path reconstructs every retained `EvidenceTransition`
+before evaluating any action. A frozen Python dataclass is not a trust boundary:
+`object.__setattr__` can replace a typed action with its equal raw `StrEnum`
+string (for example `"verify"`), or replace the clock/actor/digest/UUID,
+and `object.__delattr__` can remove a required attribute. Without revalidation,
+the raw string compared equal in a membership test but failed the enum identity
+branches, allowing an invalid transition to be interpreted as a revocation.
+The corrected replay rejects those histories before proposal or artifact access.
+Regression tests cover malformed/deleted fields and an unchanged valid lifecycle.
+
+This is **only** a defensive check of caller-supplied, in-process synthetic
+transition history. It authenticates neither principals nor artifacts and does
+not provide a trusted append-only ledger, independent verification, Bank
+approval, or readiness decision. No changes to merged #54, #52, #53, API,
+database, Kafka, frontend, shadow operation, payments or enforcement.

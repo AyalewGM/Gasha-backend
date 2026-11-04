@@ -14,7 +14,7 @@ from gasha.poc.evidence_identity import (
     EvidenceRecord,
     assert_packet_current,
 )
-from gasha.poc.evidence_lifecycle import EvidenceLifecycle
+from gasha.poc.evidence_lifecycle import EvidenceLifecycle, LifecycleRejected
 from gasha.poc.readiness import EvidenceArea, Stage
 
 NOW = datetime(2026, 10, 31, 20, 0, tzinfo=UTC)
@@ -406,5 +406,5 @@ def test_mutated_empty_packet_never_becomes_approvable_empty_lifecycle() -> None
     """An emptied packet must fail replay, not satisfy an all-records-verified check."""
     sample = packet()
     object.__setattr__(sample, "records", ())
-    with pytest.raises(EvidenceIdentityRejected, match="nonempty"):
+    with pytest.raises(LifecycleRejected, match="invalid evidence packet"):
         EvidenceLifecycle(sample)
