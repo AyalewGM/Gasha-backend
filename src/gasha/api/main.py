@@ -17,15 +17,17 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from starlette._utils import get_route_path
 
 from gasha.cases.timeline import (
     BankExecution,
+    CaseConflict,
     CaseDisposition,
     CaseEvent,
     CaseOperation,
     CaseReason,
+    CaseRejected,
     validate_case_history,
 )
 from gasha.decision.mode import DecisionEnvelope, ModeAwareDecisionService
@@ -185,11 +187,70 @@ class TrustedCaseHistoryReader(Protocol):
     ) -> tuple[CaseEvent, ...]: ...
 
 
+
+class TrustedCaseTransitionWriter(Protocol):
+    """Explicitly installed #45 atomic case + terminal-audit writer.
+
+    Must resolve a tenant-bound, immutable evaluation and any proposed assignee
+    through server-owned authority, revalidate the principal at the transaction
+    boundary, serialize expected revisions, and commit the case event and
+    redacted terminal audit atomically. Request selectors confer no authority.
+    The default bank-facing app deliberately installs no writer.
+    """
+
+    def apply(
+        self, *, principal: TrustedPrincipal, tenant_id: str, case_id: UUID,
+        operation: CaseOperation, proposal: CaseTransitionInput, at: datetime,
+    ) -> CaseEvent: ...
+
+
 class TrustedDecisionRequest(BaseModel):
     """Only transaction facts are accepted; policy, risk and mode are forbidden."""
 
     model_config = ConfigDict(extra="forbid")
     transaction: CanonicalTransaction
+
+
+
+class CaseTransitionInput(BaseModel):
+    """Only proposed state, never trusted principal, tenant, source or assignee."""
+
+    model_config = ConfigDict(extra="forbid")
+    source_event_id: UUID
+    expected_revision: int = Field(ge=0, strict=True)
+    idempotency_key: str = Field(pattern=r"^[0-9a-f]{32}$")
+    reason_code: CaseReason
+    disposition: CaseDisposition | None = None
+    # A request selector: the installed writer must independently resolve it
+    # to an authorized tenant-scoped assignee before constructing CaseCommand.
+    assignee_selector: UUID | None = None
+
+
+_CASE_TRANSITION_CAPABILITIES: dict[CaseOperation, Capability] = {
+    CaseOperation.CREATE: Capability.CASE_CREATE,
+    CaseOperation.TRIAGE: Capability.CASE_TRIAGE,
+    CaseOperation.ASSIGN: Capability.CASE_ASSIGN,
+    CaseOperation.DISPOSE: Capability.CASE_DISPOSITION,
+    CaseOperation.CORRECT: Capability.CASE_CORRECT,
+    CaseOperation.RECONCILE: Capability.CASE_FEEDBACK,
+}
+
+_CASE_TRANSITION_REASONS: dict[CaseOperation, frozenset[CaseReason]] = {
+    CaseOperation.CREATE: frozenset({CaseReason.SOURCE_EVALUATION}),
+    CaseOperation.TRIAGE: frozenset({CaseReason.ANALYST_TRIAGE}),
+    CaseOperation.ASSIGN: frozenset({CaseReason.INVESTIGATION_ASSIGNED}),
+    CaseOperation.DISPOSE: frozenset({
+        CaseReason.FRAUD_EVIDENCE, CaseReason.LEGITIMATE_EVIDENCE,
+        CaseReason.NEEDS_REVIEW,
+    }),
+    CaseOperation.CORRECT: frozenset({CaseReason.CORRECTED_FINDING}),
+    CaseOperation.RECONCILE: frozenset({CaseReason.FEEDBACK_RECONCILED}),
+}
+_CASE_DISPOSITION_REASONS: dict[CaseDisposition, CaseReason] = {
+    CaseDisposition.FRAUD: CaseReason.FRAUD_EVIDENCE,
+    CaseDisposition.LEGITIMATE: CaseReason.LEGITIMATE_EVIDENCE,
+    CaseDisposition.UNRESOLVED: CaseReason.NEEDS_REVIEW,
+}
 
 
 # Only /health/live and /health/ready are intentionally public. The default
@@ -210,6 +271,8 @@ app.state.decision_context_provider = None
 app.state.outcome_ingestion = None
 # No bank case reader is installed by default; the endpoint fails closed.
 app.state.case_history_reader = None
+# No case mutation can be enabled by request flags or a frontend role.
+app.state.case_transition_writer = None
 
 
 @app.middleware("http")
@@ -493,6 +556,108 @@ def get_case_history(
     return {
         "case_id": str(case_id),
         "events": events,
+        "enforcement_activated": False,
+    }
+
+
+
+@app.post("/v1/tenants/{tenant_id}/cases/{case_id}/transitions/{operation}")
+def submit_case_transition(
+    tenant_id: str,
+    case_id: UUID,
+    operation: str,
+    proposal: CaseTransitionInput,
+    request: Request,
+    principal: Annotated[TrustedPrincipal, Depends(get_principal)],
+) -> dict[str, object]:
+    """Bounded protected #45 ingress; no writer or Bank mutation by default.
+
+    The installed writer, not this HTTP function, owns the atomic transition +
+    redacted terminal audit. We MUST NOT append a nontransactional success audit
+    after a commit: if that audit failed, a successful write could return 503.
+    The ingress authorization audit executes before the writer is consulted.
+    """
+    try:
+        selected = CaseOperation(operation)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="case operation not found") from exc
+    action = _CASE_TRANSITION_CAPABILITIES[selected]
+    _require_action(request, principal, tenant_id, action, event_id=case_id)
+    valid_shape = (
+        proposal.reason_code in _CASE_TRANSITION_REASONS[selected]
+        and (proposal.assignee_selector is not None) == (selected is CaseOperation.ASSIGN)
+        and (proposal.disposition is not None)
+        == (selected in {CaseOperation.DISPOSE, CaseOperation.CORRECT})
+        and (
+            selected is not CaseOperation.DISPOSE
+            or _CASE_DISPOSITION_REASONS.get(proposal.disposition) is proposal.reason_code
+        )
+    )
+    if not valid_shape:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action, "denied",
+            "invalid_case_transition",
+        )
+        raise HTTPException(status_code=422, detail="invalid case transition")
+    writer: TrustedCaseTransitionWriter | None = getattr(
+        request.app.state, "case_transition_writer", None
+    )
+    if writer is None:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action,
+            "failed", "case_transition_unavailable",
+        )
+        raise HTTPException(status_code=503, detail="case transition unavailable")
+    try:
+        event = writer.apply(
+            principal=principal, tenant_id=tenant_id, case_id=case_id,
+            operation=selected, proposal=proposal, at=utcnow(),
+        )
+    except CaseConflict as exc:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action,
+            "rejected", "case_revision_conflict",
+        )
+        raise HTTPException(status_code=409, detail="case revision conflict") from exc
+    except AuthorizationRejected as exc:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action,
+            "denied", "case_reference_denied",
+        )
+        raise HTTPException(status_code=404, detail="case not found") from exc
+    except Exception as exc:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action,
+            "failed", "case_transition_unavailable",
+        )
+        raise HTTPException(status_code=503, detail="case transition unavailable") from exc
+    # Defense in depth against an incorrectly installed writer. This is *not*
+    # an attestation of its DB roles, event provenance or atomic commit.
+    if (
+        type(event) is not CaseEvent
+        or event.tenant_id != tenant_id
+        or event.case_id != case_id
+        or event.source_event_id != proposal.source_event_id
+        or event.operation is not selected
+        or event.revision != proposal.expected_revision + 1
+        or event.reason_code is not proposal.reason_code
+        or event.disposition is not proposal.disposition
+        or event.actor_ref != principal.audit_actor
+        or event.bank_execution is not BankExecution.UNKNOWN
+    ):
+        _operation_audit(
+            request, principal, tenant_id, case_id, action,
+            "failed", "case_transition_unavailable",
+        )
+        raise HTTPException(status_code=503, detail="case transition unavailable")
+    # The writer owns the terminal success audit in the *same transaction*.
+    return {
+        "case_id": str(event.case_id),
+        "source_event_id": str(event.source_event_id),
+        "revision": event.revision,
+        "operation": event.operation.value,
+        "disposition": event.disposition.value if event.disposition else None,
+        "bank_execution": BankExecution.UNKNOWN.value,
         "enforcement_activated": False,
     }
 
