@@ -21,12 +21,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette._utils import get_route_path
 
 from gasha.cases.timeline import (
+    AuthorizedAssignee,
     BankExecution,
+    CaseCommand,
     CaseConflict,
     CaseDisposition,
     CaseEvent,
     CaseOperation,
     CaseReason,
+    case_command_fingerprints,
     validate_case_history,
 )
 from gasha.decision.mode import DecisionEnvelope, ModeAwareDecisionService
@@ -560,6 +563,85 @@ def get_case_history(
 
 
 
+def _validated_case_transition_result(
+    event: object, *, tenant_id: str, case_id: UUID,
+    selected: CaseOperation, proposal: CaseTransitionInput,
+    principal: TrustedPrincipal,
+) -> CaseEvent:
+    """Bounded defense against malformed writer success claims.
+
+    This checks the full event *shape* and the proposal-bound fingerprints,
+    matching the single-event invariants of validate_case_history. It cannot
+    prove preexisting-case history, immutable Bank provenance, authorized
+    assignee resolution or atomic DB + terminal-audit commit: those remain the
+    separately accepted responsibilities of the server-installed writer.
+    """
+    if type(event) is not CaseEvent:
+        raise ValueError("typed case event required")
+    # Accessing any deleted attribute raises; the caller must map all invalid
+    # writer responses to a redacted 503, never an uncontrolled exception.
+    if (
+        type(event.tenant_id) is not str
+        or event.tenant_id != tenant_id
+        or type(event.case_id) is not UUID
+        or event.case_id != case_id
+        or type(event.source_event_id) is not UUID
+        or event.source_event_id != proposal.source_event_id
+        or type(event.source_context_ref) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", event.source_context_ref) is None
+        or type(event.revision) is not int
+        or event.revision != proposal.expected_revision + 1
+        or (event.previous_revision is not None
+            and type(event.previous_revision) is not int)
+        or event.previous_revision != (
+            proposal.expected_revision if proposal.expected_revision else None
+        )
+        or type(event.operation) is not CaseOperation
+        or event.operation is not selected
+        or type(event.actor_ref) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", event.actor_ref) is None
+        or event.actor_ref != principal.audit_actor
+        or type(event.recorded_at) is not datetime
+        or event.recorded_at.utcoffset() is None
+        or type(event.reason_code) is not CaseReason
+        or event.reason_code is not proposal.reason_code
+        or (event.disposition is not None
+            and type(event.disposition) is not CaseDisposition)
+        or event.disposition is not proposal.disposition
+        or (event.assignee_ref is not None
+            and (type(event.assignee_ref) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", event.assignee_ref) is None))
+        or (event.assignee_ref is None) == (selected is CaseOperation.ASSIGN)
+        or type(event.idempotency_ref) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", event.idempotency_ref) is None
+        or type(event.command_ref) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", event.command_ref) is None
+        or event.bank_execution is not BankExecution.UNKNOWN
+    ):
+        raise ValueError("malformed case transition result")
+    # The assignee reference comes from the writer's result, not the request.
+    # This verifies hash consistency but does not attest assignee authority.
+    assignee = (
+        AuthorizedAssignee(tenant_id, event.assignee_ref)
+        if selected is CaseOperation.ASSIGN and event.assignee_ref is not None
+        else None
+    )
+    command = CaseCommand(
+        tenant_id=tenant_id, case_id=case_id,
+        source_event_id=proposal.source_event_id,
+        operation=selected, expected_revision=proposal.expected_revision,
+        idempotency_key=proposal.idempotency_key,
+        reason_code=proposal.reason_code,
+        disposition=proposal.disposition, assignee=assignee,
+    )
+    key_ref, command_ref = case_command_fingerprints(
+        command, actor_ref=principal.audit_actor,
+    )
+    if event.idempotency_ref != key_ref or event.command_ref != command_ref:
+        raise ValueError("case transition fingerprint mismatch")
+    return event
+
+
 @app.post("/v1/tenants/{tenant_id}/cases/{case_id}/transitions/{operation}")
 def submit_case_transition(
     tenant_id: str,
@@ -630,25 +712,20 @@ def submit_case_transition(
             "failed", "case_transition_unavailable",
         )
         raise HTTPException(status_code=503, detail="case transition unavailable") from exc
-    # Defense in depth against an incorrectly installed writer. This is *not*
-    # an attestation of its DB roles, event provenance or atomic commit.
-    if (
-        type(event) is not CaseEvent
-        or event.tenant_id != tenant_id
-        or event.case_id != case_id
-        or event.source_event_id != proposal.source_event_id
-        or event.operation is not selected
-        or event.revision != proposal.expected_revision + 1
-        or event.reason_code is not proposal.reason_code
-        or event.disposition is not proposal.disposition
-        or event.actor_ref != principal.audit_actor
-        or event.bank_execution is not BankExecution.UNKNOWN
-    ):
+    # A malformed/missing writer event must never return HTTP 200.
+    try:
+        event = _validated_case_transition_result(
+            event, tenant_id=tenant_id, case_id=case_id,
+            selected=selected, proposal=proposal, principal=principal,
+        )
+    except Exception as exc:
         _operation_audit(
             request, principal, tenant_id, case_id, action,
             "failed", "case_transition_unavailable",
         )
-        raise HTTPException(status_code=503, detail="case transition unavailable")
+        raise HTTPException(
+            status_code=503, detail="case transition unavailable",
+        ) from exc
     # The writer owns the terminal success audit in the *same transaction*.
     return {
         "case_id": str(event.case_id),
