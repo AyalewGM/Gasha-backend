@@ -14,8 +14,8 @@ from gasha.api.main import app, get_principal
 from gasha.cases.timeline import (
     AuthorizedAssignee,
     BankExecution,
-    CaseDisposition,
     CaseCommand,
+    CaseDisposition,
     CaseEvent,
     CaseOperation,
     VerifiedEvaluation,
