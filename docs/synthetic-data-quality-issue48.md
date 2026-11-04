@@ -76,3 +76,16 @@ This is conservative synthetic cohort-integrity instrumentation, not Bank
 label arbitration, Bank provenance, an immutable dataset, historical replay
 binding, verified readiness or KPI permission. #54 stays advisory and #49
 remains untrusted pending an installed evidence/approval authority.
+
+## Type-aware nested same-ID identity — finite #48 QA correction
+
+The accepted-claim identity is now a deterministic, strict, typed in-memory
+tree. Nested `bool` is distinct from `int` (including `True/1` and
+`False/0`), strings, floats, decimals, null, lists, tuples, and mappings.
+Only built-in supported values and string mapping keys are accepted. Clocks
+remain UTC-normalized; otherwise different material representations are
+conservatively treated as contradictions unless a field contract explicitly
+authorizes normalization. Non-finite, opaque or overly nested values fail
+closed with the fixed `invalid.cohort_identity` check; they cannot poison a
+valid same-ID row. No raw cohort identity, nested value or identifier is
+serialized. This remains synthetic inspection, not Bank source adjudication.

@@ -850,3 +850,78 @@ def test_invalid_collision_cannot_quarantine_valid_observation() -> None:
     assert row["accepted"] == 1 and row["rejected"] == 1
     assert row["checks"] == {"invalid.amount": 1}
     assert "conflicting.event_id" not in row["checks"]
+
+
+@pytest.mark.parametrize("first, second", [
+    (True, 1), (False, 0), (1, True), (0, False),
+    ("1", 1), (1, "1"), (None, 0), (0, None),
+    (1.0, 1), (1, 1.0),
+])
+def test_same_uuid_heterogeneous_signal_claims_are_order_independent(
+    first: object, second: object,
+) -> None:
+    """Python True == 1 must never hide an optional-signal disagreement."""
+    original = candidate(
+        "type-conflict", label=True, confirmed_at=AT + timedelta(days=1),
+        alerted=True, payload_changes={"intelligence": {"beneficiary_risk": first}},
+    )
+    other_payload = dict(original.event.payload)
+    other_payload["intelligence"] = {"beneficiary_risk": second}
+    rival = replace(original, event=original.event.model_copy(
+        update={"payload": other_payload},
+    ))
+    forward = inspect_reference_quality(scope(), (original, rival)).to_dict()
+    reverse = inspect_reference_quality(scope(), (rival, original)).to_dict()
+    assert forward == reverse
+    row = forward["use_cases"][0]
+    assert row["total"] == 2 and row["accepted"] == 0 and row["rejected"] == 2
+    assert row["checks"]["conflicting.event_id"] == 2
+    assert row["labels"] == {"positive": 0, "negative": 0, "unlabelled": 0}
+    assert row["alerts"] == {"alerted": 0, "not_alerted": 0, "unknown": 0}
+    for coverage in row["optional_signals"].values():
+        assert coverage["available"]["count"] == 0
+        assert coverage["available"]["denominator"] == 0
+        assert coverage["unavailable"] == 0
+    exported = json.dumps(forward, allow_nan=False)
+    for sensitive in (str(original.event.payload["event_id"]),
+                      "synthetic-beneficiary-secret",
+                      "synthetic-customer-secret", "synthetic-account-secret"):
+        assert sensitive not in exported
+    assert forward["bank_data_verified"] is False
+    assert forward["readiness_authorized"] is False
+    assert forward["enforcement_activated"] is False
+
+
+def test_nested_heterogeneous_claims_do_not_use_python_equality() -> None:
+    original = candidate(
+        "nested-type-conflict",
+        payload_changes={"intelligence": {
+            "beneficiary_risk": 0.6, "auxiliary": {"risk": True},
+        }},
+    )
+    other_payload = dict(original.event.payload)
+    other_payload["intelligence"] = {
+        "beneficiary_risk": 0.6, "auxiliary": {"risk": 1},
+    }
+    rival = replace(original, event=original.event.model_copy(
+        update={"payload": other_payload},
+    ))
+    assert result_for(original, rival) == result_for(rival, original)
+    row = result_for(original, rival)
+    assert row["checks"]["conflicting.event_id"] == 2
+    assert row["accepted"] == 0
+
+
+def test_unsupported_opaque_nested_identity_is_rejected_not_compared() -> None:
+    valid = candidate("unsupported-identity", payload_changes={
+        "intelligence": {"beneficiary_risk": 0.5},
+    })
+    payload = dict(valid.event.payload)
+    payload["opaque_extra"] = object()
+    malformed = replace(valid, event=valid.event.model_copy(
+        update={"payload": payload},
+    ))
+    row = result_for(valid, malformed)
+    assert row["accepted"] == 1 and row["rejected"] == 1
+    assert row["checks"] == {"invalid.cohort_identity": 1}
+    assert row["optional_signals"]["beneficiary_risk"]["available"]["count"] == 1

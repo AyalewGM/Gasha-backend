@@ -345,6 +345,48 @@ class DataQualityReport:
 
 
 
+
+def _typed_cohort_value(value: object, *, depth: int = 0) -> tuple[object, ...]:
+    """Build a strict, ephemeral identity without Python's bool/int equality.
+
+    Only built-in reference-data types are permitted. All nested mapping keys
+    are string-typed and sorted, and no raw values enter aggregate reports.
+    Unsupported objects, non-finite numbers and excessive nesting fail closed.
+    """
+    if depth > 32:
+        raise ValueError("cohort identity nesting limit exceeded")
+    if value is None:
+        return ("null",)
+    if type(value) is bool:
+        return ("bool", value)
+    if type(value) is str:
+        return ("string", value)
+    if type(value) is int:
+        return ("integer", value)
+    if type(value) is float:
+        if not isfinite(value):
+            raise ValueError("non-finite cohort numeric value")
+        return ("float", repr(value))
+    if type(value) is Decimal:
+        if not value.is_finite():
+            raise ValueError("non-finite cohort decimal value")
+        return ("decimal", str(value))
+    if type(value) is datetime:
+        return ("utc_datetime", _utc(value).isoformat())
+    if type(value) is dict:
+        if any(type(key) is not str for key in value):
+            raise ValueError("non-string cohort mapping key")
+        return ("mapping", tuple(
+            (key, _typed_cohort_value(value[key], depth=depth + 1))
+            for key in sorted(value)
+        ))
+    if type(value) is list or type(value) is tuple:
+        return (("list" if type(value) is list else "tuple"), tuple(
+            _typed_cohort_value(item, depth=depth + 1) for item in value
+        ))
+    raise ValueError("unsupported cohort identity value")
+
+
 def _accepted_cohort_identity(
     observation: QualityObservation, result: _Result
 ) -> tuple[object, ...]:
@@ -362,7 +404,7 @@ def _accepted_cohort_identity(
         raise ValueError("accepted identity requires validated label clock")
     payload = dict(observation.event.payload)
     payload["occurred_at"] = occurred
-    return (
+    return _typed_cohort_value((
         observation.event.tenant_id,
         observation.event.source_system,
         observation.event.schema_version,
@@ -372,16 +414,7 @@ def _accepted_cohort_identity(
         observation.confirmed_fraud,
         _utc(confirmed) if confirmed is not None else None,
         observation.alerted,
-    )
-
-
-def _same_cohort_identity(left: tuple[object, ...], right: tuple[object, ...]) -> bool:
-    """Opaque payload comparisons that cannot be established fail closed."""
-    try:
-        equal = left == right
-    except (TypeError, ValueError, AttributeError):
-        return False
-    return type(equal) is bool and equal
+    ))
 
 
 def inspect_reference_quality(
@@ -419,10 +452,18 @@ def inspect_reference_quality(
         inspected.append((observation, check))
         if not check.failed_checks and check.event_id is not None:
             key = (observation.use_case, check.event_id)
-            claim = _accepted_cohort_identity(observation, check)
+            try:
+                claim = _accepted_cohort_identity(observation, check)
+            except (ValueError, TypeError, OverflowError, RecursionError):
+                # Opaque or malformed nested data cannot be compared safely.
+                # Quarantine this claim without poisoning a valid same-ID row.
+                inspected[-1] = (observation, replace(
+                    check, failed_checks=("invalid.cohort_identity",),
+                ))
+                continue
             if key not in first_claims:
                 first_claims[key] = claim
-            elif not _same_cohort_identity(first_claims[key], claim):
+            elif first_claims[key] != claim:
                 conflicting_ids.add(key)
     seen: set[tuple[UseCase, UUID]] = set()
     for observation, check in inspected:
