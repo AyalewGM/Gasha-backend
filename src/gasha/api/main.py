@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Annotated, NoReturn, Protocol
@@ -17,15 +17,19 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from starlette._utils import get_route_path
 
 from gasha.cases.timeline import (
+    AuthorizedAssignee,
     BankExecution,
+    CaseCommand,
+    CaseConflict,
     CaseDisposition,
     CaseEvent,
     CaseOperation,
     CaseReason,
+    case_command_fingerprints,
     validate_case_history,
 )
 from gasha.decision.mode import DecisionEnvelope, ModeAwareDecisionService
@@ -185,11 +189,74 @@ class TrustedCaseHistoryReader(Protocol):
     ) -> tuple[CaseEvent, ...]: ...
 
 
+
+class TrustedCaseTransitionWriter(Protocol):
+    """Explicitly installed #45 atomic case + terminal-audit writer.
+
+    Must resolve a tenant-bound, immutable evaluation and any proposed assignee
+    through server-owned authority, revalidate the principal at the transaction
+    boundary, serialize expected revisions, and commit the case event and
+    redacted terminal audit atomically. Request selectors confer no authority.
+    The default bank-facing app deliberately installs no writer.
+    """
+
+    def apply(
+        self, *, principal: TrustedPrincipal, tenant_id: str, case_id: UUID,
+        operation: CaseOperation, proposal: CaseTransitionInput, at: datetime,
+    ) -> CaseEvent: ...
+
+
 class TrustedDecisionRequest(BaseModel):
     """Only transaction facts are accepted; policy, risk and mode are forbidden."""
 
     model_config = ConfigDict(extra="forbid")
     transaction: CanonicalTransaction
+
+
+
+class CaseTransitionInput(BaseModel):
+    """Only proposed state, never trusted principal, tenant, source or assignee.
+
+    All fields are immutable primitives/enums/UUIDs; freeze after validation.
+    The installed writer receives a separate copy, not the HTTP guard snapshot.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    source_event_id: UUID
+    expected_revision: int = Field(ge=0, strict=True)
+    idempotency_key: str = Field(pattern=r"^[0-9a-f]{32}$")
+    reason_code: CaseReason
+    disposition: CaseDisposition | None = None
+    # A request selector: the installed writer must independently resolve it
+    # to an authorized tenant-scoped assignee before constructing CaseCommand.
+    assignee_selector: UUID | None = None
+
+
+_CASE_TRANSITION_CAPABILITIES: dict[CaseOperation, Capability] = {
+    CaseOperation.CREATE: Capability.CASE_CREATE,
+    CaseOperation.TRIAGE: Capability.CASE_TRIAGE,
+    CaseOperation.ASSIGN: Capability.CASE_ASSIGN,
+    CaseOperation.DISPOSE: Capability.CASE_DISPOSITION,
+    CaseOperation.CORRECT: Capability.CASE_CORRECT,
+    CaseOperation.RECONCILE: Capability.CASE_FEEDBACK,
+}
+
+_CASE_TRANSITION_REASONS: dict[CaseOperation, frozenset[CaseReason]] = {
+    CaseOperation.CREATE: frozenset({CaseReason.SOURCE_EVALUATION}),
+    CaseOperation.TRIAGE: frozenset({CaseReason.ANALYST_TRIAGE}),
+    CaseOperation.ASSIGN: frozenset({CaseReason.INVESTIGATION_ASSIGNED}),
+    CaseOperation.DISPOSE: frozenset({
+        CaseReason.FRAUD_EVIDENCE, CaseReason.LEGITIMATE_EVIDENCE,
+        CaseReason.NEEDS_REVIEW,
+    }),
+    CaseOperation.CORRECT: frozenset({CaseReason.CORRECTED_FINDING}),
+    CaseOperation.RECONCILE: frozenset({CaseReason.FEEDBACK_RECONCILED}),
+}
+_CASE_DISPOSITION_REASONS: dict[CaseDisposition, CaseReason] = {
+    CaseDisposition.FRAUD: CaseReason.FRAUD_EVIDENCE,
+    CaseDisposition.LEGITIMATE: CaseReason.LEGITIMATE_EVIDENCE,
+    CaseDisposition.UNRESOLVED: CaseReason.NEEDS_REVIEW,
+}
 
 
 # Only /health/live and /health/ready are intentionally public. The default
@@ -210,6 +277,8 @@ app.state.decision_context_provider = None
 app.state.outcome_ingestion = None
 # No bank case reader is installed by default; the endpoint fails closed.
 app.state.case_history_reader = None
+# No case mutation can be enabled by request flags or a frontend role.
+app.state.case_transition_writer = None
 
 
 @app.middleware("http")
@@ -493,6 +562,196 @@ def get_case_history(
     return {
         "case_id": str(case_id),
         "events": events,
+        "enforcement_activated": False,
+    }
+
+
+
+def _validated_case_transition_result(
+    event: object, *, tenant_id: str, case_id: UUID,
+    selected: CaseOperation, proposal: CaseTransitionInput,
+    accepted_actor_ref: str,
+) -> CaseEvent:
+    """Bounded defense against malformed writer success claims.
+
+    This checks the full event *shape* and the proposal-bound fingerprints,
+    matching the single-event invariants of validate_case_history. It cannot
+    prove preexisting-case history, immutable Bank provenance, authorized
+    assignee resolution or atomic DB + terminal-audit commit: those remain the
+    separately accepted responsibilities of the server-installed writer.
+    """
+    if type(event) is not CaseEvent:
+        raise ValueError("typed case event required")
+    # Accessing any deleted attribute raises; the caller must map all invalid
+    # writer responses to a redacted 503, never an uncontrolled exception.
+    if (
+        type(event.tenant_id) is not str
+        or event.tenant_id != tenant_id
+        or type(event.case_id) is not UUID
+        or event.case_id != case_id
+        or type(event.source_event_id) is not UUID
+        or event.source_event_id != proposal.source_event_id
+        or type(event.source_context_ref) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", event.source_context_ref) is None
+        or type(event.revision) is not int
+        or event.revision != proposal.expected_revision + 1
+        or (event.previous_revision is not None
+            and type(event.previous_revision) is not int)
+        or event.previous_revision != (
+            proposal.expected_revision if proposal.expected_revision else None
+        )
+        or type(event.operation) is not CaseOperation
+        or event.operation is not selected
+        or type(event.actor_ref) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", event.actor_ref) is None
+        or event.actor_ref != accepted_actor_ref
+        or type(event.recorded_at) is not datetime
+        or event.recorded_at.utcoffset() is None
+        or type(event.reason_code) is not CaseReason
+        or event.reason_code not in _CASE_TRANSITION_REASONS[selected]
+        or event.reason_code is not proposal.reason_code
+        or (event.disposition is not None
+            and type(event.disposition) is not CaseDisposition)
+        or event.disposition is not proposal.disposition
+        or ((event.disposition is not None)
+            != (selected in {CaseOperation.DISPOSE, CaseOperation.CORRECT}))
+        or (selected is CaseOperation.DISPOSE and (
+            event.disposition is None
+            or _CASE_DISPOSITION_REASONS[event.disposition] is not event.reason_code
+        ))
+        or (event.assignee_ref is not None
+            and (type(event.assignee_ref) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", event.assignee_ref) is None))
+        or (event.assignee_ref is None) == (selected is CaseOperation.ASSIGN)
+        or type(event.idempotency_ref) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", event.idempotency_ref) is None
+        or type(event.command_ref) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", event.command_ref) is None
+        or event.bank_execution is not BankExecution.UNKNOWN
+    ):
+        raise ValueError("malformed case transition result")
+    # The assignee reference comes from the writer's result, not the request.
+    # This verifies hash consistency but does not attest assignee authority.
+    assignee = (
+        AuthorizedAssignee(tenant_id, event.assignee_ref)
+        if selected is CaseOperation.ASSIGN and event.assignee_ref is not None
+        else None
+    )
+    command = CaseCommand(
+        tenant_id=tenant_id, case_id=case_id,
+        source_event_id=proposal.source_event_id,
+        operation=selected, expected_revision=proposal.expected_revision,
+        idempotency_key=proposal.idempotency_key,
+        reason_code=proposal.reason_code,
+        disposition=proposal.disposition, assignee=assignee,
+    )
+    key_ref, command_ref = case_command_fingerprints(
+        command, actor_ref=accepted_actor_ref,
+    )
+    if event.idempotency_ref != key_ref or event.command_ref != command_ref:
+        raise ValueError("case transition fingerprint mismatch")
+    return event
+
+
+@app.post("/v1/tenants/{tenant_id}/cases/{case_id}/transitions/{operation}")
+def submit_case_transition(
+    tenant_id: str,
+    case_id: UUID,
+    operation: str,
+    proposal: CaseTransitionInput,
+    request: Request,
+    principal: Annotated[TrustedPrincipal, Depends(get_principal)],
+) -> dict[str, object]:
+    """Bounded protected #45 ingress; no writer or Bank mutation by default.
+
+    The installed writer, not this HTTP function, owns the atomic transition +
+    redacted terminal audit. We MUST NOT append a nontransactional success audit
+    after a commit: if that audit failed, a successful write could return 503.
+    The ingress authorization audit executes before the writer is consulted.
+    """
+    try:
+        selected = CaseOperation(operation)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="case operation not found") from exc
+    action = _CASE_TRANSITION_CAPABILITIES[selected]
+    _require_action(request, principal, tenant_id, action, event_id=case_id)
+    valid_shape = (
+        proposal.reason_code in _CASE_TRANSITION_REASONS[selected]
+        and (proposal.assignee_selector is not None) == (selected is CaseOperation.ASSIGN)
+        and (proposal.disposition is not None)
+        == (selected in {CaseOperation.DISPOSE, CaseOperation.CORRECT})
+        and (
+            selected is not CaseOperation.DISPOSE
+            or (proposal.disposition is not None and _CASE_DISPOSITION_REASONS[proposal.disposition] is proposal.reason_code)
+        )
+    )
+    if not valid_shape:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action, "denied",
+            "invalid_case_transition",
+        )
+        raise HTTPException(status_code=422, detail="invalid case transition")
+    # Preserve an immutable, detached copy of the exact validated HTTP command.
+    # An installed writer may be misconfigured or bypass model immutability;
+    # neither its argument nor any returned hash may rewrite this reference.
+    accepted_proposal = proposal.model_copy(deep=True)
+    # Bind response validation to the actor authenticated before writer entry.
+    accepted_actor_ref = principal.audit_actor
+    writer: TrustedCaseTransitionWriter | None = getattr(
+        request.app.state, "case_transition_writer", None
+    )
+    if writer is None:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action,
+            "failed", "case_transition_unavailable",
+        )
+        raise HTTPException(status_code=503, detail="case transition unavailable")
+    try:
+        event = writer.apply(
+            principal=replace(principal), tenant_id=tenant_id, case_id=case_id,
+            operation=selected, proposal=proposal.model_copy(deep=True), at=utcnow(),
+        )
+    except CaseConflict as exc:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action,
+            "rejected", "case_revision_conflict",
+        )
+        raise HTTPException(status_code=409, detail="case revision conflict") from exc
+    except AuthorizationRejected as exc:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action,
+            "denied", "case_reference_denied",
+        )
+        raise HTTPException(status_code=404, detail="case not found") from exc
+    except Exception as exc:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action,
+            "failed", "case_transition_unavailable",
+        )
+        raise HTTPException(status_code=503, detail="case transition unavailable") from exc
+    # A malformed/missing writer event must never return HTTP 200.
+    try:
+        event = _validated_case_transition_result(
+            event, tenant_id=tenant_id, case_id=case_id,
+            selected=selected, proposal=accepted_proposal,
+            accepted_actor_ref=accepted_actor_ref,
+        )
+    except Exception as exc:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action,
+            "failed", "case_transition_unavailable",
+        )
+        raise HTTPException(
+            status_code=503, detail="case transition unavailable",
+        ) from exc
+    # The writer owns the terminal success audit in the *same transaction*.
+    return {
+        "case_id": str(event.case_id),
+        "source_event_id": str(event.source_event_id),
+        "revision": event.revision,
+        "operation": event.operation.value,
+        "disposition": event.disposition.value if event.disposition else None,
+        "bank_execution": BankExecution.UNKNOWN.value,
         "enforcement_activated": False,
     }
 
