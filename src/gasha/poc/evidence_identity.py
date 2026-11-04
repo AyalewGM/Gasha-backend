@@ -7,7 +7,7 @@ matching digest is NOT evidence of provenance, approval or Bank authorization.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from json import dumps
@@ -189,18 +189,47 @@ class EvidencePacket:
             ids.add(record.evidence_id)
 
     def packet_digest(self) -> str:
-        """Content fingerprint only; caller assertions cannot become trusted authority."""
+        """Content fingerprint only; reject corrupted nested runtime values first."""
+        checked = _revalidated_packet(self)
         identity: dict[str, object] = {
             "domain": "gasha-evidence-packet-identity-v1",
-            "binding": self.binding._identity(),
-            "evaluator_version": self.evaluator_version,
+            "binding": checked.binding._identity(),
+            "evaluator_version": checked.evaluator_version,
             "records": [
                 record._identity()
-                for record in sorted(self.records, key=lambda entry: entry.evidence_id.int)
+                for record in sorted(checked.records, key=lambda entry: entry.evidence_id.int)
             ],
         }
         payload = dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return "sha256:" + sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _revalidated_binding(value: EvidenceBinding) -> EvidenceBinding:
+    """Re-run construction checks; frozen instances may be mutated via object.__setattr__."""
+    if type(value) is not EvidenceBinding:
+        raise EvidenceIdentityRejected("typed evidence binding required")
+    try:
+        return replace(value)
+    except AttributeError:
+        raise EvidenceIdentityRejected("missing evidence binding attribute") from None
+
+
+def _revalidated_packet(packet: EvidencePacket) -> EvidencePacket:
+    """Validate nested shape before fingerprint or freshness; this does not attest origin."""
+    if type(packet) is not EvidencePacket:
+        raise EvidenceIdentityRejected("typed packet required")
+    try:
+        if type(packet.records) is not tuple:
+            raise EvidenceIdentityRejected("records must be a nonempty immutable tuple")
+        scope = _revalidated_binding(packet.binding)
+        records: list[EvidenceRecord] = []
+        for record in packet.records:
+            if type(record) is not EvidenceRecord:
+                raise EvidenceIdentityRejected("records must contain EvidenceRecord values")
+            records.append(replace(record, binding=_revalidated_binding(record.binding)))
+        return EvidencePacket(scope, packet.evaluator_version, tuple(records))
+    except AttributeError:
+        raise EvidenceIdentityRejected("missing packet or record attribute") from None
 
 
 def assert_packet_current(
@@ -212,11 +241,13 @@ def assert_packet_current(
     """
     if type(packet) is not EvidencePacket or type(expected) is not EvidenceBinding:
         raise EvidenceIdentityRejected("typed packet and expected binding required")
+    checked = _revalidated_packet(packet)
+    scope = _revalidated_binding(expected)
     current = _time("now", now)
-    if packet.binding != expected:
+    if checked.binding != scope:
         raise EvidenceIdentityRejected("evidence binding mismatch")
-    for record in packet.records:
-        if record.binding != expected:
+    for record in checked.records:
+        if record.binding != scope:
             raise EvidenceIdentityRejected("record binding mismatch")
         if _time("collected_at", record.collected_at) > current:
             raise EvidenceIdentityRejected("future-dated evidence")

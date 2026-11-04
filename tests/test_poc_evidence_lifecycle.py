@@ -606,3 +606,28 @@ def test_strenum_value_cannot_replay_as_a_different_lifecycle_action() -> None:
             reader=reader,
         )
     assert reader.calls == 0
+
+
+
+@pytest.mark.parametrize("bad_records", [None, [], ()])
+def test_replay_checks_packet_shape_before_nested_record_access(
+    bad_records: Any,
+) -> None:
+    damaged = packet()
+    object.__setattr__(damaged, "records", bad_records)
+    with pytest.raises(LifecycleRejected, match="invalid evidence packet"):
+        EvidenceLifecycle(damaged)
+
+
+def test_replay_rejects_deleted_record_identifier_with_domain_error() -> None:
+    damaged = packet()
+    object.__delattr__(damaged.records[0], "evidence_id")
+    with pytest.raises(LifecycleRejected, match="invalid evidence packet"):
+        EvidenceLifecycle(damaged)
+
+
+def test_replay_accepts_valid_packet_with_verified_approval_history() -> None:
+    existing = approved()
+    replayed = EvidenceLifecycle(existing.packet, existing.events)
+    assert replayed.events == existing.events
+    assert replayed.packet.packet_digest() == existing.packet.packet_digest()

@@ -17,6 +17,7 @@ from typing import Protocol
 from uuid import UUID
 
 from gasha.poc.evidence_identity import (
+    EvidenceIdentityRejected,
     EvidencePacket,
     EvidenceRecord,
     assert_packet_current,
@@ -109,6 +110,13 @@ def _replay(lifecycle: EvidenceLifecycle) -> _State:
         raise LifecycleRejected("typed packet required")
     if type(lifecycle.events) is not tuple:
         raise LifecycleRejected("immutable event sequence required")
+    # Validate the entire packet before dereferencing nested records. A frozen
+    # dataclass can still be damaged via low-level mutation after construction.
+    # Invalid proposal input must fail with a controlled lifecycle rejection.
+    try:
+        expected_digest = lifecycle.packet.packet_digest()
+    except EvidenceIdentityRejected as exc:
+        raise LifecycleRejected("invalid evidence packet") from exc
     records = {r.evidence_id: r for r in lifecycle.packet.records}
     # Packet-level separation: no collector may verify ANY record in this packet.
     collector_refs = {record.collector_actor_ref for record in records.values()}
@@ -118,7 +126,6 @@ def _replay(lifecycle: EvidenceLifecycle) -> _State:
     approved_by: str | None = None
     approval_revoked = False
     last_at: datetime | None = None
-    expected_digest = lifecycle.packet.packet_digest()
     for untrusted_event in lifecycle.events:
         if type(untrusted_event) is not EvidenceTransition:
             raise LifecycleRejected("typed transition required")
