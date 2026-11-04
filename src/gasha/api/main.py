@@ -27,7 +27,6 @@ from gasha.cases.timeline import (
     CaseEvent,
     CaseOperation,
     CaseReason,
-    CaseRejected,
     validate_case_history,
 )
 from gasha.decision.mode import DecisionEnvelope, ModeAwareDecisionService
