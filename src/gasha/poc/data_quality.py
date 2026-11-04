@@ -344,6 +344,46 @@ class DataQualityReport:
         }
 
 
+
+def _accepted_cohort_identity(
+    observation: QualityObservation, result: _Result
+) -> tuple[object, ...]:
+    """Ephemeral equality for accepted records, never exported as evidence.
+
+    Event UUID alone cannot settle contradictory transactions, labels or alerts.
+    Normalize clocks so equivalent offsets do not become false conflicts.
+    """
+    received = observation.event.received_at
+    occurred = result.occurred_at
+    if not isinstance(received, datetime) or occurred is None:
+        raise ValueError("accepted identity requires validated event clocks")
+    confirmed = observation.confirmed_at
+    if confirmed is not None and not isinstance(confirmed, datetime):
+        raise ValueError("accepted identity requires validated label clock")
+    payload = dict(observation.event.payload)
+    payload["occurred_at"] = occurred
+    return (
+        observation.event.tenant_id,
+        observation.event.source_system,
+        observation.event.schema_version,
+        observation.event.correlation_id,
+        _utc(received),
+        payload,
+        observation.confirmed_fraud,
+        _utc(confirmed) if confirmed is not None else None,
+        observation.alerted,
+    )
+
+
+def _same_cohort_identity(left: tuple[object, ...], right: tuple[object, ...]) -> bool:
+    """Opaque payload comparisons that cannot be established fail closed."""
+    try:
+        equal = left == right
+    except Exception:
+        return False
+    return type(equal) is bool and equal
+
+
 def inspect_reference_quality(
     scope: DataQualityScope, observations: Sequence[QualityObservation]
 ) -> DataQualityReport:
@@ -360,7 +400,13 @@ def inspect_reference_quality(
     counters: dict[UseCase, Counter[str]] = {uc: Counter() for uc in UseCase}
     failures: dict[UseCase, Counter[str]] = {uc: Counter() for uc in UseCase}
     coverage: dict[UseCase, Counter[str]] = {uc: Counter() for uc in UseCase}
-    seen: set[tuple[UseCase, UUID]] = set()
+    # First inspect the entire batch. A contradictory, otherwise valid
+    # same-UUID claim quarantines every such claim rather than letting input
+    # order decide the accepted fraud/alert/label denominator. Invalid rows
+    # do not reserve IDs or poison separately valid observations.
+    inspected: list[tuple[QualityObservation, _Result]] = []
+    first_claims: dict[tuple[UseCase, UUID], tuple[object, ...]] = {}
+    conflicting_ids: set[tuple[UseCase, UUID]] = set()
     for observation in observations:
         if type(observation) is not QualityObservation:
             raise ValueError("expected validated QualityObservation")
@@ -369,17 +415,26 @@ def inspect_reference_quality(
             or not isinstance(observation.event, InboundBankEvent)
         ):
             raise ValueError("invalid quality observation type")
+        check = _inspect(scope, observation)
+        inspected.append((observation, check))
+        if not check.failed_checks and check.event_id is not None:
+            key = (observation.use_case, check.event_id)
+            claim = _accepted_cohort_identity(observation, check)
+            if key not in first_claims:
+                first_claims[key] = claim
+            elif not _same_cohort_identity(first_claims[key], claim):
+                conflicting_ids.add(key)
+    seen: set[tuple[UseCase, UUID]] = set()
+    for observation, check in inspected:
         uc = observation.use_case
         stats = counters[uc]
         stats["total"] += 1
-        check = _inspect(scope, observation)
         rejected = set(check.failed_checks)
-        # Quarantined/out-of-scope rows must never reserve an in-scope ID.
-        # Only structurally, temporally and tenant/schema-valid observations
-        # participate in deduplication; order cannot poison accepted counts.
         if not rejected and check.event_id is not None:
             identity = (uc, check.event_id)
-            if identity in seen:
+            if identity in conflicting_ids:
+                rejected.add("conflicting.event_id")
+            elif identity in seen:
                 rejected.add("duplicate.event_id")
             else:
                 seen.add(identity)

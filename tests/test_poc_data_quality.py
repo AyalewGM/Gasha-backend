@@ -763,3 +763,90 @@ def test_corrupted_quality_observation_type_rejected(
     object.__setattr__(forged, field, corrupt)
     with pytest.raises(ValueError):
         inspect_reference_quality(scope(), (forged,))
+
+
+@pytest.mark.parametrize("changed", [
+    "amount", "beneficiary_id", "channel", "source_system",
+    "receipt_clock", "event_clock", "confirmed_fraud", "confirmed_at",
+    "alerted", "intelligence",
+])
+def test_conflicting_valid_uuid_claims_quarantine_both_in_any_order(
+    changed: str,
+) -> None:
+    """Order must not decide which incompatible transaction/label wins."""
+    valid = candidate(
+        "conflicting-cohort", label=True,
+        confirmed_at=AT + timedelta(days=1), alerted=True,
+        payload_changes={"intelligence": {"beneficiary_risk": 0.3}},
+    )
+    if changed in {"amount", "beneficiary_id", "channel", "event_clock", "intelligence"}:
+        payload = dict(valid.event.payload)
+        payload[changed if changed != "event_clock" else "occurred_at"] = {
+            "amount": "900.00",
+            "beneficiary_id": "other-synthetic-beneficiary",
+            "channel": "branch",
+            "event_clock": (AT + timedelta(minutes=1)).isoformat(),
+            "intelligence": {"beneficiary_risk": 0.9},
+        }[changed]
+        rival = replace(valid, event=valid.event.model_copy(update={"payload": payload}))
+    elif changed == "source_system":
+        rival = replace(valid, event=valid.event.model_copy(
+            update={"source_system": "other-synthetic-source"},
+        ))
+    elif changed == "receipt_clock":
+        rival = replace(valid, event=valid.event.model_copy(
+            update={"received_at": AT + timedelta(minutes=2)},
+        ))
+    elif changed == "confirmed_fraud":
+        rival = replace(valid, confirmed_fraud=False)
+    elif changed == "confirmed_at":
+        rival = replace(valid, confirmed_at=AT + timedelta(days=2))
+    else:
+        rival = replace(valid, alerted=False)
+
+    for rows in ((valid, rival), (rival, valid)):
+        report = inspect_reference_quality(scope(), rows).to_dict()
+        row = report["use_cases"][0]
+        assert row["total"] == 2
+        assert row["accepted"] == 0 and row["rejected"] == 2
+        assert row["checks"] == {"conflicting.event_id": 2}
+        assert row["labels"] == {"positive": 0, "negative": 0, "unlabelled": 0}
+        assert row["alerts"] == {"alerted": 0, "not_alerted": 0, "unknown": 0}
+        assert row["optional_signals"]["beneficiary_risk"]["available"]["count"] == 0
+        assert "other-synthetic-beneficiary" not in json.dumps(report)
+
+
+def test_equivalent_utc_instants_stay_exact_duplicates_not_conflicts() -> None:
+    row = candidate(
+        "equivalent-offset-uuid", label=True,
+        confirmed_at=AT + timedelta(days=1), alerted=True,
+    )
+    offset = timezone(timedelta(hours=-5))
+    changed_payload = dict(row.event.payload)
+    changed_payload["occurred_at"] = AT.astimezone(offset).isoformat()
+    same = replace(
+        row,
+        event=row.event.model_copy(update={
+            "received_at": (AT + timedelta(minutes=1)).astimezone(offset),
+            "payload": changed_payload,
+        }),
+        confirmed_at=(AT + timedelta(days=1)).astimezone(offset),
+    )
+    first = result_for(row, same)
+    second = result_for(same, row)
+    assert first == second
+    assert first["accepted"] == 1 and first["rejected"] == 1
+    assert first["checks"] == {"duplicate.event_id": 1}
+    assert first["labels"] == {"positive": 1, "negative": 0, "unlabelled": 0}
+
+
+def test_invalid_collision_cannot_quarantine_valid_observation() -> None:
+    valid = candidate("invalid-collision", label=True, confirmed_at=AT + timedelta(days=1))
+    invalid = replace(valid, event=valid.event.model_copy(update={
+        "payload": dict(valid.event.payload, amount="-5.00"),
+    }))
+    assert result_for(valid, invalid) == result_for(invalid, valid)
+    row = result_for(valid, invalid)
+    assert row["accepted"] == 1 and row["rejected"] == 1
+    assert row["checks"] == {"invalid.amount": 1}
+    assert "conflicting.event_id" not in row["checks"]

@@ -59,3 +59,20 @@ digest, protect against privileged runtime mutation or authorize UC-04/UC-05
 metrics. The existing provisional UC matrix and non-authoritative flags
 remain unchanged. In particular #54 is still advisory and #49 still
 requires trusted verifier/approver provenance and revocation.
+
+## Same-UUID contradictory accepted rows (bounded #48 protection)
+
+The inspector scans the **entire synthetic batch** before deciding which
+otherwise-valid same-UC event IDs can contribute to the accepted population.
+Exact replays retain first-accepted plus duplicate-rejected behavior. If two
+valid claims about one ID disagree on transaction/envelope fields, source,
+receipt/event time, signals, label or alert assertion, **every** claim for that
+UC/ID is quarantined as `conflicting.event_id`, independent of row order.
+UTC-equivalent clocks compare equal. Malformed, wrong-tenant and out-of-window
+rows never poison a valid ID. Conflict inputs remain in memory and reports
+carry only fixed check-code counts without raw values or event IDs.
+
+This is conservative synthetic cohort-integrity instrumentation, not Bank
+label arbitration, Bank provenance, an immutable dataset, historical replay
+binding, verified readiness or KPI permission. #54 stays advisory and #49
+remains untrusted pending an installed evidence/approval authority.
