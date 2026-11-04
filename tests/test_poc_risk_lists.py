@@ -379,3 +379,48 @@ def test_revalidated_valid_snapshot_preserves_digest_and_match_semantics() -> No
     assert result.matched_entry_ids == (UUID(int=1), UUID(int=2), UUID(int=3))
     assert lookup(replace(original, entries=tuple(reversed(original.entries))),
                   subjects=(OTHER, BANK)) == result
+
+
+
+@pytest.mark.parametrize(("field", "corruption"), [
+    ("kind", "beneficiary"),  # Equal to a StrEnum value, but not the enum type.
+    ("token", "a" * 63),
+])
+def test_corrupted_request_subject_rejected_before_hash_or_match(
+    field: str, corruption: object,
+) -> None:
+    original = snapshot(entry(1, RiskListKind.BLOCK))
+    request_subject = RiskListSubject(SubjectKind.BENEFICIARY, "a" * 64)
+    object.__setattr__(request_subject, field, corruption)
+    with pytest.raises(RiskListRejected):
+        lookup(original, subjects=(request_subject,))
+
+
+@pytest.mark.parametrize("field", ["kind", "token"])
+def test_deleted_request_subject_attribute_raises_domain_rejection(
+    field: str,
+) -> None:
+    original = snapshot(entry(1, RiskListKind.BLOCK))
+    request_subject = RiskListSubject(SubjectKind.BENEFICIARY, "a" * 64)
+    object.__delattr__(request_subject, field)
+    with pytest.raises(RiskListRejected, match="missing list subject attribute"):
+        lookup(original, subjects=(request_subject,))
+
+
+def test_nonmatching_request_subject_must_also_validate_before_hashing() -> None:
+    original = snapshot(entry(1, RiskListKind.ALLOW))
+    unrelated = RiskListSubject(SubjectKind.CUSTOMER, "c" * 64)
+    object.__setattr__(unrelated, "kind", "customer")
+    with pytest.raises(RiskListRejected):
+        lookup(original, subjects=(BANK, unrelated))
+
+
+def test_valid_request_subject_copies_preserve_match_only_result() -> None:
+    original = snapshot(entry(1, RiskListKind.BLOCK))
+    independent = RiskListSubject(SubjectKind.BENEFICIARY, "a" * 64)
+    report = lookup(original, subjects=(independent,))
+    assert report.matched_entry_ids == (UUID(int=1),)
+    assert report.snapshot_digest == original.digest()
+    assert not report.enforcement_activated
+    with pytest.raises(RiskListRejected, match="duplicate subject"):
+        lookup(original, subjects=(BANK, independent))

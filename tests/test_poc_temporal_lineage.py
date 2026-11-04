@@ -238,16 +238,28 @@ def test_lineage_helper_is_not_imported_or_consulted_by_live_paths() -> None:
 
     root = Path(__file__).resolve().parents[1] / "src" / "gasha"
     helper = root / "poc" / "temporal_lineage.py"
+    offline = root / "poc" / "matured_lineage_replay.py"
     assert helper.is_file()
+    assert offline.is_file()
     forbidden = ("temporal_lineage", "HistoricalFeatureEnvelope", "assert_historical_snapshot_bound")
     consumers = []
+    wired_offline = []
     for candidate in root.rglob("*.py"):
         if candidate == helper:
             continue
         source = candidate.read_text(encoding="utf-8")
+        if candidate == offline:
+            # Only the intentionally opt-in, synthetic-only preflight may use
+            # lineage. Never let its caller assertions reach a runtime path.
+            assert "from gasha.poc.temporal_lineage import" in source
+            assert "from gasha.poc.historical import" in source
+            continue
         if any(marker in source for marker in forbidden):
             consumers.append(candidate.relative_to(root).as_posix())
+        if "matured_lineage_replay" in source or "replay_offline_matured_lineage" in source:
+            wired_offline.append(candidate.relative_to(root).as_posix())
     assert consumers == [], f"Unreviewed production lineage integration: {consumers}"
+    assert wired_offline == [], f"Offline helper wired into production path: {wired_offline}"
 
 
 @pytest.mark.parametrize(("field", "bad"), [

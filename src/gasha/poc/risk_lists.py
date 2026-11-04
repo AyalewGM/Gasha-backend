@@ -159,15 +159,22 @@ class RiskListSnapshot:
         return "sha256:" + sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _checked_subject(value: RiskListSubject) -> RiskListSubject:
+    """Copy and strictly validate request or snapshot subjects before hashing."""
+    if type(value) is not RiskListSubject:
+        raise RiskListRejected("typed subject reference required")
+    try:
+        return RiskListSubject(value.kind, value.token)
+    except AttributeError as exc:
+        raise RiskListRejected("missing list subject attribute") from exc
+
+
 def _checked_entry(value: RiskListEntry) -> RiskListEntry:
     """Rebuild an untrusted reference after possible post-construction mutation."""
     if type(value) is not RiskListEntry:
         raise RiskListRejected("typed entries required")
     try:
-        subject = value.subject
-        if type(subject) is not RiskListSubject:
-            raise RiskListRejected("typed subject reference required")
-        checked_subject = RiskListSubject(subject.kind, subject.token)
+        checked_subject = _checked_subject(value.subject)
         return RiskListEntry(
             entry_id=value.entry_id,
             kind=value.kind,
@@ -268,13 +275,14 @@ def match_reference_snapshot(
         raise RiskListRejected("snapshot scope or version mismatch")
     if snapshot.published_at > at:
         raise RiskListRejected("snapshot was not published at event time")
-    if type(subjects) is not tuple or any(
-        type(subject) is not RiskListSubject for subject in subjects
-    ):
+    if type(subjects) is not tuple:
         raise RiskListRejected("immutable typed subjects required")
-    if len(set(subjects)) != len(subjects):
+    # Validate *all* caller-provided subjects before any hash or equality.
+    # A corrupted StrEnum-equivalent string could otherwise match a valid entry.
+    checked_subjects = tuple(_checked_subject(subject) for subject in subjects)
+    if len(set(checked_subjects)) != len(checked_subjects):
         raise RiskListRejected("duplicate subject reference")
-    subject_set = set(subjects)
+    subject_set = set(checked_subjects)
     selected = tuple(sorted(
         (entry for entry in snapshot.entries
          if entry.subject in subject_set and entry.active_at(at)),
