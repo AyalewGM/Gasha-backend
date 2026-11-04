@@ -298,3 +298,80 @@ def test_reference_matcher_has_no_production_consumer() -> None:
         if "gasha.poc.risk_lists" in path.read_text(encoding="utf-8"):
             unsafe.append(str(path.relative_to(source_root)))
     assert unsafe == []
+
+
+@pytest.mark.parametrize(("target", "field", "corruption"), [
+    ("snapshot", "entries", ("not-an-entry",)),
+    ("snapshot", "published_at", datetime(2026, 10, 31)),
+    ("entry", "kind", "block"),
+    ("entry", "effective_from", AT + timedelta(hours=1)),
+    ("entry", "revoked_at", AT - timedelta(days=1)),
+    ("subject", "kind", "beneficiary"),
+    ("subject", "token", "untrusted"),
+])
+def test_postconstruction_corruption_rejected_before_match_or_digest(
+    target: str, field: str, corruption: object,
+) -> None:
+    original = snapshot(entry(1, RiskListKind.BLOCK))
+    targets: dict[str, object] = {
+        "snapshot": original,
+        "entry": original.entries[0],
+        "subject": original.entries[0].subject,
+    }
+    # Simulate deserialized or low-level altered caller assertions. This is
+    # not a security boundary, but malformed reference input must fail closed.
+    object.__setattr__(targets[target], field, corruption)
+    with pytest.raises(RiskListRejected):
+        lookup(original)
+    with pytest.raises(RiskListRejected):
+        original.digest()
+    if target == "entry":
+        with pytest.raises(RiskListRejected):
+            original.entries[0].active_at(AT)
+
+
+@pytest.mark.parametrize(("target", "field"), [
+    ("snapshot", "entries"),
+    ("snapshot", "list_version"),
+    ("entry", "subject"),
+    ("entry", "entry_id"),
+    ("subject", "kind"),
+])
+def test_deleted_reference_attributes_fail_with_domain_rejection(
+    target: str, field: str,
+) -> None:
+    original = snapshot(entry(1, RiskListKind.BLOCK))
+    targets: dict[str, object] = {
+        "snapshot": original,
+        "entry": original.entries[0],
+        "subject": original.entries[0].subject,
+    }
+    object.__delattr__(targets[target], field)
+    with pytest.raises(RiskListRejected):
+        lookup(original)
+    with pytest.raises(RiskListRejected):
+        original.digest()
+
+
+def test_invalid_nonmatching_entry_does_not_get_skipped() -> None:
+    original = snapshot(
+        entry(1, RiskListKind.ALLOW),
+        replace(entry(2, RiskListKind.WATCH), subject=OTHER),
+    )
+    object.__setattr__(original.entries[1], "kind", "watch")
+    # All input entries must validate, not just entries matched by subjects.
+    with pytest.raises(RiskListRejected):
+        lookup(original, subjects=(BANK,))
+
+
+def test_revalidated_valid_snapshot_preserves_digest_and_match_semantics() -> None:
+    original = snapshot(
+        entry(3, RiskListKind.WATCH),
+        entry(1, RiskListKind.ALLOW),
+        replace(entry(2, RiskListKind.BLOCK), subject=OTHER),
+    )
+    result = lookup(original, subjects=(BANK, OTHER))
+    assert result.snapshot_digest == original.digest()
+    assert result.matched_entry_ids == (UUID(int=1), UUID(int=2), UUID(int=3))
+    assert lookup(replace(original, entries=tuple(reversed(original.entries))),
+                  subjects=(OTHER, BANK)) == result
