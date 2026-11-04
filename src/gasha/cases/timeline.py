@@ -239,6 +239,30 @@ def _sha(tag: str, fields: dict[str, object]) -> str:
                   .encode("utf-8")).hexdigest()
 
 
+def case_command_fingerprints(
+    command: CaseCommand, *, actor_ref: str,
+) -> tuple[str, str]:
+    """Canonical synthetic #45 idempotency and command identities.
+
+    Shared by the case kernel and protected HTTP response guard. These hashes
+    verify consistency with proposed fields; they are not source/assignee
+    authority and cannot replace the installed writer's durable audit.
+    """
+    key_ref = _sha("gasha-case-key-v1", {
+        "tenant": command.tenant_id, "actor": actor_ref,
+        "key": command.idempotency_key,
+    })
+    payload_ref = _sha("gasha-case-command-v1", {
+        "tenant": command.tenant_id, "case": str(command.case_id),
+        "source": str(command.source_event_id), "operation": command.operation.value,
+        "expected_revision": command.expected_revision, "reason": command.reason_code.value,
+        "disposition": command.disposition.value if command.disposition else None,
+        "assignee": command.assignee.actor_ref if command.assignee else None,
+        "actor": actor_ref,
+    })
+    return key_ref, payload_ref
+
+
 def _check_command(command: CaseCommand) -> None:
     if not isinstance(command, CaseCommand):
         raise CaseRejected("typed case command required")
@@ -320,18 +344,7 @@ def advance_case(
                 or event.source_context_ref != resolved.context_ref):
             raise CaseRejected("history source mismatches trusted evaluation")
     actor_ref = principal.audit_actor
-    key_ref = _sha("gasha-case-key-v1", {
-        "tenant": command.tenant_id, "actor": actor_ref,
-        "key": command.idempotency_key,
-    })
-    payload_ref = _sha("gasha-case-command-v1", {
-        "tenant": command.tenant_id, "case": str(command.case_id),
-        "source": str(command.source_event_id), "operation": command.operation.value,
-        "expected_revision": command.expected_revision, "reason": command.reason_code.value,
-        "disposition": command.disposition.value if command.disposition else None,
-        "assignee": command.assignee.actor_ref if command.assignee else None,
-        "actor": actor_ref,
-    })
+    key_ref, payload_ref = case_command_fingerprints(command, actor_ref=actor_ref)
     for existing in history:
         if existing.idempotency_ref == key_ref:
             if existing.command_ref != payload_ref:
