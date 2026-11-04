@@ -693,3 +693,18 @@ def test_transition_rejects_deleted_principal_field(missing: str) -> None:
             UUID(int=1), reader=reader,
         )
     assert reader.calls == 0
+
+@pytest.mark.parametrize("missing", ("packet", "events"))
+def test_proposal_rejects_deleted_lifecycle_field_before_artifact_read(missing: str) -> None:
+    lifecycle = submitted()
+    reader = ArtifactReader()
+    original_events = lifecycle.events
+    object.__delattr__(lifecycle, missing)
+    with pytest.raises(LifecycleRejected, match="missing lifecycle attribute"):
+        apply(
+            lifecycle, EvidenceAction.VERIFY, VERIFIER,
+            UUID(int=1), reader=reader,
+        )
+    assert reader.calls == 0
+    if missing != "events":
+        assert lifecycle.events is original_events

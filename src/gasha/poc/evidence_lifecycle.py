@@ -106,18 +106,25 @@ class _State:
 
 def _replay(lifecycle: EvidenceLifecycle) -> _State:
     """Check structural history integrity; cannot authenticate its external origin."""
-    if type(lifecycle.packet) is not EvidencePacket:
+    # Revalidate the top-level lifecycle shape before dereferencing fields.
+    # Even frozen/slotted instances can lose attributes via low-level mutation.
+    try:
+        packet = lifecycle.packet
+        events = lifecycle.events
+    except AttributeError as exc:
+        raise LifecycleRejected("missing lifecycle attribute") from exc
+    if type(packet) is not EvidencePacket:
         raise LifecycleRejected("typed packet required")
-    if type(lifecycle.events) is not tuple:
+    if type(events) is not tuple:
         raise LifecycleRejected("immutable event sequence required")
     # Validate the entire packet before dereferencing nested records. A frozen
     # dataclass can still be damaged via low-level mutation after construction.
     # Invalid proposal input must fail with a controlled lifecycle rejection.
     try:
-        expected_digest = lifecycle.packet.packet_digest()
+        expected_digest = packet.packet_digest()
     except EvidenceIdentityRejected as exc:
         raise LifecycleRejected("invalid evidence packet") from exc
-    records = {r.evidence_id: r for r in lifecycle.packet.records}
+    records = {r.evidence_id: r for r in packet.records}
     # Packet-level separation: no collector may verify ANY record in this packet.
     collector_refs = {record.collector_actor_ref for record in records.values()}
     submitted: set[UUID] = set()
@@ -126,7 +133,7 @@ def _replay(lifecycle: EvidenceLifecycle) -> _State:
     approved_by: str | None = None
     approval_revoked = False
     last_at: datetime | None = None
-    for untrusted_event in lifecycle.events:
+    for untrusted_event in events:
         if type(untrusted_event) is not EvidenceTransition:
             raise LifecycleRejected("typed transition required")
         # Frozen dataclass instances can be altered with object.__setattr__,
@@ -157,7 +164,7 @@ def _replay(lifecycle: EvidenceLifecycle) -> _State:
                 # SUBMIT event can predate evidence collection or follow expiry,
                 # even though fresh submissions through the proposal API fail.
                 assert_packet_current(
-                    lifecycle.packet, expected=lifecycle.packet.binding, now=event.at,
+                    packet, expected=packet.binding, now=event.at,
                 )
                 submitted.add(event.evidence_id)
             elif event.action is EvidenceAction.VERIFY:
@@ -168,7 +175,7 @@ def _replay(lifecycle: EvidenceLifecycle) -> _State:
                     or event.actor_ref in collector_refs
                 ):
                     raise LifecycleRejected("invalid independent verification")
-                assert_packet_current(lifecycle.packet, expected=lifecycle.packet.binding, now=event.at)
+                assert_packet_current(packet, expected=packet.binding, now=event.at)
                 verified_by[event.evidence_id] = event.actor_ref
             else:
                 if event.evidence_id not in submitted or event.evidence_id in revoked:
@@ -190,7 +197,7 @@ def _replay(lifecycle: EvidenceLifecycle) -> _State:
                     or not collector_refs.isdisjoint(verified_by.values())
                 ):
                     raise LifecycleRejected("independent verified approval required")
-                assert_packet_current(lifecycle.packet, expected=lifecycle.packet.binding, now=event.at)
+                assert_packet_current(packet, expected=packet.binding, now=event.at)
                 approved_by = event.actor_ref
             elif event.action is EvidenceAction.REVOKE_APPROVAL:
                 if approved_by is None or approval_revoked:
