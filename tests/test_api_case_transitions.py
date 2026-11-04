@@ -14,6 +14,7 @@ from gasha.api.main import app, get_principal
 from gasha.cases.timeline import (
     AuthorizedAssignee,
     BankExecution,
+    CaseDisposition,
     CaseCommand,
     CaseEvent,
     CaseOperation,
@@ -118,6 +119,30 @@ class SyntheticAtomicWriter:
             return replace(event, bank_execution="executed")
         if self.forge == "revision":
             return replace(event, revision=999)
+        if self.forge == "missing_clock":
+            object.__delattr__(event, "recorded_at")
+            return event
+        if self.forge == "missing_context":
+            object.__delattr__(event, "source_context_ref")
+            return event
+        if self.forge is not None:
+            mutation = {
+                "context": {"source_context_ref": "BAD"},
+                "previous_revision": {"previous_revision": 999},
+                "boolean_revision": {"revision": True},
+                "actor": {"actor_ref": "invalid"},
+                "idempotency": {"idempotency_ref": "not-hex"},
+                "command": {"command_ref": "not-hex"},
+                "wrong_key_digest": {"idempotency_ref": "d" * 64},
+                "wrong_command_digest": {"command_ref": "d" * 64},
+                "naive_clock": {"recorded_at": datetime(2026, 11, 4)},
+                "wrong_clock_type": {"recorded_at": "2026-11-04T00:00:00Z"},
+                "assignee_on_create": {"assignee_ref": "a" * 64},
+                "disposition_on_create": {"disposition": CaseDisposition.FRAUD},
+                "operation_type": {"operation": "create"},
+                "source_type": {"source_event_id": str(SOURCE)},
+            }[self.forge]
+            return replace(event, **mutation)
         self.history[case_id] = history
         return event
 
@@ -305,7 +330,13 @@ def test_cross_tenant_event_and_unauthorized_assignee_do_not_mutate(wired):
     assert all("synthetic-analyst" not in repr(e) for e in audit.events)
 
 
-@pytest.mark.parametrize("forged", ["tenant", "execution", "revision"])
+@pytest.mark.parametrize("forged", [
+    "tenant", "execution", "revision", "context", "previous_revision",
+    "boolean_revision", "actor", "idempotency", "command",
+    "wrong_key_digest", "wrong_command_digest", "naive_clock",
+    "wrong_clock_type", "missing_clock", "missing_context",
+    "assignee_on_create", "disposition_on_create", "operation_type", "source_type",
+])
 def test_malformed_writer_response_never_grants_execution_authority(wired, forged):
     client, audit, writer = wired
     writer.forge = forged
@@ -313,6 +344,59 @@ def test_malformed_writer_response_never_grants_execution_authority(wired, forge
     assert response.status_code == 503
     assert response.json() == {"detail": "case transition unavailable"}
     assert writer.history == {}
+    assert any(e.reason == "case_transition_unavailable" for e in audit.events)
+
+
+def test_writer_missing_assignee_response_does_not_claim_success(wired):
+    client, audit, writer = wired
+    assert client.post(url("create"), json=body(), headers=token()).status_code == 200
+    assert client.post(
+        url("triage"), json=body("analyst_triage", rev=1),
+        headers=token(),
+    ).status_code == 200
+    before = writer.history[CASE]
+    original = writer.apply
+
+    def invalid_assignee(**kwargs):
+        event = original(**kwargs)
+        return replace(event, assignee_ref=None)
+
+    writer.apply = invalid_assignee
+    response = client.post(
+        url("assign"),
+        json=body("investigation_assigned", rev=2, assignee=ASSIGNEE),
+        headers=token(),
+    )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "case transition unavailable"}
+    # The normal synthetic writer appended before our wrapper changed its
+    # response; HTTP validation cannot roll back a writer's side effects.
+    assert len(before) == 2
+    assert any(e.reason == "case_transition_unavailable" for e in audit.events)
+
+
+def test_writer_missing_disposition_response_does_not_claim_success(wired):
+    client, audit, writer = wired
+    for op, payload in (
+        ("create", body()),
+        ("triage", body("analyst_triage", rev=1)),
+        ("assign", body("investigation_assigned", rev=2, assignee=ASSIGNEE)),
+    ):
+        assert client.post(url(op), json=payload, headers=token()).status_code == 200
+    original = writer.apply
+
+    def invalid_disposition(**kwargs):
+        event = original(**kwargs)
+        return replace(event, disposition=None)
+
+    writer.apply = invalid_disposition
+    response = client.post(
+        url("dispose"),
+        json=body("fraud_evidence", rev=3, disposition="confirmed_fraud"),
+        headers=token(),
+    )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "case transition unavailable"}
     assert any(e.reason == "case_transition_unavailable" for e in audit.events)
 
 
