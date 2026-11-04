@@ -31,6 +31,8 @@ from gasha.poc.temporal_lineage import (
 _TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 REPORT_VERSION = "synthetic-matured-lineage-replay-v1"
+EVALUATION_VERSION = "synthetic-matured-lineage-evaluation-v1"
+SCORER_VERSION = "decision-service-max-signal-v1"
 
 
 def _utc(value: datetime) -> datetime:
@@ -83,12 +85,45 @@ def _rate(numerator: int, denominator: int, missing_reason: str) -> dict[str, ob
     }
 
 
+def _validated_policy(value: DecisionPolicy) -> DecisionPolicy:
+    """Rebuild an independent, strict scorer policy before any replay work."""
+    if type(value) is not DecisionPolicy:
+        raise HistoricalLineageRejected("invalid offline decision policy type")
+    try:
+        fields = {name: getattr(value, name) for name in DecisionPolicy.model_fields}
+    except AttributeError:
+        raise HistoricalLineageRejected("invalid offline decision policy: missing field") from None
+    thresholds = (
+        "monitor_threshold", "review_threshold", "hold_threshold", "block_threshold",
+    )
+    # Pydantic model_copy(update=...) bypasses validation; reject coercible
+    # string/bool/decimal and corrupted instances, not only invalid ranges.
+    if any(type(fields[name]) is not float for name in thresholds):
+        raise HistoricalLineageRejected("invalid offline decision policy threshold type")
+    if any(type(fields[name]) is not str for name in (
+        "configuration_version", "policy_version", "rule_version",
+    )) or (fields["model_version"] is not None and type(fields["model_version"]) is not str):
+        raise HistoricalLineageRejected("invalid offline decision policy version type")
+    try:
+        return DecisionPolicy.model_validate(fields, strict=True)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HistoricalLineageRejected("invalid offline decision policy values") from exc
+
+
+def _fingerprint(payload: object) -> str:
+    serialized = dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                       allow_nan=False)
+    return "sha256:" + sha256(serialized.encode("ascii")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class OfflineLineageReplayResult:
     """Raw replay is for local tests only; to_dict exports aggregates only."""
 
     scope: OfflineCohortScope
     cohort_digest: str
+    policy_digest: str
+    evaluation_digest: str
     replay: HistoricalReplayReport
     matured_positive: int
     matured_negative: int
@@ -115,6 +150,9 @@ class OfflineLineageReplayResult:
                 "label_cutoff": self.scope.label_cutoff.isoformat(),
             },
             "cohort_digest": self.cohort_digest,
+            "policy_digest": self.policy_digest,
+            "evaluation_digest": self.evaluation_digest,
+            "evaluation_version": EVALUATION_VERSION,
             "cases": metrics.cases,
             "maturity": {
                 "matured_positive": self.matured_positive,
@@ -177,10 +215,11 @@ def replay_offline_matured_lineage(
         raise HistoricalLineageRejected("missing offline cohort scope field") from None
     if type(events) is not tuple or type(lineages) is not tuple:
         raise HistoricalLineageRejected("immutable event and lineage tuples required")
-    if not isinstance(policy, DecisionPolicy) or (
-        policy.configuration_version != scope.configuration_version
-        or policy.policy_version != scope.policy_version
-        or policy.rule_version != scope.rule_version
+    validated_policy = _validated_policy(policy)
+    if (
+        validated_policy.configuration_version != scope.configuration_version
+        or validated_policy.policy_version != scope.policy_version
+        or validated_policy.rule_version != scope.rule_version
     ):
         raise HistoricalLineageRejected("cohort policy/config/rule version mismatch")
 
@@ -298,9 +337,21 @@ def replay_offline_matured_lineage(
         sort_keys=True, separators=(",", ":"), ensure_ascii=True,
     )
     digest = "sha256:" + sha256(canonical.encode("ascii")).hexdigest()
-    result = replay_historical(tuple(masked), {scope.tenant_id: policy}, clock=clock)
+    policy_digest = _fingerprint({
+        "domain": "synthetic-offline-DecisionPolicy-v1",
+        "policy": validated_policy.model_dump(mode="json"),
+    })
+    evaluation_digest = _fingerprint({
+        "domain": EVALUATION_VERSION,
+        "scorer": SCORER_VERSION,
+        "report_version": REPORT_VERSION,
+        "cohort_digest": digest,
+        "policy_digest": policy_digest,
+    })
+    result = replay_historical(tuple(masked), {scope.tenant_id: validated_policy}, clock=clock)
     return OfflineLineageReplayResult(
-        scope=scope, cohort_digest=digest, replay=result,
+        scope=scope, cohort_digest=digest, policy_digest=policy_digest,
+        evaluation_digest=evaluation_digest, replay=result,
         matured_positive=maturity["matured_positive"],
         matured_negative=maturity["matured_negative"],
         excluded_future_labels=maturity["excluded_future_labels"],

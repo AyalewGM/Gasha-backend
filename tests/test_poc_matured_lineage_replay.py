@@ -328,3 +328,91 @@ def test_deleted_lineage_field_fails_before_decision_execution() -> None:
             scope(), (event,), (lineage,), policy(), clock=decision_clock,
         )
     assert calls == 0
+
+
+def test_evaluation_identity_changes_for_same_cohort_different_valid_thresholds() -> None:
+    event, lineage = sample(1, risk=0.80, confirmed_at=AT + timedelta(days=2))
+    first = replay_offline_matured_lineage(scope(), (event,), (lineage,), policy())
+    second_policy = DecisionPolicy(
+        configuration_version="config-v1", policy_version="policy-v1",
+        rule_version="rules-v1", monitor_threshold=0.50,
+        review_threshold=0.85, hold_threshold=0.90, block_threshold=0.95,
+    )
+    second = replay_offline_matured_lineage(
+        scope(), (event,), (lineage,), second_policy,
+    )
+    assert first.replay.results[0].classification == ReplayClassification.TRUE_POSITIVE
+    assert second.replay.results[0].classification == ReplayClassification.FALSE_NEGATIVE
+    assert first.cohort_digest == second.cohort_digest
+    assert first.policy_digest != second.policy_digest
+    assert first.evaluation_digest != second.evaluation_digest
+    assert first.to_dict()["evaluation_digest"] == first.evaluation_digest
+    assert check((event, lineage))["evaluation_digest"] == first.evaluation_digest
+    # Model provenance also affects the policy/evaluation identity, even if
+    # threshold action stays the same.
+    model_changed = policy().model_copy(update={"model_version": "other-model-v2"})
+    third = replay_offline_matured_lineage(
+        scope(), (event,), (lineage,), model_changed,
+    )
+    assert third.cohort_digest == first.cohort_digest
+    assert third.policy_digest != first.policy_digest
+    assert third.evaluation_digest != first.evaluation_digest
+
+
+@pytest.mark.parametrize("field,value", [
+    ("review_threshold", 2.0),
+    ("review_threshold", -0.1),
+    ("review_threshold", 0.90),
+    ("review_threshold", "0.70"),
+    ("review_threshold", True),
+    ("review_threshold", None),
+    ("model_version", 42),
+    ("configuration_version", []),
+])
+def test_mutated_policy_rejected_without_any_replay_execution(
+    field: str, value: object, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event, lineage = sample(1, risk=0.8, confirmed_at=AT + timedelta(days=2))
+    damaged = policy().model_copy(update={field: value})
+    decision_calls = 0
+    clock_calls = 0
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        nonlocal decision_calls
+        decision_calls += 1
+        pytest.fail("invalid policy reached historical decision execution")
+
+    def counting_clock() -> datetime:
+        nonlocal clock_calls
+        clock_calls += 1
+        return AT
+
+    monkeypatch.setattr("gasha.poc.matured_lineage_replay.replay_historical", forbidden)
+    with pytest.raises(HistoricalLineageRejected, match="invalid offline decision policy"):
+        replay_offline_matured_lineage(
+            scope(), (event,), (lineage,), damaged, clock=counting_clock,
+        )
+    assert decision_calls == clock_calls == 0
+
+
+@pytest.mark.parametrize("missing", [
+    "monitor_threshold", "review_threshold", "hold_threshold",
+    "block_threshold", "configuration_version", "model_version",
+])
+def test_deleted_policy_attribute_fails_closed_before_replay(
+    missing: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event, lineage = sample(1)
+    damaged = policy()
+    object.__delattr__(damaged, missing)
+    called = False
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        nonlocal called
+        called = True
+        pytest.fail("deleted policy field reached decision execution")
+
+    monkeypatch.setattr("gasha.poc.matured_lineage_replay.replay_historical", forbidden)
+    with pytest.raises(HistoricalLineageRejected, match="invalid offline decision policy"):
+        replay_offline_matured_lineage(scope(), (event,), (lineage,), damaged)
+    assert not called
