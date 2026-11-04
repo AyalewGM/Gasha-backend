@@ -379,7 +379,7 @@ def _same_cohort_identity(left: tuple[object, ...], right: tuple[object, ...]) -
     """Opaque payload comparisons that cannot be established fail closed."""
     try:
         equal = left == right
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         return False
     return type(equal) is bool and equal
 
