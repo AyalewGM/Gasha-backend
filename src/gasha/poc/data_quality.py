@@ -344,6 +344,79 @@ class DataQualityReport:
         }
 
 
+
+
+def _typed_cohort_value(value: object, *, depth: int = 0) -> tuple[object, ...]:
+    """Build a strict, ephemeral identity without Python's bool/int equality.
+
+    Only built-in reference-data types are permitted. All nested mapping keys
+    are string-typed and sorted, and no raw values enter aggregate reports.
+    Unsupported objects, non-finite numbers and excessive nesting fail closed.
+    """
+    if depth > 32:
+        raise ValueError("cohort identity nesting limit exceeded")
+    if value is None:
+        return ("null",)
+    if type(value) is bool:
+        return ("bool", value)
+    if type(value) is str:
+        return ("string", value)
+    if type(value) is int:
+        return ("integer", value)
+    if type(value) is float:
+        if not isfinite(value):
+            raise ValueError("non-finite cohort numeric value")
+        return ("float", repr(value))
+    if type(value) is Decimal:
+        if not value.is_finite():
+            raise ValueError("non-finite cohort decimal value")
+        return ("decimal", str(value))
+    if type(value) is datetime:
+        return ("utc_datetime", _utc(value).isoformat())
+    if type(value) is dict:
+        if any(type(key) is not str for key in value):
+            raise ValueError("non-string cohort mapping key")
+        return ("mapping", tuple(
+            (key, _typed_cohort_value(value[key], depth=depth + 1))
+            for key in sorted(value)
+        ))
+    if type(value) is list or type(value) is tuple:
+        return (("list" if type(value) is list else "tuple"), tuple(
+            _typed_cohort_value(item, depth=depth + 1) for item in value
+        ))
+    raise ValueError("unsupported cohort identity value")
+
+
+def _accepted_cohort_identity(
+    observation: QualityObservation, result: _Result
+) -> tuple[object, ...]:
+    """Ephemeral equality for accepted records, never exported as evidence.
+
+    Event UUID alone cannot settle contradictory transactions, labels or alerts.
+    Normalize clocks so equivalent offsets do not become false conflicts.
+    """
+    received = observation.event.received_at
+    occurred = result.occurred_at
+    if not isinstance(received, datetime) or occurred is None:
+        raise ValueError("accepted identity requires validated event clocks")
+    confirmed = observation.confirmed_at
+    if confirmed is not None and not isinstance(confirmed, datetime):
+        raise ValueError("accepted identity requires validated label clock")
+    payload = dict(observation.event.payload)
+    payload["occurred_at"] = occurred
+    return _typed_cohort_value((
+        observation.event.tenant_id,
+        observation.event.source_system,
+        observation.event.schema_version,
+        observation.event.correlation_id,
+        _utc(received),
+        payload,
+        observation.confirmed_fraud,
+        _utc(confirmed) if confirmed is not None else None,
+        observation.alerted,
+    ))
+
+
 def inspect_reference_quality(
     scope: DataQualityScope, observations: Sequence[QualityObservation]
 ) -> DataQualityReport:
@@ -360,7 +433,13 @@ def inspect_reference_quality(
     counters: dict[UseCase, Counter[str]] = {uc: Counter() for uc in UseCase}
     failures: dict[UseCase, Counter[str]] = {uc: Counter() for uc in UseCase}
     coverage: dict[UseCase, Counter[str]] = {uc: Counter() for uc in UseCase}
-    seen: set[tuple[UseCase, UUID]] = set()
+    # First inspect the entire batch. A contradictory, otherwise valid
+    # same-UUID claim quarantines every such claim rather than letting input
+    # order decide the accepted fraud/alert/label denominator. Invalid rows
+    # do not reserve IDs or poison separately valid observations.
+    inspected: list[tuple[QualityObservation, _Result]] = []
+    first_claims: dict[tuple[UseCase, UUID], tuple[object, ...]] = {}
+    conflicting_ids: set[tuple[UseCase, UUID]] = set()
     for observation in observations:
         if type(observation) is not QualityObservation:
             raise ValueError("expected validated QualityObservation")
@@ -369,17 +448,34 @@ def inspect_reference_quality(
             or not isinstance(observation.event, InboundBankEvent)
         ):
             raise ValueError("invalid quality observation type")
+        check = _inspect(scope, observation)
+        inspected.append((observation, check))
+        if not check.failed_checks and check.event_id is not None:
+            key = (observation.use_case, check.event_id)
+            try:
+                claim = _accepted_cohort_identity(observation, check)
+            except (ValueError, TypeError, OverflowError, RecursionError):
+                # Opaque or malformed nested data cannot be compared safely.
+                # Quarantine this claim without poisoning a valid same-ID row.
+                inspected[-1] = (observation, replace(
+                    check, failed_checks=("invalid.cohort_identity",),
+                ))
+                continue
+            if key not in first_claims:
+                first_claims[key] = claim
+            elif first_claims[key] != claim:
+                conflicting_ids.add(key)
+    seen: set[tuple[UseCase, UUID]] = set()
+    for observation, check in inspected:
         uc = observation.use_case
         stats = counters[uc]
         stats["total"] += 1
-        check = _inspect(scope, observation)
         rejected = set(check.failed_checks)
-        # Quarantined/out-of-scope rows must never reserve an in-scope ID.
-        # Only structurally, temporally and tenant/schema-valid observations
-        # participate in deduplication; order cannot poison accepted counts.
         if not rejected and check.event_id is not None:
             identity = (uc, check.event_id)
-            if identity in seen:
+            if identity in conflicting_ids:
+                rejected.add("conflicting.event_id")
+            elif identity in seen:
                 rejected.add("duplicate.event_id")
             else:
                 seen.add(identity)
