@@ -33,6 +33,7 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 REPORT_VERSION = "synthetic-matured-lineage-replay-v1"
 EVALUATION_VERSION = "synthetic-matured-lineage-evaluation-v1"
 SCORER_VERSION = "decision-service-max-signal-v1"
+COHORT_DIGEST_VERSION = "synthetic-matured-lineage-cohort-input-v2"
 
 
 def _utc(value: datetime) -> datetime:
@@ -150,6 +151,7 @@ class OfflineLineageReplayResult:
                 "label_cutoff": self.scope.label_cutoff.isoformat(),
             },
             "cohort_digest": self.cohort_digest,
+            "cohort_digest_version": COHORT_DIGEST_VERSION,
             "policy_digest": self.policy_digest,
             "evaluation_digest": self.evaluation_digest,
             "evaluation_version": EVALUATION_VERSION,
@@ -299,8 +301,30 @@ def replay_offline_matured_lineage(
         if label_status not in ("matured_positive", "matured_negative"):
             event = event.model_copy(update={"label": None})
         masked.append(event)
+        # The lineage digest alone does not bind the actual replay input:
+        # amount, channel, counterpart identifiers, receipt clock, evidence
+        # reasons and incumbent observations can change without changing any
+        # signal lineage. Bind the fully validated, label-maturity-masked event
+        # into the cohort identity; never export these fields or their raw IDs.
+        # Normalize the clocks that have explicit semantics in this contract.
+        event_payload = event.model_dump(mode="json")
+        event_payload["transaction"]["occurred_at"] = _utc(
+            transaction.occurred_at,
+        ).isoformat(timespec="microseconds")
+        event_payload["received_at"] = (
+            _utc(event.received_at).isoformat(timespec="microseconds")
+            if event.received_at is not None else None
+        )
+        if event.label is not None and event.label.confirmed_at is not None:
+            event_payload["label"]["confirmed_at"] = _utc(
+                event.label.confirmed_at,
+            ).isoformat(timespec="microseconds")
         digest_entries.append({
             "event_id": str(transaction.event_id),
+            "replay_input_digest": _fingerprint({
+                "domain": "synthetic-matured-lineage-replay-input-v1",
+                "event": event_payload,
+            }),
             "lineage_digest": lineage.fingerprint(),
             "label_status": label_status,
             "label_confirmed_at": (
@@ -318,7 +342,7 @@ def replay_offline_matured_lineage(
 
     canonical = dumps(
         {
-            "domain": REPORT_VERSION,
+            "domain": COHORT_DIGEST_VERSION,
             "scope": {
                 "tenant": scope.tenant_id,
                 "dataset": scope.dataset_digest,
