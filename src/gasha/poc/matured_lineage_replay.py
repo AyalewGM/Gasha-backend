@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from json import dumps
@@ -172,9 +172,7 @@ def replay_offline_matured_lineage(
     if type(scope) is not OfflineCohortScope:
         raise HistoricalLineageRejected("typed offline cohort scope required")
     try:
-        scope = OfflineCohortScope(**{
-            key: getattr(scope, key) for key in OfflineCohortScope.__dataclass_fields__
-        })
+        scope = replace(scope)
     except AttributeError:
         raise HistoricalLineageRejected("missing offline cohort scope field") from None
     if type(events) is not tuple or type(lineages) is not tuple:
