@@ -194,6 +194,8 @@ def replay_offline_matured_lineage(
             event_id = lineage.event_id
         except AttributeError:
             raise HistoricalLineageRejected("missing lineage event identity") from None
+        if type(event_id) is not UUID:
+            raise HistoricalLineageRejected("invalid lineage event identity")
         if event_id in lineage_by_event:
             raise HistoricalLineageRejected("duplicate lineage event identity")
         lineage_by_event[event_id] = lineage
@@ -224,6 +226,13 @@ def replay_offline_matured_lineage(
         lineage = lineage_by_event.get(transaction.event_id)
         if lineage is None:
             raise HistoricalLineageRejected("missing complete event lineage")
+        # Validate nested caller-owned lineage before dereferencing its versions
+        # or clocks. Otherwise damaged frozen fields could fail outside the
+        # explicit offline rejection boundary.
+        assert_historical_snapshot_bound(
+            lineage, transaction=transaction, snapshot=event.intelligence,
+            expected_tenant=scope.tenant_id, expected_dataset_digest=scope.dataset_digest,
+        )
         if (
             lineage.cohort_version != scope.cohort_version
             or lineage.mapping_version != scope.mapping_version
@@ -239,11 +248,6 @@ def replay_offline_matured_lineage(
             or _utc(lineage.decision_cutoff) > scope.label_cutoff
         ):
             raise HistoricalLineageRejected("missing or invalid historical receipt/cutoff")
-        assert_historical_snapshot_bound(
-            lineage, transaction=transaction, snapshot=event.intelligence,
-            expected_tenant=scope.tenant_id, expected_dataset_digest=scope.dataset_digest,
-        )
-
         label = event.label
         label_status = "absent_labels"
         if label is not None:
@@ -261,6 +265,11 @@ def replay_offline_matured_lineage(
             "event_id": str(transaction.event_id),
             "lineage_digest": lineage.fingerprint(),
             "label_status": label_status,
+            "label_confirmed_at": (
+                _utc(label.confirmed_at).isoformat()
+                if label is not None and label.confirmed_at is not None else ""
+            ),
+            "label_source": label.label_source if label is not None else "",
             "matured_label": str(label.is_fraud) if label_status.startswith("matured_") else "",
         })
     if set(lineage_by_event) != seen:
@@ -269,8 +278,19 @@ def replay_offline_matured_lineage(
     canonical = dumps(
         {
             "domain": REPORT_VERSION,
-            "tenant": scope.tenant_id, "dataset": scope.dataset_digest,
-            "cohort": scope.cohort_version,
+            "scope": {
+                "tenant": scope.tenant_id,
+                "dataset": scope.dataset_digest,
+                "cohort": scope.cohort_version,
+                "mapping": scope.mapping_version,
+                "configuration": scope.configuration_version,
+                "policy": scope.policy_version,
+                "rule": scope.rule_version,
+                "signal_policy": scope.signal_policy_version,
+                "window_start": scope.window_start.isoformat(),
+                "window_end": scope.window_end.isoformat(),
+                "label_cutoff": scope.label_cutoff.isoformat(),
+            },
             "entries": sorted(digest_entries, key=lambda item: item["event_id"]),
         },
         sort_keys=True, separators=(",", ":"), ensure_ascii=True,
