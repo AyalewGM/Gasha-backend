@@ -631,3 +631,65 @@ def test_replay_accepts_valid_packet_with_verified_approval_history() -> None:
     replayed = EvidenceLifecycle(existing.packet, existing.events)
     assert replayed.events == existing.events
     assert replayed.packet.packet_digest() == existing.packet.packet_digest()
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("binding", None),
+        ("records", None),
+        ("records", []),
+        ("evaluator_version", ""),
+    ],
+)
+def test_transition_rejects_mutated_packet_before_tenant_lookup_or_reader(
+    field: str, replacement: Any,
+) -> None:
+    lifecycle = submitted()
+    reader = ArtifactReader()
+    original_events = lifecycle.events
+    object.__setattr__(lifecycle.packet, field, replacement)
+    with pytest.raises(LifecycleRejected, match="invalid evidence packet"):
+        apply(
+            lifecycle, EvidenceAction.VERIFY, VERIFIER,
+            UUID(int=1), reader=reader,
+        )
+    assert reader.calls == 0
+    assert lifecycle.events == original_events
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("capabilities", frozenset({"evidence.verify"})),
+        ("tenant_ids", frozenset({123})),
+        ("expires_at", None),
+        ("subject", ""),
+    ],
+)
+def test_transition_rejects_mutated_principal_before_authorization_or_reader(
+    field: str, replacement: Any,
+) -> None:
+    lifecycle = submitted()
+    reader = ArtifactReader()
+    principal = actor("verifier", Capability.EVIDENCE_VERIFY)
+    object.__setattr__(principal, field, replacement)
+    with pytest.raises(LifecycleRejected, match="invalid trusted principal"):
+        apply(
+            lifecycle, EvidenceAction.VERIFY, principal,
+            UUID(int=1), reader=reader,
+        )
+    assert reader.calls == 0
+    assert len(lifecycle.events) == 2
+
+
+@pytest.mark.parametrize("missing", ["subject", "capabilities", "expires_at"])
+def test_transition_rejects_deleted_principal_field(missing: str) -> None:
+    principal = actor("verifier", Capability.EVIDENCE_VERIFY)
+    object.__delattr__(principal, missing)
+    reader = ArtifactReader()
+    with pytest.raises(LifecycleRejected, match="invalid trusted principal"):
+        apply(
+            submitted(), EvidenceAction.VERIFY, principal,
+            UUID(int=1), reader=reader,
+        )
+    assert reader.calls == 0
