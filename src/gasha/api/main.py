@@ -548,7 +548,7 @@ def get_case_queue(
     It is inoperative without a trusted tenant-scoped installed reader.
     """
     action = Capability.CASE_READ
-    audit_scope = UUID(int=0)  # Generated read-operation reference, not an event claim.
+    audit_scope = uuid4()  # Unique server-generated reference for this queue read.
     _require_action(request, principal, tenant_id, action, event_id=audit_scope)
     reader: TrustedCaseQueueReader | None = getattr(
         request.app.state, "case_queue_reader", None
