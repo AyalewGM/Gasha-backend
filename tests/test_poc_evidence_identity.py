@@ -15,6 +15,7 @@ from gasha.poc.evidence_identity import (
     assert_packet_current,
 )
 from gasha.poc.readiness import EvidenceArea, Stage
+from gasha.poc.evidence_lifecycle import EvidenceLifecycle
 
 NOW = datetime(2026, 10, 31, 20, 0, tzinfo=UTC)
 
@@ -326,3 +327,84 @@ def test_dst_collection_and_expiry_exact_instant_boundaries() -> None:
         )
     with pytest.raises(EvidenceIdentityRejected, match="expired"):
         assert_packet_current(sample, expected=late, now=expiry)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("records", ()),
+    ("records", []),
+    ("evaluator_version", ""),
+    ("binding", "caller-supplied-scope"),
+])
+def test_mutated_packet_shape_rejected_before_fingerprint_or_freshness(
+    field: str, value: Any,
+) -> None:
+    sample = packet()
+    object.__setattr__(sample, field, value)
+    with pytest.raises(EvidenceIdentityRejected):
+        sample.packet_digest()
+    with pytest.raises(EvidenceIdentityRejected):
+        assert_packet_current(sample, expected=binding(), now=NOW)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("area", "security"),
+    ("evidence_id", "1"),
+    ("artifact_digest", "d" * 64),
+    ("collected_at", datetime(2026, 10, 31, 20)),
+])
+def test_mutated_record_shape_rejected_before_fingerprint_or_freshness(
+    field: str, value: Any,
+) -> None:
+    sample = packet()
+    object.__setattr__(sample.records[0], field, value)
+    with pytest.raises(EvidenceIdentityRejected):
+        sample.packet_digest()
+    with pytest.raises(EvidenceIdentityRejected):
+        assert_packet_current(sample, expected=binding(), now=NOW)
+
+
+def test_postconstruction_duplicate_and_cross_scope_records_fail_closed() -> None:
+    duplicate = packet()
+    object.__setattr__(duplicate.records[1], "evidence_id", duplicate.records[0].evidence_id)
+    with pytest.raises(EvidenceIdentityRejected, match="duplicate evidence_id"):
+        duplicate.packet_digest()
+
+    cross_scope = packet()
+    object.__setattr__(cross_scope.records[0].binding, "tenant_id", "other-tenant")
+    with pytest.raises(EvidenceIdentityRejected, match="cross-scope"):
+        assert_packet_current(cross_scope, expected=binding(), now=NOW)
+
+
+def test_expected_binding_is_revalidated_not_just_equal() -> None:
+    sample = packet()
+    expected = binding()
+    object.__setattr__(expected, "stage", "shadow")
+    with pytest.raises(EvidenceIdentityRejected, match="Stage enum"):
+        assert_packet_current(sample, expected=expected, now=NOW)
+
+
+@pytest.mark.parametrize("level,field", [
+    ("packet", "records"),
+    ("binding", "tenant_id"),
+    ("record", "evidence_id"),
+])
+def test_deleted_nested_attributes_fail_with_domain_error(level: str, field: str) -> None:
+    sample = packet()
+    target: object = {
+        "packet": sample,
+        "binding": sample.binding,
+        "record": sample.records[0],
+    }[level]
+    object.__delattr__(target, field)
+    with pytest.raises(EvidenceIdentityRejected, match="missing"):
+        sample.packet_digest()
+    with pytest.raises(EvidenceIdentityRejected, match="missing"):
+        assert_packet_current(sample, expected=binding(), now=NOW)
+
+
+def test_mutated_empty_packet_never_becomes_approvable_empty_lifecycle() -> None:
+    """An emptied packet must fail replay, not satisfy an all-records-verified check."""
+    sample = packet()
+    object.__setattr__(sample, "records", ())
+    with pytest.raises(EvidenceIdentityRejected, match="nonempty"):
+        EvidenceLifecycle(sample)
