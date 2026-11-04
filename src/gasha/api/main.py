@@ -613,8 +613,8 @@ def _validated_case_transition_result(
         or (event.disposition is not None
             and type(event.disposition) is not CaseDisposition)
         or event.disposition is not proposal.disposition
-        or (event.disposition is None)
-        != (selected in {CaseOperation.DISPOSE, CaseOperation.CORRECT})
+        or ((event.disposition is not None)
+            != (selected in {CaseOperation.DISPOSE, CaseOperation.CORRECT}))
         or (selected is CaseOperation.DISPOSE and (
             event.disposition is None
             or _CASE_DISPOSITION_REASONS[event.disposition] is not event.reason_code
