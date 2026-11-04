@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from json import dumps
 from uuid import UUID
@@ -416,3 +416,84 @@ def test_deleted_policy_attribute_fails_closed_before_replay(
     with pytest.raises(HistoricalLineageRejected, match="invalid offline decision policy"):
         replay_offline_matured_lineage(scope(), (event,), (lineage,), damaged)
     assert not called
+
+
+@pytest.mark.parametrize("mutation", [
+    "amount", "channel", "beneficiary", "reason_codes", "receipt_clock",
+])
+def test_cohort_digest_binds_all_material_replay_inputs(mutation: str) -> None:
+    """Same dataset claim and signal lineage must not alias different replay rows."""
+    event, lineage = sample(1, risk=0.80, confirmed_at=AT + timedelta(days=2))
+    original = replay_offline_matured_lineage(
+        scope(), (event,), (lineage,), policy(),
+    )
+    if mutation == "amount":
+        transaction = event.transaction.model_copy(update={"amount": Decimal("150.25")})
+        modified = event.model_copy(update={"transaction": transaction})
+    elif mutation == "channel":
+        transaction = event.transaction.model_copy(update={"channel": "internet"})
+        modified = event.model_copy(update={"transaction": transaction})
+    elif mutation == "beneficiary":
+        transaction = event.transaction.model_copy(
+            update={"beneficiary_id": "private-beneficiary-OTHER"},
+        )
+        modified = event.model_copy(update={"transaction": transaction})
+    elif mutation == "reason_codes":
+        modified = event.model_copy(
+            update={"evidence_reason_codes": ("SYNTHETIC_RULE_MATCH",)},
+        )
+    else:
+        modified = event.model_copy(
+            update={"received_at": AT + timedelta(seconds=2)},
+        )
+
+    changed = replay_offline_matured_lineage(
+        scope(), (modified,), (lineage,), policy(),
+    )
+    assert changed.cohort_digest != original.cohort_digest
+    assert changed.evaluation_digest != original.evaluation_digest
+    assert changed.policy_digest == original.policy_digest
+    assert original.to_dict()["cohort_digest_version"] == (
+        "synthetic-matured-lineage-cohort-input-v2"
+    )
+    exported = dumps(changed.to_dict(), sort_keys=True)
+    for private in (
+        "private-beneficiary", "private-account", "private-customer",
+        "private-correlation", "SYNTHETIC_RULE_MATCH",
+    ):
+        assert private not in exported
+
+
+def test_equivalent_replay_clocks_have_same_cohort_identity() -> None:
+    event, lineage = sample(1, risk=0.80, confirmed_at=AT + timedelta(days=2))
+    other_zone = timezone(timedelta(hours=-5))
+    equivalent_transaction = event.transaction.model_copy(
+        update={"occurred_at": AT.astimezone(other_zone)},
+    )
+    equivalent_label = ConfirmedOutcomeLabel(
+        is_fraud=True, label_source="synthetic-analyst",
+        confirmed_at=(AT + timedelta(days=2)).astimezone(other_zone),
+    )
+    equivalent_event = event.model_copy(update={
+        "transaction": equivalent_transaction,
+        "received_at": (AT + timedelta(seconds=1)).astimezone(other_zone),
+        "label": equivalent_label,
+    })
+    first = check((event, lineage))
+    second = check((equivalent_event, lineage))
+    assert first["cohort_digest"] == second["cohort_digest"]
+    assert first["evaluation_digest"] == second["evaluation_digest"]
+
+
+def test_future_label_value_is_not_embedded_in_eligible_replay_identity() -> None:
+    event, lineage = sample(1, risk=0.80, label=True,
+                            confirmed_at=AT + timedelta(days=11))
+    masked_alternative = event.model_copy(update={
+        "label": ConfirmedOutcomeLabel(
+            is_fraud=False, label_source="synthetic-analyst",
+            confirmed_at=AT + timedelta(days=11),
+        ),
+    })
+    assert check((event, lineage))["cohort_digest"] == check(
+        (masked_alternative, lineage),
+    )["cohort_digest"]

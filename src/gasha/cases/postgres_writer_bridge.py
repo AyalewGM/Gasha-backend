@@ -79,10 +79,16 @@ class _ScopedEvaluationLookup:
     def resolve(self, tenant_id: str, event_id: UUID) -> VerifiedEvaluation:
         if tenant_id != self._tenant_id or type(event_id) is not UUID:
             raise CaseSourceUnavailable("invalid tenant-scoped evaluation selector")
+        # An installed callback must never receive the principal later used
+        # by the case kernel. A callback can defeat frozen dataclasses via
+        # object.__setattr__, so check its detached argument before SQL insert.
+        delegated = replace(self._principal)
         result = self._directory.resolve(
-            principal=self._principal, tenant_id=tenant_id,
+            principal=delegated, tenant_id=tenant_id,
             event_id=event_id, at=self._at,
         )
+        if delegated != self._principal:
+            raise CaseSourceUnavailable("evaluation directory changed principal")
         if (
             type(result) is not VerifiedEvaluation
             or type(result.tenant_id) is not str
@@ -131,12 +137,18 @@ class ExplicitPostgresCaseTransitionWriter:
         # Defend against a stale or damaged principal from a misconfigured
         # in-process verifier, and re-check both expiry and least privilege.
         try:
-            principal = replace(principal)
+            # Capture an independent accepted identity before any external
+            # directory callback. Only immutable scalar/frozenset/datetime
+            # fields are present in this validated TrustedPrincipal.
+            accepted_principal = replace(principal)
         except (TypeError, AttributeError, ValueError) as exc:
             raise AuthorizationRejected("invalid principal") from exc
-        if principal.expires_at.astimezone(UTC) <= at.astimezone(UTC):
+        if accepted_principal.expires_at.astimezone(UTC) <= at.astimezone(UTC):
             raise AuthorizationRejected("expired principal")
-        authorize(principal, tenant_id=tenant_id, capability=_CAPABILITIES[operation])
+        authorize(
+            accepted_principal, tenant_id=tenant_id,
+            capability=_CAPABILITIES[operation],
+        )
 
         # Keep one detached snapshot: a mutable request object or resolver must
         # not change the accepted command between authorization and SQL commit.
@@ -148,10 +160,16 @@ class ExplicitPostgresCaseTransitionWriter:
         if operation is CaseOperation.ASSIGN:
             if snapshot.assignee_selector is None or self._assignees is None:
                 raise CaseRejected("server assignee directory required")
+            # Never hand a directory the authoritative identity or the
+            # kernel's principal. Detect even an otherwise valid resolver
+            # response if the callback mutated its own supplied identity.
+            delegated = replace(accepted_principal)
             resolved = self._assignees.resolve(
-                principal=principal, tenant_id=tenant_id,
+                principal=delegated, tenant_id=tenant_id,
                 selector=snapshot.assignee_selector, at=at,
             )
+            if delegated != accepted_principal:
+                raise CaseRejected("assignee directory changed principal")
             if (
                 type(resolved) is not AuthorizedAssignee
                 or type(resolved.tenant_id) is not str
@@ -171,10 +189,20 @@ class ExplicitPostgresCaseTransitionWriter:
             reason_code=snapshot.reason_code,
             disposition=snapshot.disposition, assignee=assignee,
         )
+        # Reauthorize at the transactional decision boundary. Callback-
+        # specific copies cannot rebind the actor used for event and audit.
+        if accepted_principal.expires_at.astimezone(UTC) <= at.astimezone(UTC):
+            raise AuthorizationRejected("expired principal")
+        authorize(
+            accepted_principal, tenant_id=tenant_id,
+            capability=_CAPABILITIES[operation],
+        )
+        kernel_principal = replace(accepted_principal)
         source = _ScopedEvaluationLookup(
-            self._evaluations, principal=principal, tenant_id=tenant_id, at=at,
+            self._evaluations, principal=replace(accepted_principal),
+            tenant_id=tenant_id, at=at,
         )
         with self._connections() as connection:
             return PostgresCaseTimelineService(connection).apply(
-                command, principal=principal, source=source, at=at,
+                command, principal=kernel_principal, source=source, at=at,
             )

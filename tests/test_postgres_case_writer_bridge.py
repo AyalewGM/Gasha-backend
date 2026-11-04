@@ -59,6 +59,7 @@ class EvaluationDirectory:
     def __init__(self) -> None:
         self.calls = 0
         self.wrong_tenant = False
+        self.mutate_principal_field: str | None = None
 
     def resolve(
         self, *, principal: TrustedPrincipal, tenant_id: str,
@@ -66,6 +67,10 @@ class EvaluationDirectory:
     ) -> VerifiedEvaluation:
         self.calls += 1
         assert at.utcoffset() is not None
+        if self.mutate_principal_field is not None:
+            object.__setattr__(
+                principal, self.mutate_principal_field, "forged-evaluation-identity",
+            )
         if tenant_id != "tenant-a" or event_id != EVENT:
             raise LookupError("synthetic source unavailable")
         return VerifiedEvaluation(
@@ -78,12 +83,17 @@ class AssigneeDirectory:
     def __init__(self) -> None:
         self.calls = 0
         self.wrong_tenant = False
+        self.mutate_principal_field: str | None = None
 
     def resolve(
         self, *, principal: TrustedPrincipal, tenant_id: str,
         selector: UUID, at: datetime,
     ) -> AuthorizedAssignee:
         self.calls += 1
+        if self.mutate_principal_field is not None:
+            object.__setattr__(
+                principal, self.mutate_principal_field, "forged-assignee-identity",
+            )
         if selector != ASSIGNEE or tenant_id != "tenant-a":
             raise LookupError("unknown synthetic assignee")
         return AuthorizedAssignee(
@@ -257,3 +267,49 @@ def test_postgres_audit_insert_outage_rolls_back_case_event(wired) -> None:
         assert row is not None and row["n"] == 0
     assert any(getattr(item, "reason", None) == "case_transition_unavailable"
                for item in ingress.events)
+
+
+@pytest.mark.parametrize("field", ("subject", "issuer"))
+def test_evaluation_directory_cannot_rebind_actor_before_commit(wired, field: str) -> None:
+    client, schema, ingress, evaluations, _assignees, _connections = wired
+    evaluations.mutate_principal_field = field
+    response = post(client, "create", body("source_evaluation", 0))
+    assert response.status_code == 503
+    # These are durable case-event and terminal-success-audit counts;
+    # protected ingress denial is retained separately in memory.
+    assert counts(schema) == (0, 0)
+    assert any(
+        getattr(event, "reason", None) == "case_transition_unavailable"
+        for event in ingress.events
+    )
+
+
+@pytest.mark.parametrize("field", ("subject", "issuer"))
+def test_assignee_directory_cannot_rebind_actor_before_commit(wired, field: str) -> None:
+    client, schema, ingress, _evaluations, assignees, _connections = wired
+    assert post(client, "create", body("source_evaluation", 0)).status_code == 200
+    assert post(client, "triage", body("analyst_triage", 1)).status_code == 200
+    before = counts(schema)
+    assert before == (2, 2)
+    assignees.mutate_principal_field = field
+    response = post(
+        client, "assign", body(
+            "investigation_assigned", 2, assignee_selector=str(ASSIGNEE),
+        ),
+    )
+    assert response.status_code == 503
+    assert counts(schema) == before  # zero newly committed event/success-audit rows
+    with connect(schema) as connection:
+        event_actors = connection.execute(
+            "SELECT actor_ref FROM analyst_case_events ORDER BY revision",
+        ).fetchall()
+        audit_actors = connection.execute(
+            "SELECT actor_ref FROM security_audit_events ORDER BY id",
+        ).fetchall()
+    expected_actor = principal().audit_actor
+    assert all(row["actor_ref"] == expected_actor for row in event_actors)
+    assert all(row["actor_ref"] == expected_actor for row in audit_actors)
+    assert any(
+        getattr(event, "reason", None) == "case_transition_unavailable"
+        for event in ingress.events
+    )
