@@ -435,3 +435,43 @@ def test_equivalent_utc_offset_instants_keep_timing_canonical() -> None:
     assert _report(history, clocks=(clock,))["alert_latency"] == (
         _report(history, clocks=(shifted,))["alert_latency"]
     )
+
+
+@pytest.mark.parametrize(("field", "bad_value"), [
+    ("tenant_id", "tenant-b"),
+    ("case_id", "not-a-uuid"),
+    ("source_event_id", "not-a-uuid"),
+    ("source_event_at", AS_OF - timedelta(minutes=70)),
+    ("alert_emitted_at", AS_OF - timedelta(minutes=90)),
+    ("source_event_at", "2026-11-01T18:00:00Z"),
+    ("alert_emitted_at", None),
+])
+def test_post_construction_mutated_alert_clock_is_rejected(
+    field: str, bad_value: object,
+) -> None:
+    history = _done()
+    clock = _clock(history)
+    # Frozen/slotted dataclasses still permit low-level mutation.
+    object.__setattr__(clock, field, bad_value)
+    with pytest.raises(CaseMetricsRejected):
+        _report(history, clocks=(clock,))
+
+
+@pytest.mark.parametrize("field", [
+    "tenant_id", "case_id", "source_event_id",
+    "source_event_at", "alert_emitted_at",
+])
+def test_deleted_alert_clock_attribute_is_rejected(field: str) -> None:
+    history = _done()
+    clock = _clock(history)
+    object.__delattr__(clock, field)
+    with pytest.raises(CaseMetricsRejected, match="invalid synthetic alert clock"):
+        _report(history, clocks=(clock,))
+
+
+def test_valid_synthetic_clock_still_reports_nonnegative_latency() -> None:
+    history = _done()
+    report = _report(history, clocks=(_clock(history),))
+    assert report["alert_latency"]["count"] == 1
+    assert report["alert_latency"]["mean_seconds"] == 120.0
+    assert report["alert_latency"]["missing_count"] == 0
