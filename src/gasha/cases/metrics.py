@@ -7,7 +7,7 @@ Nothing here reads/writes storage, authenticates users, or invokes a payment act
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -159,8 +159,17 @@ def summarize_synthetic_case_metrics(
 
     observed_clocks: set[UUID] = set()
     latencies: list[float] = []
-    for clock in alert_clocks:
-        if type(clock) is not SyntheticAlertClock or clock.tenant_id != tenant_id:
+    for untrusted_clock in alert_clocks:
+        if type(untrusted_clock) is not SyntheticAlertClock:
+            raise CaseMetricsRejected("wrong-tenant or untyped alert clock")
+        # Reconstruct each caller-supplied clock before using its times or
+        # identifiers. A frozen/slotted record can be altered or damaged after
+        # construction; a negative latency must never enter a KPI aggregate.
+        try:
+            clock = replace(untrusted_clock)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise CaseMetricsRejected("invalid synthetic alert clock") from exc
+        if clock.tenant_id != tenant_id:
             raise CaseMetricsRejected("wrong-tenant or untyped alert clock")
         matching = by_case.get(clock.case_id)
         if (
