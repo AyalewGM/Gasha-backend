@@ -39,6 +39,7 @@ jobs:
           python -m pytest -vv -rA --junitxml=test-results/protected-api.xml \
             tests/test_api_security.py \
             tests/test_api_case_history.py \
+            tests/test_api_case_transitions.py \
             tests/test_security_access.py \
             tests/test_audit_actor_identity.py
       - name: Require executed negative tests without skipped cases
