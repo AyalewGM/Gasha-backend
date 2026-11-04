@@ -205,6 +205,50 @@ def test_reader_failure_redacts_and_denies(wired_queue):
                for e in audit.events)
 
 
+
+@pytest.mark.parametrize(
+    ("token", "reader_fails", "expected_status", "expected_results"),
+    [
+        ("valid", False, 200, ("authorized", "succeeded")),
+        ("valid", True, 503, ("authorized", "failed")),
+        ("no-read", False, 403, ("denied",)),
+    ],
+)
+def test_queue_read_audit_correlation_is_request_unique(
+    wired_queue, token, reader_fails, expected_status, expected_results,
+):
+    """Authorization and terminal audit correlate without reusing an operation ID."""
+    client, reader, audit = wired_queue
+    reader.fail = reader_fails
+    operation_refs = []
+    attempt_refs = []
+    for _ in range(2):
+        before = len(audit.events)
+        response = client.get(endpoint(), headers=bearer(token))
+        assert response.status_code == expected_status, response.text
+        events = [
+            entry for entry in audit.events[before:]
+            if entry.action == Capability.CASE_READ.value
+        ]
+        assert tuple(entry.result for entry in events) == expected_results
+        # The operation is different for each HTTP request, but every
+        # authorization / terminal record within it uses the same reference.
+        assert len({entry.event_ref for entry in events}) == 1
+        assert len({entry.attempt_ref for entry in events}) == 1
+        assert events[0].event_ref
+        assert len(events[0].event_ref) == 64
+        assert set(events[0].event_ref) <= set("0123456789abcdef")
+        assert events[0].attempt_ref
+        assert all(entry.tenant_ref != "tenant-a" for entry in events)
+        operation_refs.append(events[0].event_ref)
+        attempt_refs.append(events[0].attempt_ref)
+    assert operation_refs[0] != operation_refs[1]
+    assert attempt_refs[0] != attempt_refs[1]
+    assert reader.calls == ([] if token == "no-read" else [("tenant-a", 25)] * 2)
+    assert "synthetic-queue-analyst-secret" not in str(audit.events)
+    assert "synthetic-credential-secret" not in str(audit.events)
+
+
 @pytest.mark.parametrize("mutate", [
     lambda s: replace(s, tenant_id="tenant-b"),
     lambda s: replace(s, ranking_policy_version="unapproved\nheader"),
