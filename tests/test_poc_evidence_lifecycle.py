@@ -544,3 +544,65 @@ def test_replay_submission_uses_utc_instants_across_dst_fold() -> None:
     )
     with pytest.raises(EvidenceIdentityRejected, match="future-dated"):
         EvidenceLifecycle(invalid, (invalid_event,))
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        ("action", "verify", "typed action"),
+        ("action", 0, "typed action"),
+        ("actor_ref", "", "pseudonymous actor"),
+        ("actor_ref", 1, "pseudonymous actor"),
+        ("at", datetime(2026, 10, 31, 20), "timezone-aware"),
+        ("at", None, "timezone-aware"),
+        ("packet_digest", 17, "packet digest"),
+        ("evidence_id", "1", "typed evidence_id"),
+    ],
+)
+def test_replay_revalidates_runtime_mutated_transition_fields(
+    field: str, value: object, reason: str,
+) -> None:
+    """Typed frozen history may be mutated after construction; never trust it."""
+    lifecycle = submitted()
+    forged = EvidenceTransition(
+        EvidenceAction.VERIFY, VERIFIER.audit_actor, NOW,
+        lifecycle.packet.packet_digest(), UUID(int=1),
+    )
+    object.__setattr__(forged, field, value)
+    with pytest.raises(LifecycleRejected, match=reason):
+        EvidenceLifecycle(lifecycle.packet, lifecycle.events + (forged,))
+
+
+@pytest.mark.parametrize(
+    "field", ("action", "actor_ref", "at", "packet_digest", "evidence_id"),
+)
+def test_replay_rejects_deleted_transition_attributes(field: str) -> None:
+    lifecycle = submitted()
+    forged = EvidenceTransition(
+        EvidenceAction.VERIFY, VERIFIER.audit_actor, NOW,
+        lifecycle.packet.packet_digest(), UUID(int=1),
+    )
+    object.__delattr__(forged, field)
+    with pytest.raises(LifecycleRejected, match="missing transition attribute"):
+        EvidenceLifecycle(lifecycle.packet, lifecycle.events + (forged,))
+
+
+def test_strenum_value_cannot_replay_as_a_different_lifecycle_action() -> None:
+    """A raw string 'verify' formerly compared equal, then fell into REVOKE."""
+    lifecycle = submitted()
+    forged = EvidenceTransition(
+        EvidenceAction.VERIFY, VERIFIER.audit_actor, NOW,
+        lifecycle.packet.packet_digest(), UUID(int=1),
+    )
+    object.__setattr__(forged, "action", "verify")
+    with pytest.raises(LifecycleRejected, match="typed action"):
+        EvidenceLifecycle(lifecycle.packet, lifecycle.events + (forged,))
+    # A forged history must fail before the privileged artifact resolver is read.
+    object.__setattr__(lifecycle, "events", lifecycle.events + (forged,))
+    reader = ArtifactReader()
+    with pytest.raises(LifecycleRejected, match="typed action"):
+        apply(
+            lifecycle, EvidenceAction.VERIFY, VERIFIER, UUID(int=1),
+            reader=reader,
+        )
+    assert reader.calls == 0

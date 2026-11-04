@@ -9,7 +9,7 @@ histories, verification results, or hashes are never trusted evidence.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from hmac import compare_digest
@@ -119,9 +119,17 @@ def _replay(lifecycle: EvidenceLifecycle) -> _State:
     approval_revoked = False
     last_at: datetime | None = None
     expected_digest = lifecycle.packet.packet_digest()
-    for event in lifecycle.events:
-        if type(event) is not EvidenceTransition:
+    for untrusted_event in lifecycle.events:
+        if type(untrusted_event) is not EvidenceTransition:
             raise LifecycleRejected("typed transition required")
+        # Frozen dataclass instances can be altered with object.__setattr__,
+        # or fields deleted after construction. Rebuild each entry so strict
+        # action/actor/clock/packet/evidence validation runs BEFORE the replay
+        # state machine; StrEnum string equality must not become authority.
+        try:
+            event = replace(untrusted_event)
+        except AttributeError:
+            raise LifecycleRejected("missing transition attribute") from None
         if event.packet_digest != expected_digest:
             raise LifecycleRejected("packet identity changed")
         if last_at is not None and event.at < last_at:
