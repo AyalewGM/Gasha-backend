@@ -304,7 +304,7 @@ def test_reference_matcher_has_no_production_consumer() -> None:
     ("snapshot", "entries", ("not-an-entry",)),
     ("snapshot", "published_at", datetime(2026, 10, 31)),
     ("entry", "kind", "block"),
-    ("entry", "effective_from", AT + timedelta(hours=1)),
+    ("entry", "effective_from", datetime(2026, 10, 31)),
     ("entry", "revoked_at", AT - timedelta(days=1)),
     ("subject", "kind", "beneficiary"),
     ("subject", "token", "untrusted"),
