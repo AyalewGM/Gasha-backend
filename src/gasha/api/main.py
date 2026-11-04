@@ -215,9 +215,13 @@ class TrustedDecisionRequest(BaseModel):
 
 
 class CaseTransitionInput(BaseModel):
-    """Only proposed state, never trusted principal, tenant, source or assignee."""
+    """Only proposed state, never trusted principal, tenant, source or assignee.
 
-    model_config = ConfigDict(extra="forbid")
+    All fields are immutable primitives/enums/UUIDs; freeze after validation.
+    The installed writer receives a separate copy, not the HTTP guard snapshot.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
     source_event_id: UUID
     expected_revision: int = Field(ge=0, strict=True)
     idempotency_key: str = Field(pattern=r"^[0-9a-f]{32}$")
@@ -604,10 +608,17 @@ def _validated_case_transition_result(
         or type(event.recorded_at) is not datetime
         or event.recorded_at.utcoffset() is None
         or type(event.reason_code) is not CaseReason
+        or event.reason_code not in _CASE_TRANSITION_REASONS[selected]
         or event.reason_code is not proposal.reason_code
         or (event.disposition is not None
             and type(event.disposition) is not CaseDisposition)
         or event.disposition is not proposal.disposition
+        or (event.disposition is None)
+        != (selected in {CaseOperation.DISPOSE, CaseOperation.CORRECT})
+        or (selected is CaseOperation.DISPOSE and (
+            event.disposition is None
+            or _CASE_DISPOSITION_REASONS[event.disposition] is not event.reason_code
+        ))
         or (event.assignee_ref is not None
             and (type(event.assignee_ref) is not str
                 or re.fullmatch(r"[0-9a-f]{64}", event.assignee_ref) is None))
@@ -680,6 +691,10 @@ def submit_case_transition(
             "invalid_case_transition",
         )
         raise HTTPException(status_code=422, detail="invalid case transition")
+    # Preserve an immutable, detached copy of the exact validated HTTP command.
+    # An installed writer may be misconfigured or bypass model immutability;
+    # neither its argument nor any returned hash may rewrite this reference.
+    accepted_proposal = proposal.model_copy(deep=True)
     writer: TrustedCaseTransitionWriter | None = getattr(
         request.app.state, "case_transition_writer", None
     )
@@ -692,7 +707,7 @@ def submit_case_transition(
     try:
         event = writer.apply(
             principal=principal, tenant_id=tenant_id, case_id=case_id,
-            operation=selected, proposal=proposal, at=utcnow(),
+            operation=selected, proposal=proposal.model_copy(deep=True), at=utcnow(),
         )
     except CaseConflict as exc:
         _operation_audit(
@@ -716,7 +731,7 @@ def submit_case_transition(
     try:
         event = _validated_case_transition_result(
             event, tenant_id=tenant_id, case_id=case_id,
-            selected=selected, proposal=proposal, principal=principal,
+            selected=selected, proposal=accepted_proposal, principal=principal,
         )
     except Exception as exc:
         _operation_audit(
