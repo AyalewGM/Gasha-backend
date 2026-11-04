@@ -15,11 +15,8 @@ from gasha.cases.timeline import (
     AuthorizedAssignee,
     BankExecution,
     CaseCommand,
-    CaseConflict,
-    CaseDisposition,
     CaseEvent,
     CaseOperation,
-    CaseReason,
     VerifiedEvaluation,
     advance_case,
 )
