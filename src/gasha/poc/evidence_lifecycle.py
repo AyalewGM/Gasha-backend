@@ -226,6 +226,19 @@ def propose_transition(
         raise LifecycleRejected("verified principal required")
     if not isinstance(now, datetime) or now.utcoffset() is None:
         raise LifecycleRejected("timezone-aware trusted clock required")
+    # Frozen principal objects can be corrupted after verification in-process.
+    # Rebuild before reading expiry, tenant scope, capabilities or actor identity;
+    # a raw StrEnum-equivalent string must never become an accepted capability.
+    try:
+        principal = replace(principal)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise LifecycleRejected("invalid trusted principal") from exc
+    # A valid lifecycle may be mutated after construction. Verify the packet
+    # and history before accessing its tenant binding for authorization.
+    try:
+        state = _replay(lifecycle)
+    except EvidenceIdentityRejected as exc:
+        raise LifecycleRejected("invalid evidence packet") from exc
     current = now.astimezone(UTC)
     if principal.expires_at.astimezone(UTC) <= current:
         raise LifecycleRejected("expired principal")
@@ -236,7 +249,6 @@ def propose_transition(
         )
     except AuthorizationRejected as exc:
         raise LifecycleRejected("tenant or capability denied") from exc
-    state = _replay(lifecycle)
     if state.last_at is not None and current < state.last_at:
         raise LifecycleRejected("transition clock moved backward")
     if action in (EvidenceAction.SUBMIT, EvidenceAction.VERIFY, EvidenceAction.APPROVE):
