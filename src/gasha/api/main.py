@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Annotated, NoReturn, Protocol
@@ -570,7 +570,7 @@ def get_case_history(
 def _validated_case_transition_result(
     event: object, *, tenant_id: str, case_id: UUID,
     selected: CaseOperation, proposal: CaseTransitionInput,
-    principal: TrustedPrincipal,
+    accepted_actor_ref: str,
 ) -> CaseEvent:
     """Bounded defense against malformed writer success claims.
 
@@ -604,7 +604,7 @@ def _validated_case_transition_result(
         or event.operation is not selected
         or type(event.actor_ref) is not str
         or re.fullmatch(r"[0-9a-f]{64}", event.actor_ref) is None
-        or event.actor_ref != principal.audit_actor
+        or event.actor_ref != accepted_actor_ref
         or type(event.recorded_at) is not datetime
         or event.recorded_at.utcoffset() is None
         or type(event.reason_code) is not CaseReason
@@ -646,7 +646,7 @@ def _validated_case_transition_result(
         disposition=proposal.disposition, assignee=assignee,
     )
     key_ref, command_ref = case_command_fingerprints(
-        command, actor_ref=principal.audit_actor,
+        command, actor_ref=accepted_actor_ref,
     )
     if event.idempotency_ref != key_ref or event.command_ref != command_ref:
         raise ValueError("case transition fingerprint mismatch")
@@ -695,6 +695,8 @@ def submit_case_transition(
     # An installed writer may be misconfigured or bypass model immutability;
     # neither its argument nor any returned hash may rewrite this reference.
     accepted_proposal = proposal.model_copy(deep=True)
+    # Bind response validation to the actor authenticated before writer entry.
+    accepted_actor_ref = principal.audit_actor
     writer: TrustedCaseTransitionWriter | None = getattr(
         request.app.state, "case_transition_writer", None
     )
@@ -706,7 +708,7 @@ def submit_case_transition(
         raise HTTPException(status_code=503, detail="case transition unavailable")
     try:
         event = writer.apply(
-            principal=principal, tenant_id=tenant_id, case_id=case_id,
+            principal=replace(principal), tenant_id=tenant_id, case_id=case_id,
             operation=selected, proposal=proposal.model_copy(deep=True), at=utcnow(),
         )
     except CaseConflict as exc:
@@ -731,7 +733,8 @@ def submit_case_transition(
     try:
         event = _validated_case_transition_result(
             event, tenant_id=tenant_id, case_id=case_id,
-            selected=selected, proposal=accepted_proposal, principal=principal,
+            selected=selected, proposal=accepted_proposal,
+            accepted_actor_ref=accepted_actor_ref,
         )
     except Exception as exc:
         _operation_audit(

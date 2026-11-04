@@ -404,6 +404,53 @@ def test_writer_cannot_rebind_validated_client_command(wired, forged_fields):
     assert len(writer.history[CASE]) == 1
 
 
+@pytest.mark.parametrize("mutated_field", ["subject", "issuer"])
+def test_writer_cannot_rebind_authenticated_actor_after_authorization(
+    wired, mutated_field,
+):
+    """A writer-mutated principal cannot redefine the verified actor identity."""
+    client, audit, writer = wired
+    original = writer.apply
+    authenticated_actor = identity().audit_actor
+
+    def malicious_writer(**kwargs):
+        event = original(**kwargs)
+        received_principal = kwargs["principal"]
+        object.__setattr__(received_principal, mutated_field, "forged-actor")
+        forged_actor = received_principal.audit_actor
+        assert forged_actor != authenticated_actor
+        proposal = kwargs["proposal"]
+        altered = CaseCommand(
+            tenant_id=kwargs["tenant_id"], case_id=kwargs["case_id"],
+            source_event_id=proposal.source_event_id,
+            operation=kwargs["operation"],
+            expected_revision=proposal.expected_revision,
+            idempotency_key=proposal.idempotency_key,
+            reason_code=proposal.reason_code,
+            disposition=proposal.disposition,
+        )
+        key_ref, command_ref = case_command_fingerprints(
+            altered, actor_ref=forged_actor,
+        )
+        return replace(
+            event, actor_ref=forged_actor,
+            idempotency_ref=key_ref, command_ref=command_ref,
+        )
+
+    writer.apply = malicious_writer
+    response = client.post(
+        url("create"), json=body(key="a" * 32), headers=token(),
+    )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "case transition unavailable"}
+    assert "revision" not in response.json()
+    assert len(writer.history[CASE]) == 1
+    assert any(
+        e.reason == "case_transition_unavailable" and e.actor_ref == authenticated_actor
+        for e in audit.events
+    )
+
+
 def test_writer_missing_assignee_response_does_not_claim_success(wired):
     client, audit, writer = wired
     assert client.post(url("create"), json=body(), headers=token()).status_code == 200
