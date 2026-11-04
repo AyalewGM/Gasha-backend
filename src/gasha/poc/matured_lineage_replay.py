@@ -221,9 +221,10 @@ def replay_offline_matured_lineage(
         ):
             raise HistoricalLineageRejected("cohort tenant/window/duplicate event mismatch")
         seen.add(transaction.event_id)
-        lineage = lineage_by_event.get(transaction.event_id)
-        if lineage is None:
+        selected_lineage = lineage_by_event.get(transaction.event_id)
+        if selected_lineage is None:
             raise HistoricalLineageRejected("missing complete event lineage")
+        lineage = selected_lineage
         # Validate nested caller-owned lineage before dereferencing its versions
         # or clocks. Otherwise damaged frozen fields could fail outside the
         # explicit offline rejection boundary.
@@ -268,7 +269,10 @@ def replay_offline_matured_lineage(
                 if label is not None and label.confirmed_at is not None else ""
             ),
             "label_source": label.label_source if label is not None else "",
-            "matured_label": str(label.is_fraud) if label_status.startswith("matured_") else "",
+            "matured_label": (
+                str(label.is_fraud)
+                if label is not None and label_status.startswith("matured_") else ""
+            ),
         })
     if set(lineage_by_event) != seen:
         raise HistoricalLineageRejected("orphan lineage outside cohort")
