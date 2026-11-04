@@ -589,7 +589,7 @@ def submit_case_transition(
         == (selected in {CaseOperation.DISPOSE, CaseOperation.CORRECT})
         and (
             selected is not CaseOperation.DISPOSE
-            or _CASE_DISPOSITION_REASONS.get(proposal.disposition) is proposal.reason_code
+            or (proposal.disposition is not None and _CASE_DISPOSITION_REASONS[proposal.disposition] is proposal.reason_code)
         )
     )
     if not valid_shape:
