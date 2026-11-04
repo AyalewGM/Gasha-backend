@@ -62,7 +62,11 @@ def test_actual_existing_uc01_uc02_uc03_path_across_two_isolated_workers() -> No
     assert payload["latency_ms"]["sample_count"] == 34
     assert payload["latency_ms"]["p95"] <= payload["latency_ms"]["p99"]
     assert payload["latency_ms"]["p99"] <= payload["latency_ms"]["max"]
-    assert payload["measurement_window"] == "wall_clock_spanning_concurrent_workers"
+    assert payload["measurement_window"] == "unavailable_warmup_not_isolated"
+    assert payload["observed_events_per_second"] is None
+    assert payload["throughput_undefined_reason"] == "warmup_not_separately_timed"
+    assert payload["measured_window_elapsed_seconds"] is None
+    assert payload["whole_run_elapsed_seconds"] == payload["elapsed_seconds"]
     assert payload["source"] == "synthetic_only"
     assert payload["bank_kpi_approved"] is False
     assert payload["bank_delivery_accepted"] is False
@@ -95,6 +99,9 @@ def test_aggregate_uses_all_event_samples_and_one_overlapping_wall_clock() -> No
     payload = report.to_dict()
     assert payload["attempted_events"] == 2
     assert payload["observed_events_per_second"] == 20.0
+    assert payload["measurement_window"] == "whole_run_without_warmup"
+    assert payload["throughput_undefined_reason"] is None
+    assert payload["measured_window_elapsed_seconds"] == 0.1
     assert payload["latency_ms"]["mean"] == 50.5
     assert payload["latency_ms"]["p95"] == 100.0
     assert payload["latency_ms"]["p99"] == 100.0
@@ -159,13 +166,17 @@ def test_mismatched_worker_evidence_is_not_aggregated() -> None:
         )
 
 
-def test_unexpected_worker_exception_aborts_without_emitting_partial_report() -> None:
+@pytest.mark.parametrize("warmup", [0, 1, 5])
+def test_unexpected_worker_exception_aborts_without_emitting_partial_report(
+    warmup: int,
+) -> None:
     def crashed(_: SyntheticLoadConfig) -> SyntheticLoadReport:
         raise RuntimeError("synthetic-test-worker-failed")
 
     with pytest.raises(RuntimeError, match="synthetic-test-worker-failed"):
         run_concurrent_synthetic_shadow(
-            ConcurrentSyntheticConfig(workers=2), worker_runner=crashed,
+            ConcurrentSyntheticConfig(workers=2, warmup_per_worker=warmup),
+            worker_runner=crashed,
         )
 
 
@@ -180,3 +191,60 @@ def test_concurrent_report_rejects_wrong_aggregate_iteration_identity() -> None:
         ConcurrentSyntheticReport(
             ConcurrentSyntheticConfig(workers=2), aggregate,
         )
+
+
+@pytest.mark.parametrize(
+    ("workers", "warmup", "duration_ns", "expected_rate"),
+    [
+        (1, 0, 50_000_000, 20.0),
+        (2, 0, 50_000_000, 40.0),
+        (1, 1, 50_000_000, None),
+        (1, 5, 500_000_000, None),
+        (2, 1, 50_000_000, None),
+        (2, 5, 500_000_000, None),
+    ],
+)
+def test_measured_rate_never_divides_by_warmup_contaminated_window(
+    workers: int, warmup: int, duration_ns: int, expected_rate: float | None,
+) -> None:
+    # The controlled clock represents either a short warm-up or a slow worker
+    # warm-up; measured attempt counts stay fixed. The true measured-window
+    # clock is unavailable if the baseline performs warm-up in its worker.
+    def fake_worker(config: SyntheticLoadConfig) -> SyntheticLoadReport:
+        return SyntheticLoadReport(
+            config=config, attempted_events=1, evaluated_payments=1,
+            accepted_journey_events=0, duplicate_events=0, failed_events=0,
+            failure_types={}, elapsed_seconds=0.01,
+            event_latencies_ms=(1.0,),
+        )
+
+    clock_times = iter((10_000_000, 10_000_000 + duration_ns))
+    payload = run_concurrent_synthetic_shadow(
+        ConcurrentSyntheticConfig(
+            workers=workers, warmup_per_worker=warmup,
+        ),
+        worker_runner=fake_worker,
+        clock_ns=lambda: next(clock_times),
+    ).to_dict()
+    assert payload["attempted_events"] == workers
+    assert payload["observed_events_per_second"] == expected_rate
+    assert payload["whole_run_elapsed_seconds"] == duration_ns / 1_000_000_000
+    assert payload["measured_window_elapsed_seconds"] == (
+        None if warmup else duration_ns / 1_000_000_000
+    )
+    assert payload["throughput_undefined_reason"] == (
+        "warmup_not_separately_timed" if warmup else None
+    )
+    assert payload["latency_ms"]["sample_count"] == workers
+    assert payload["enforcement_activated"] is False
+    json.dumps(payload, allow_nan=False)
+
+
+def test_zero_duration_without_warmup_has_explicit_undefined_reason() -> None:
+    payload = run_concurrent_synthetic_shadow(
+        ConcurrentSyntheticConfig(workers=1),
+        clock_ns=lambda: 42,
+    ).to_dict()
+    assert payload["observed_events_per_second"] is None
+    assert payload["throughput_undefined_reason"] == "zero_elapsed_window"
+    assert payload["measured_window_elapsed_seconds"] == 0.0

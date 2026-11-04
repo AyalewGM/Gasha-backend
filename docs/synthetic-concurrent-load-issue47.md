@@ -23,12 +23,24 @@ the entire run; no successful partial result is emitted.
 The aggregation reuses the existing strict `SyntheticLoadReport` validator:
 all accepted journeys, payments, transport duplicates, failures, and latency
 samples must reconcile to *one measured attempted-event population*.
-Failure labels are sanitized exception class names only. Thread results
-are accumulated with an overlapping **process wall-clock window** for
-observed events/sec, not the sum of each worker's elapsed seconds.
+Failure labels are sanitized exception class names only. The outer process
+wall clock spans thread dispatch through join. **With warm-up enabled**, it
+includes warm-up time even though the event population excludes warm-up.
+Therefore `observed_events_per_second` and `measured_window_elapsed_seconds`
+are **null** for every `warmup_per_worker > 0` run: the numerator must not be
+divided by a mismatched full-run denominator. The machine-readable
+`throughput_undefined_reason=warmup_not_separately_timed` and
+`measurement_window=unavailable_warmup_not_isolated` explain this block.
+`whole_run_elapsed_seconds` (also the legacy `elapsed_seconds`) is
+diagnostic only in that case, not a measured-throughput denominator.
+
+With zero warm-up, the full overlapping wall-clock interval is the
+approximate measured concurrent run duration, including thread dispatch
+overhead, and may be used for a synthetic rate. A zero interval yields null
+throughput and `throughput_undefined_reason=zero_elapsed_window`.
 Mean and nearest-rank P95/P99/max are computed over **all individual event
 latencies, including failed attempts**; no averaging of worker percentiles.
-A zero measurement window produces null throughput. JSON serialization is
+JSON serialization is
 strict (no NaN/Infinity), and no transaction/account/customer IDs appear.
 
 The JSON schema is `gasha-synthetic-concurrent-load-1`; it always reports
@@ -36,6 +48,13 @@ The JSON schema is `gasha-synthetic-concurrent-load-1`; it always reports
 `bank_delivery_accepted=false`, `enforcement_activated=false`, and
 `assessment=BLOCKED_EXTERNAL_BANK_WORKLOAD_AND_DEPLOYMENT`.
 Local cycle/worker caps prevent accidental unbounded CI workloads.
+
+**Correction scope:** This deliberately chooses the PO/QA-approved *null-rate*
+fallback rather than misrepresenting a mixed-duration measurement as a
+post-warm-up concurrent throughput. A future true measured-window rate
+requires a separately reviewed synchronized post-warm-up measurement boundary.
+Deterministic tests cover one/two workers, no/short/slow warm-up, null-rate
+semantics and aborted workers. No Bank acceptance should use a null rate.
 
 **Critical limitations:** Python threads and isolated in-memory repositories do
 not establish sustained peak arrival rate, CPU scaling, shared-state concurrency,

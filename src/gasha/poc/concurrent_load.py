@@ -59,13 +59,35 @@ class ConcurrentSyntheticReport:
         # Reuse the existing, strictly validated one-population count and
         # nearest-rank quantile reporting, rather than averaging worker P95s.
         result = self.aggregate.to_dict()
+        # The worker baseline executes warm-up *inside* each worker call.
+        # This outer clock therefore covers both warm-up and measured attempts.
+        # Until a synchronized post-warm-up window is available, do not
+        # divide a measured-only event count by that mixed elapsed duration.
+        warmup_present = self.config.warmup_per_worker > 0
+        if warmup_present:
+            result["observed_events_per_second"] = None
         result.update({
             "schema_version": "gasha-synthetic-concurrent-load-1",
             "workload": "threaded_isolated_in_memory_uc01_uc02_uc03_shadow",
             "workers": self.config.workers,
             "iterations_per_worker": self.config.iterations_per_worker,
             "warmup_per_worker": self.config.warmup_per_worker,
-            "measurement_window": "wall_clock_spanning_concurrent_workers",
+            "measurement_window": (
+                "unavailable_warmup_not_isolated"
+                if warmup_present else "whole_run_without_warmup"
+            ),
+            "whole_run_elapsed_seconds": self.aggregate.elapsed_seconds,
+            "measured_window_elapsed_seconds": (
+                None if warmup_present else self.aggregate.elapsed_seconds
+            ),
+            "throughput_undefined_reason": (
+                "warmup_not_separately_timed"
+                if warmup_present
+                else (
+                    "zero_elapsed_window"
+                    if result["observed_events_per_second"] is None else None
+                )
+            ),
             "limitations": [
                 "Synthetic threads use isolated in-memory services; no shared PostgreSQL or Kafka.",
                 "Python threads do not establish bank CPU scaling or representative arrival rates.",
@@ -87,8 +109,10 @@ def run_concurrent_synthetic_shadow(
     """Measure overlapping independent #47 shadow baseline cycles.
 
     All worker stores are created inside the existing baseline runner. Wall
-    time spans dispatch through join; latency quantiles use *all* measured
-    per-event samples, including failures. An unexpected worker exception
+    time spans dispatch through join (including worker warm-up). When warm-up
+    is nonzero the measured-only rate is explicitly undefined; the full-run
+    elapsed time is retained for diagnostics only. Latency quantiles use *all*
+    measured per-event samples, including failures. An unexpected worker exception
     aborts the report rather than silently dropping a workload segment.
     """
     if type(config) is not ConcurrentSyntheticConfig:
