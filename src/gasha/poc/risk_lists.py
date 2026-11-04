@@ -93,12 +93,13 @@ class RiskListEntry:
         object.__setattr__(self, "revoked_at", revoked)
 
     def active_at(self, instant: datetime) -> bool:
-        """Half-open effective interval; revocation takes effect inclusively."""
+        """Half-open effective interval; reject damaged reference entries."""
+        checked = _checked_entry(self)
         at = _time(instant, "event_at")
         return (
-            self.effective_from <= at
-            and (self.effective_until is None or at < self.effective_until)
-            and (self.revoked_at is None or at < self.revoked_at)
+            checked.effective_from <= at
+            and (checked.effective_until is None or at < checked.effective_until)
+            and (checked.revoked_at is None or at < checked.revoked_at)
         )
 
 
@@ -131,13 +132,14 @@ class RiskListSnapshot:
             logical.add(key)
 
     def digest(self) -> str:
-        """Content fingerprint only, not evidence of list authority or origin."""
+        """Validated content fingerprint, never evidence of list authority."""
+        checked = _checked_snapshot(self)
         body = {
             "domain": "gasha-risk-list-snapshot-reference-v1",
-            "tenant_id": self.tenant_id,
-            "list_version": self.list_version,
-            "policy_version": self.policy_version,
-            "published_at": _iso(self.published_at),
+            "tenant_id": checked.tenant_id,
+            "list_version": checked.list_version,
+            "policy_version": checked.policy_version,
+            "published_at": _iso(checked.published_at),
             "entries": [
                 {
                     "entry_id": str(entry.entry_id),
@@ -150,11 +152,62 @@ class RiskListSnapshot:
                     ),
                     "revoked_at": None if entry.revoked_at is None else _iso(entry.revoked_at),
                 }
-                for entry in sorted(self.entries, key=lambda item: item.entry_id.int)
+                for entry in sorted(checked.entries, key=lambda item: item.entry_id.int)
             ],
         }
         canonical = dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return "sha256:" + sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _checked_subject(value: RiskListSubject) -> RiskListSubject:
+    """Copy and strictly validate request or snapshot subjects before hashing."""
+    if type(value) is not RiskListSubject:
+        raise RiskListRejected("typed subject reference required")
+    try:
+        return RiskListSubject(value.kind, value.token)
+    except AttributeError as exc:
+        raise RiskListRejected("missing list subject attribute") from exc
+
+
+def _checked_entry(value: RiskListEntry) -> RiskListEntry:
+    """Rebuild an untrusted reference after possible post-construction mutation."""
+    if type(value) is not RiskListEntry:
+        raise RiskListRejected("typed entries required")
+    try:
+        checked_subject = _checked_subject(value.subject)
+        return RiskListEntry(
+            entry_id=value.entry_id,
+            kind=value.kind,
+            subject=checked_subject,
+            effective_from=value.effective_from,
+            effective_until=value.effective_until,
+            revoked_at=value.revoked_at,
+        )
+    except AttributeError as exc:
+        raise RiskListRejected("missing list entry or subject attribute") from exc
+
+
+def _checked_snapshot(value: RiskListSnapshot) -> RiskListSnapshot:
+    """Validate all entries, including nonmatches, before hashing or matching.
+
+    Frozen dataclasses are not a trust boundary: low-level mutation can alter
+    or delete their attributes. Reconstruct copies under the original strict
+    constructors so malformed caller assertions fail closed.
+    """
+    if type(value) is not RiskListSnapshot:
+        raise RiskListRejected("typed snapshot required")
+    try:
+        if type(value.entries) is not tuple:
+            raise RiskListRejected("immutable tuple of entries required")
+        return RiskListSnapshot(
+            tenant_id=value.tenant_id,
+            list_version=value.list_version,
+            policy_version=value.policy_version,
+            published_at=value.published_at,
+            entries=tuple(_checked_entry(entry) for entry in value.entries),
+        )
+    except AttributeError as exc:
+        raise RiskListRejected("missing list snapshot attribute") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,8 +262,7 @@ def match_reference_snapshot(
     The caller-provided snapshot/scope cannot establish Bank authorization;
     do not wire this helper to protected APIs or decision enforcement.
     """
-    if type(snapshot) is not RiskListSnapshot:
-        raise RiskListRejected("typed snapshot required")
+    snapshot = _checked_snapshot(snapshot)
     _tag(expected_tenant, "expected_tenant")
     _tag(expected_list_version, "expected_list_version")
     _tag(expected_policy_version, "expected_policy_version")
@@ -223,13 +275,14 @@ def match_reference_snapshot(
         raise RiskListRejected("snapshot scope or version mismatch")
     if snapshot.published_at > at:
         raise RiskListRejected("snapshot was not published at event time")
-    if type(subjects) is not tuple or any(
-        type(subject) is not RiskListSubject for subject in subjects
-    ):
+    if type(subjects) is not tuple:
         raise RiskListRejected("immutable typed subjects required")
-    if len(set(subjects)) != len(subjects):
+    # Validate *all* caller-provided subjects before any hash or equality.
+    # A corrupted StrEnum-equivalent string could otherwise match a valid entry.
+    checked_subjects = tuple(_checked_subject(subject) for subject in subjects)
+    if len(set(checked_subjects)) != len(checked_subjects):
         raise RiskListRejected("duplicate subject reference")
-    subject_set = set(subjects)
+    subject_set = set(checked_subjects)
     selected = tuple(sorted(
         (entry for entry in snapshot.entries
          if entry.subject in subject_set and entry.active_at(at)),
