@@ -312,7 +312,9 @@ def test_reference_matcher_has_no_production_consumer() -> None:
 def test_postconstruction_corruption_rejected_before_match_or_digest(
     target: str, field: str, corruption: object,
 ) -> None:
-    original = snapshot(entry(1, RiskListKind.BLOCK))
+    # Allocate an isolated subject: the module-level BANK fixture is shared.
+    private_subject = RiskListSubject(SubjectKind.BENEFICIARY, "c" * 64)
+    original = snapshot(replace(entry(1, RiskListKind.BLOCK), subject=private_subject))
     targets: dict[str, object] = {
         "snapshot": original,
         "entry": original.entries[0],
@@ -340,7 +342,9 @@ def test_postconstruction_corruption_rejected_before_match_or_digest(
 def test_deleted_reference_attributes_fail_with_domain_rejection(
     target: str, field: str,
 ) -> None:
-    original = snapshot(entry(1, RiskListKind.BLOCK))
+    # Allocate an isolated subject: the module-level BANK fixture is shared.
+    private_subject = RiskListSubject(SubjectKind.BENEFICIARY, "c" * 64)
+    original = snapshot(replace(entry(1, RiskListKind.BLOCK), subject=private_subject))
     targets: dict[str, object] = {
         "snapshot": original,
         "entry": original.entries[0],
