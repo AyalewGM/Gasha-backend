@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from math import isfinite
+from types import MappingProxyType
 from uuid import UUID
 
 from gasha.ingestion.contracts import InboundBankEvent
@@ -262,10 +263,56 @@ def _ratio(numerator: int, denominator: int) -> dict[str, object]:
             "undefined_reason": None if denominator else "no_records"}
 
 
+def _freeze_report_value(value: object) -> object:
+    """Own a deep immutable snapshot of a synthetic aggregate, not external evidence.
+
+    Only fixed-schema JSON scalar types, mappings and ordered tuples/lists may
+    enter a retained report. In particular, arbitrary mutable objects cannot
+    bypass the immutable output contract.
+    """
+    if isinstance(value, Mapping):
+        if any(type(key) is not str for key in value):
+            raise ValueError("aggregate report keys must be strings")
+        return MappingProxyType({
+            key: _freeze_report_value(item) for key, item in value.items()
+        })
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_report_value(item) for item in value)
+    if value is None or type(value) in (str, int, bool):
+        return value
+    if type(value) is float and isfinite(value):
+        return value
+    raise ValueError("aggregate report contains a non-JSON or non-finite value")
+
+
+def _export_report_value(value: object) -> object:
+    """Produce a fresh mutable JSON tree without exposing retained aliases."""
+    if isinstance(value, Mapping):
+        return {key: _export_report_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_export_report_value(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class DataQualityReport:
     scope: DataQualityScope
-    use_cases: tuple[dict[str, object], ...]
+    use_cases: tuple[Mapping[str, object], ...]
+
+    def __post_init__(self) -> None:
+        # A frozen dataclass does not freeze dicts inside a tuple. Snapshot the
+        # caller-owned tree at construction, including direct construction.
+        if type(self.scope) is not DataQualityScope:
+            raise ValueError("invalid aggregate report scope")
+        object.__setattr__(self, "scope", replace(self.scope))
+        if (type(self.use_cases) is not tuple
+                or len(self.use_cases) != len(UseCase)
+                or any(not isinstance(row, Mapping) for row in self.use_cases)):
+            raise ValueError("invalid aggregate use-case rows")
+        object.__setattr__(
+            self, "use_cases",
+            tuple(_freeze_report_value(row) for row in self.use_cases),
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Serialize only safe schema names, aggregate counts and scope metadata."""
@@ -287,7 +334,7 @@ class DataQualityReport:
                 "window_end": _utc(self.scope.window_end).isoformat(),
                 "label_cutoff": _utc(self.scope.label_cutoff).isoformat(),
             },
-            "use_cases": list(self.use_cases),
+            "use_cases": [_export_report_value(row) for row in self.use_cases],
             "limitations": [
                 "Input schema, dataset digest, tenant and label clocks are caller assertions.",
                 "No Bank-approved mappings, source attestations, mature cohort or KPI thresholds.",
