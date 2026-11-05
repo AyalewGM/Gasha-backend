@@ -1,6 +1,6 @@
 """Issue #48 source-only historical feature lineage negative/positive tests."""
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -346,3 +346,99 @@ def test_valid_low_level_score_change_gets_new_identity_but_not_trusted_replay()
     assert original.fingerprint() != original_fingerprint
     with pytest.raises(HistoricalLineageRejected, match="value contradicts"):
         validate(original)
+
+
+class _LineageCallbackTZ(tzinfo):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        self.calls += 1
+        return timedelta(0)
+
+    def dst(self, dt: datetime | None) -> timedelta:
+        return timedelta(0)
+
+    def tzname(self, dt: datetime | None) -> str:
+        return "untrusted"
+
+
+class _LineageCallbackDateTime(datetime):
+    calls = 0
+
+    def utcoffset(self) -> timedelta:
+        type(self).calls += 1
+        return timedelta(0)
+
+
+def _lineage_hostile_clock(kind: str, at: datetime) -> tuple[datetime, _LineageCallbackTZ | None]:
+    if kind == "tzinfo":
+        zone = _LineageCallbackTZ()
+        return datetime(
+            at.year, at.month, at.day, at.hour, at.minute, at.second,
+            at.microsecond, tzinfo=zone,
+        ), zone
+    _LineageCallbackDateTime.calls = 0
+    return _LineageCallbackDateTime(
+        at.year, at.month, at.day, at.hour, at.minute, at.second,
+        at.microsecond, tzinfo=UTC,
+    ), None
+
+
+def _assert_lineage_clock_uninvoked(zone: _LineageCallbackTZ | None) -> None:
+    assert (zone.calls if zone is not None else _LineageCallbackDateTime.calls) == 0
+
+
+@pytest.mark.parametrize("kind", ["tzinfo", "datetime_subclass"])
+@pytest.mark.parametrize(("object_kind", "field", "at"), [
+    ("signal", "as_of", EVENT_TIME),
+    ("signal", "available_at", EVENT_TIME),
+    ("envelope", "occurred_at", EVENT_TIME),
+    ("envelope", "decision_cutoff", CUTOFF),
+])
+def test_offline_lineage_constructor_rejects_callback_clocks_before_execution(
+    kind: str, object_kind: str, field: str, at: datetime,
+) -> None:
+    hostile, zone = _lineage_hostile_clock(kind, at)
+    with pytest.raises(HistoricalLineageRejected, match="timezone-aware"):
+        if object_kind == "signal":
+            replace(observation(), **{field: hostile})
+        else:
+            replace(envelope(), **{field: hostile})
+    _assert_lineage_clock_uninvoked(zone)
+
+
+@pytest.mark.parametrize("kind", ["tzinfo", "datetime_subclass"])
+@pytest.mark.parametrize("consumer", ["fingerprint", "unavailable", "snapshot_binding"])
+def test_mutated_historical_lineage_clock_cannot_execute_hook_on_revalidation(
+    kind: str, consumer: str,
+) -> None:
+    env = envelope()
+    original_identity = env.fingerprint()
+    hostile, zone = _lineage_hostile_clock(kind, EVENT_TIME)
+    object.__setattr__(env.signals[0], "available_at", hostile)
+    with pytest.raises(HistoricalLineageRejected, match="timezone-aware"):
+        if consumer == "fingerprint":
+            env.fingerprint()
+        elif consumer == "unavailable":
+            env.unavailable_signals()
+        else:
+            validate(env)
+    _assert_lineage_clock_uninvoked(zone)
+    # No new digest can be produced for the altered caller-held signal.
+    assert original_identity.startswith("sha256:")
+
+
+@pytest.mark.parametrize("kind", ["tzinfo", "datetime_subclass"])
+def test_bypassed_transaction_clock_is_rejected_before_timezone_callbacks(kind: str) -> None:
+    hostile, zone = _lineage_hostile_clock(kind, EVENT_TIME)
+    damaged = transaction().model_copy(update={"occurred_at": hostile})
+    with pytest.raises(HistoricalLineageRejected, match="timezone-aware"):
+        assert_historical_snapshot_bound(
+            envelope(), transaction=damaged,
+            snapshot=IntelligenceSnapshot(**{
+                n: 0.2 for n in IntelligenceSnapshot.model_fields
+            }),
+            expected_tenant="synthetic-tenant", expected_dataset_digest=DATASET,
+        )
+    _assert_lineage_clock_uninvoked(zone)
