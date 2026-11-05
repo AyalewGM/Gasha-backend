@@ -157,16 +157,16 @@ def _snapshot(
     ):
         raise RelatedAlertRejected("invalid, ambiguous or wrong-tenant finding")
     # All identity, scope and scenario values were detached before calling tzinfo.
-    normalized = _instant(cast(datetime, observed))
+    normalized = _instant(observed)
     if not _unchanged(row, captured):
         raise RelatedAlertRejected("finding changed during clock normalization")
     if normalized > at:
         raise RelatedAlertRejected("future observation is not eligible")
     return _Finding(
-        event_id=str(event), context_ref=cast(str, context),
+        event_id=str(event), context_ref=context,
         link_ref=cast(str | None, link), observed_at=normalized,
         scenario_id=cast(tuple[str, ...], scenarios)[0],
-        availability=cast(str, availability),
+        availability=availability,
     ), captured
 
 
