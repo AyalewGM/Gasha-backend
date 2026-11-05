@@ -58,6 +58,18 @@ class RelatedAlertEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class _CapturedFinding:
+    """Validated scope/identity; observed_at is unnormalized until all rows are captured."""
+
+    event_id: str
+    context_ref: str
+    link_ref: str | None
+    observed_at: datetime
+    scenario_id: str
+    availability: str
+
+
+@dataclass(frozen=True, slots=True)
 class _Finding:
     """Detached primitive-only snapshot. No source record/tzinfo references."""
 
@@ -124,13 +136,20 @@ _FIELDS = (
 )
 
 
-def _unchanged(row: RelatedAlertEvidence, captured: tuple[object, ...]) -> bool:
-    return all(getattr(row, name) is original for name, original in zip(_FIELDS, captured))
+def _unchanged(
+    row: RelatedAlertEvidence, captured: tuple[object, ...], *, event_id: str,
+) -> bool:
+    # UUID is frozen but can still be mutated using object.__setattr__.
+    return (
+        all(getattr(row, name) is original for name, original in zip(_FIELDS, captured))
+        and type(row.event_id) is UUID and str(row.event_id) == event_id
+    )
 
 
-def _snapshot(
-    row: RelatedAlertEvidence, *, tenant_id: str, at: datetime,
-) -> tuple[_Finding, tuple[object, ...]]:
+def _capture(
+    row: RelatedAlertEvidence, *, tenant_id: str,
+) -> tuple[_CapturedFinding, tuple[object, ...]]:
+    """Validate and detach identity for every row before invoking any tzinfo."""
     if type(row) is not RelatedAlertEvidence:
         raise RelatedAlertRejected("invalid finding record")
     captured: tuple[object, ...] = (
@@ -156,17 +175,10 @@ def _snapshot(
         )
     ):
         raise RelatedAlertRejected("invalid, ambiguous or wrong-tenant finding")
-    # All identity, scope and scenario values were detached before calling tzinfo.
-    normalized = _instant(observed)
-    if not _unchanged(row, captured):
-        raise RelatedAlertRejected("finding changed during clock normalization")
-    if normalized > at:
-        raise RelatedAlertRejected("future observation is not eligible")
-    return _Finding(
+    return _CapturedFinding(
         event_id=str(event), context_ref=context,
-        link_ref=cast(str | None, link), observed_at=normalized,
-        scenario_id=cast(tuple[str, ...], scenarios)[0],
-        availability=availability,
+        link_ref=cast(str | None, link), observed_at=observed,
+        scenario_id=cast(tuple[str, ...], scenarios)[0], availability=availability,
     ), captured
 
 
@@ -208,15 +220,32 @@ def project_related_alert_candidates(
     ):
         raise RelatedAlertRejected("invalid bounded tenant candidate request")
     policy_fields, policy_digest = _policy_snapshot(policy)
-    # No policy source reference is consulted after untrusted clock callbacks.
+    # Phase 1: validate and detach *all* input scope, identity, scenario, link
+    # and context before calling as_of or any observation tzinfo callback.
+    # Otherwise a callback can launder a later invalid record into a valid one.
+    originals: list[
+        tuple[RelatedAlertEvidence, tuple[object, ...], _CapturedFinding]
+    ] = []
+    for row in evidence:
+        snapshot, captured = _capture(row, tenant_id=tenant_id)
+        originals.append((row, captured, snapshot))
+    # Phase 2: normalize clocks only after the entire batch has been validated.
     at = _instant(as_of)
+    if any(not _unchanged(row, captured, event_id=snapshot.event_id)
+           for row, captured, snapshot in originals):
+        raise RelatedAlertRejected("finding changed during projection clock normalization")
     by_link: dict[str, list[_Finding]] = defaultdict(list)
     unlinked: list[_Finding] = []
-    originals: list[tuple[RelatedAlertEvidence, tuple[object, ...]]] = []
     seen_events: set[str] = set()
-    for row in evidence:
-        finding, captured = _snapshot(row, tenant_id=tenant_id, at=at)
-        originals.append((row, captured))
+    for row, captured, snapshot in originals:
+        normalized = _instant(snapshot.observed_at)
+        if normalized > at:
+            raise RelatedAlertRejected("future observation is not eligible")
+        finding = _Finding(
+            event_id=snapshot.event_id, context_ref=snapshot.context_ref,
+            link_ref=snapshot.link_ref, observed_at=normalized,
+            scenario_id=snapshot.scenario_id, availability=snapshot.availability,
+        )
         if finding.event_id in seen_events:
             raise RelatedAlertRejected("duplicate source-event identity")
         seen_events.add(finding.event_id)
@@ -224,10 +253,11 @@ def project_related_alert_candidates(
             unlinked.append(finding)
         else:
             by_link[finding.link_ref].append(finding)
-    # A callback belonging to a later row may have mutated an earlier row.
-    # Never use the source objects to build output, and reject such a race.
-    if any(not _unchanged(row, captured) for row, captured in originals):
-        raise RelatedAlertRejected("finding changed during source snapshot")
+    # Projection and observation clocks may mutate any row, including rows
+    # already normalized; never return output if original evidence changed.
+    if any(not _unchanged(row, captured, event_id=snapshot.event_id)
+           for row, captured, snapshot in originals):
+        raise RelatedAlertRejected("finding changed during clock normalization")
     # Custom tzinfo can also mutate the policy: never consume that new policy.
     if _policy_snapshot(policy)[0] != policy_fields:
         raise RelatedAlertRejected("grouping policy changed during snapshot")
