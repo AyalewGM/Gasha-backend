@@ -1,6 +1,6 @@
 """Issue #49 isolated evidence identity/freshness tests; never Bank approval."""
 from dataclasses import FrozenInstanceError, replace
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -408,3 +408,80 @@ def test_mutated_empty_packet_never_becomes_approvable_empty_lifecycle() -> None
     object.__setattr__(sample, "records", ())
     with pytest.raises(LifecycleRejected, match="invalid evidence packet"):
         EvidenceLifecycle(sample)
+
+
+class _HookZone(tzinfo):
+    """An untrusted timezone provider with observable callbacks."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def utcoffset(self, dt: datetime | None) -> timedelta | None:
+        self.calls += 1
+        return timedelta(0)
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return timedelta(0)
+
+    def tzname(self, dt: datetime | None) -> str | None:
+        return "hostile-test-zone"
+
+
+class _HookDateTime(datetime):
+    calls = 0
+
+    def utcoffset(self) -> timedelta | None:
+        type(self).calls += 1
+        return timedelta(0)
+
+    def astimezone(self, tz: tzinfo | None = None) -> datetime:
+        type(self).calls += 1
+        return super().astimezone(tz)
+
+
+@pytest.mark.parametrize("field", [
+    "window_start", "window_end", "collected_at", "expires_at", "now",
+])
+@pytest.mark.parametrize("kind", ["custom_zone", "datetime_subclass"])
+def test_evidence_rejects_callback_clocks_before_invoking_hooks(
+    field: str, kind: str,
+) -> None:
+    zone = _HookZone()
+    _HookDateTime.calls = 0
+    hostile = (
+        datetime(2026, 10, 31, 19, 30, tzinfo=zone)
+        if kind == "custom_zone"
+        else _HookDateTime(2026, 10, 31, 19, 30, tzinfo=UTC)
+    )
+    with pytest.raises(EvidenceIdentityRejected, match="timezone-aware"):
+        if field in ("window_start", "window_end"):
+            replace(binding(), **{field: hostile})
+        elif field in ("collected_at", "expires_at"):
+            replace(record(), **{field: hostile})
+        else:
+            assert_packet_current(packet(), expected=binding(), now=hostile)
+    assert zone.calls == 0
+    assert _HookDateTime.calls == 0
+
+
+@pytest.mark.parametrize("surface", ["binding", "record"])
+@pytest.mark.parametrize("kind", ["custom_zone", "datetime_subclass"])
+def test_evidence_runtime_clock_substitution_fails_before_hooks(
+    surface: str, kind: str,
+) -> None:
+    original = packet()
+    zone = _HookZone()
+    _HookDateTime.calls = 0
+    hostile = (
+        datetime(2026, 10, 31, 19, 30, tzinfo=zone)
+        if kind == "custom_zone"
+        else _HookDateTime(2026, 10, 31, 19, 30, tzinfo=UTC)
+    )
+    if surface == "binding":
+        object.__setattr__(original.binding, "window_end", hostile)
+    else:
+        object.__setattr__(original.records[0], "collected_at", hostile)
+    with pytest.raises(EvidenceIdentityRejected, match="timezone-aware"):
+        original.packet_digest()
+    assert zone.calls == 0
+    assert _HookDateTime.calls == 0

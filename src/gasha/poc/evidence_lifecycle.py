@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from enum import StrEnum
 from hmac import compare_digest
 from typing import Protocol
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from gasha.poc.evidence_identity import (
     EvidenceIdentityRejected,
@@ -34,6 +35,17 @@ _ACTOR = re.compile(r"[0-9a-f]{64}\Z")
 
 class LifecycleRejected(ValueError):
     """A proposed evidence transition is inconsistent or unauthorized."""
+
+
+def _safe_utc(value: object, *, reason: str) -> datetime:
+    """Normalize only built-in clock values; never execute caller timezone hooks."""
+    if not isinstance(value, datetime) or type(value) is not datetime:
+        raise LifecycleRejected(reason)
+    if type(value.tzinfo) not in (timezone, ZoneInfo):
+        raise LifecycleRejected(reason)
+    if value.utcoffset() is None:
+        raise LifecycleRejected(reason)
+    return value.astimezone(UTC)
 
 
 class EvidenceAction(StrEnum):
@@ -72,9 +84,9 @@ class EvidenceTransition:
             raise LifecycleRejected("typed action required")
         if type(self.actor_ref) is not str or _ACTOR.fullmatch(self.actor_ref) is None:
             raise LifecycleRejected("pseudonymous actor reference required")
-        if not isinstance(self.at, datetime) or self.at.utcoffset() is None:
-            raise LifecycleRejected("timezone-aware transition time required")
-        object.__setattr__(self, "at", self.at.astimezone(UTC))
+        object.__setattr__(
+            self, "at", _safe_utc(self.at, reason="timezone-aware transition time required")
+        )
         if type(self.packet_digest) is not str or not re.fullmatch(
             r"sha256:[0-9a-f]{64}", self.packet_digest
         ):
@@ -231,12 +243,14 @@ def propose_transition(
         raise LifecycleRejected("typed lifecycle and action required")
     if type(principal) is not TrustedPrincipal:
         raise LifecycleRejected("verified principal required")
-    if not isinstance(now, datetime) or now.utcoffset() is None:
-        raise LifecycleRejected("timezone-aware trusted clock required")
+    current = _safe_utc(now, reason="timezone-aware trusted clock required")
     # Frozen principal objects can be corrupted after verification in-process.
     # Rebuild before reading expiry, tenant scope, capabilities or actor identity;
     # a raw StrEnum-equivalent string must never become an accepted capability.
     try:
+        # A damaged principal may carry a hostile expiry clock. Reject its type
+        # before replace() invokes TrustedPrincipal's timezone validation.
+        _safe_utc(principal.expires_at, reason="invalid credential expiry")
         principal = replace(principal)
     except (AttributeError, TypeError, ValueError) as exc:
         raise LifecycleRejected("invalid trusted principal") from exc
@@ -246,7 +260,6 @@ def propose_transition(
         state = _replay(lifecycle)
     except EvidenceIdentityRejected as exc:
         raise LifecycleRejected("invalid evidence packet") from exc
-    current = now.astimezone(UTC)
     if principal.expires_at.astimezone(UTC) <= current:
         raise LifecycleRejected("expired principal")
     try:
