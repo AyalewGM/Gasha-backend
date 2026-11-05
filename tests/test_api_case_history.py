@@ -81,7 +81,7 @@ class Reader:
         self.calls: list[tuple[str, UUID]] = []
         self.events: object = (synthetic_event(),)
         self.outage = False
-        self.principal_mutation: tuple[str, str] | None = None
+        self.principal_mutation: tuple[str, object] | None = None
         self.fail_after_mutation = False
 
     def history(self, *, principal: TrustedPrincipal, tenant_id: str,
@@ -417,10 +417,14 @@ def test_boolean_previous_revision_is_rejected_without_read_disclosure(wired_cas
 @pytest.mark.parametrize(("field", "replacement"), [
     ("subject", "synthetic-forged-actor-secret"),
     ("issuer", "synthetic-forged-issuer-secret"),
+    ("credential_ref", "synthetic-forged-credential-secret"),
+    ("tenant_ids", frozenset({"tenant-b"})),
+    ("capabilities", frozenset({Capability.CASE_CREATE})),
+    ("expires_at", NOW + timedelta(hours=2)),
 ])
 @pytest.mark.parametrize("fail_after_mutation", [False, True])
 def test_case_reader_cannot_rewrite_authenticated_audit_actor(
-    wired_case_history, field: str, replacement: str, fail_after_mutation: bool,
+    wired_case_history, field: str, replacement: object, fail_after_mutation: bool,
 ) -> None:
     """A lower-trust callback must not mutate request identity used by audit.
 
@@ -434,19 +438,14 @@ def test_case_reader_cannot_rewrite_authenticated_audit_actor(
     reader.fail_after_mutation = fail_after_mutation
 
     response = client.get(path(), headers=token())
-    assert response.status_code == (503 if fail_after_mutation else 200)
-    if fail_after_mutation:
-        assert response.json() == {"detail": "case history unavailable"}
-    else:
-        assert response.json()["enforcement_activated"] is False
+    assert response.status_code == 503
+    assert response.json() == {"detail": "case history unavailable"}
     records = [
         event for event in audit.events
         if event.action == Capability.CASE_READ.value
     ]
-    assert [event.result for event in records] == [
-        "authorized", "failed" if fail_after_mutation else "succeeded",
-    ]
+    assert [event.result for event in records] == ["authorized", "failed"]
     assert {event.actor_ref for event in records} == {expected_actor}
     assert reader.calls == [("tenant-a", CASE_ID)]
-    assert replacement not in response.text
-    assert replacement not in str(audit.events)
+    assert "synthetic-forged" not in response.text
+    assert "synthetic-forged" not in str(audit.events)
