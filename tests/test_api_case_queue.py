@@ -92,12 +92,19 @@ class Reader:
         self.calls: list[tuple[str, int]] = []
         self.change = lambda snapshot: snapshot
         self.fail = False
+        self.principal_mutation: tuple[str, object] | None = None
+        self.fail_after_mutation = False
 
     def read(self, *, principal: TrustedPrincipal, tenant_id: str,
              limit: int, at: datetime) -> CaseQueueSnapshot:
         self.calls.append((tenant_id, limit))
         assert principal.audit_actor and tenant_id in principal.tenant_ids
         assert at.tzinfo is not None
+        if self.principal_mutation is not None:
+            field, replacement = self.principal_mutation
+            object.__setattr__(principal, field, replacement)
+            if self.fail_after_mutation:
+                raise RuntimeError("synthetic queue reader mutated principal then failed")
         if self.fail:
             raise RuntimeError("synthetic storage failure")
         snapshot = CaseQueueSnapshot(
@@ -315,3 +322,34 @@ def test_queue_route_authenticates_before_query_validation(wired_queue):
     client, reader, _ = wired_queue
     assert client.get(endpoint(limit=0)).status_code == 401
     assert reader.calls == []
+
+@pytest.mark.parametrize(("field", "replacement"), [
+    ("subject", "synthetic-forged-queue-subject-secret"),
+    ("issuer", "synthetic-forged-queue-issuer-secret"),
+    ("credential_ref", "synthetic-forged-queue-credential-secret"),
+    ("tenant_ids", frozenset({"tenant-b"})),
+    ("capabilities", frozenset({Capability.CASE_TRIAGE})),
+    ("expires_at", datetime.now(UTC) + timedelta(hours=2)),
+])
+@pytest.mark.parametrize("fail_after_mutation", [False, True])
+def test_queue_reader_cannot_modify_authenticated_principal(
+    wired_queue, field: str, replacement: object, fail_after_mutation: bool,
+) -> None:
+    """A callback must not change verified authorization or audit attribution."""
+    client, reader, audit = wired_queue
+    expected_actor = principal().audit_actor
+    reader.principal_mutation = (field, replacement)
+    reader.fail_after_mutation = fail_after_mutation
+
+    response = client.get(endpoint(), headers=bearer())
+    assert response.status_code == 503
+    assert response.json() == {"detail": "case queue unavailable"}
+    records = [
+        entry for entry in audit.events
+        if entry.action == Capability.CASE_READ.value
+    ]
+    assert [entry.result for entry in records] == ["authorized", "failed"]
+    assert {entry.actor_ref for entry in records} == {expected_actor}
+    assert reader.calls == [("tenant-a", 25)]
+    assert "synthetic-forged" not in response.text
+    assert "synthetic-forged" not in str(audit.events)
