@@ -221,12 +221,14 @@ def test_mutated_frozen_records_rejected() -> None:
 
 class MutatingZone(tzinfo):
     def __init__(self, action: str, replacement: object, throws: bool = False) -> None:
-        self.row: RelatedAlertEvidence | None = None
+        self.row: RelatedAlertEvidence | RelatedAlertPolicy | None = None
         self.action = action
         self.replacement = replacement
         self.throws = throws
+        self.calls = 0
 
     def utcoffset(self, dt: datetime | None) -> timedelta:
+        self.calls += 1
         if self.row is not None:
             object.__setattr__(self.row, self.action, self.replacement)
         if self.throws:
@@ -318,3 +320,85 @@ def test_non_tuple_batch_and_non_evidence_records_rejected() -> None:
             tenant_id=TENANT, evidence=(alert(1), "wrong"),  # type: ignore[arg-type]
             as_of=AT,
         )
+
+
+@pytest.mark.parametrize(("field", "invalid", "laundered"), [
+    ("tenant_id", "tenant-b", TENANT),
+    ("scenario_ids", ("UNAPPROVED-99",), ("APP-01",)),
+    ("link_ref", "invalid", LINK),
+    ("context_ref", "invalid", CONTEXT),
+    ("event_id", UUID(int=0), UUID(int=2)),
+])
+@pytest.mark.parametrize("throws", [False, True])
+def test_as_of_clock_cannot_launder_invalid_evidence_before_batch_capture(
+    field: str, invalid: object, laundered: object, throws: bool,
+) -> None:
+    invalid_row = replace(alert(2), **{field: invalid})
+    zone = MutatingZone(field, laundered, throws)
+    zone.row = invalid_row
+    with pytest.raises(RelatedAlertRejected):
+        project(alert(1), invalid_row, at=datetime(2026, 11, 5, tzinfo=zone))
+    # The invalid row must be rejected before invoking even the projection clock.
+    assert zone.calls == 0
+
+
+@pytest.mark.parametrize(("field", "replacement"), [
+    ("tenant_id", "tenant-b"),
+    ("scenario_ids", ("UNAPPROVED-99",)),
+    ("link_ref", OTHER_LINK),
+    ("context_ref", "d" * 64),
+    ("event_id", UUID(int=32)),
+])
+@pytest.mark.parametrize("throws", [False, True])
+def test_as_of_clock_cannot_change_valid_evidence_after_batch_capture(
+    field: str, replacement: object, throws: bool,
+) -> None:
+    row = alert(2)
+    zone = MutatingZone(field, replacement, throws)
+    zone.row = row
+    with pytest.raises(RelatedAlertRejected):
+        project(alert(1), row, at=datetime(2026, 11, 5, tzinfo=zone))
+    assert zone.calls == 1
+
+
+@pytest.mark.parametrize("throws", [False, True])
+def test_as_of_clock_cannot_change_another_previously_captured_row(throws: bool) -> None:
+    first = alert(1)
+    second = alert(2)
+    zone = MutatingZone("tenant_id", "tenant-b", throws)
+    zone.row = first
+    with pytest.raises(RelatedAlertRejected):
+        project(first, second, at=datetime(2026, 11, 5, tzinfo=zone))
+    assert zone.calls == 1
+
+
+@pytest.mark.parametrize("throws", [False, True])
+def test_as_of_clock_cannot_change_policy_after_capture(throws: bool) -> None:
+    policy = replace(DEFAULT_POLICY)
+    zone = MutatingZone("version", "v2", throws)
+    zone.row = policy
+    with pytest.raises(RelatedAlertRejected):
+        project(alert(1), alert(2), policy=policy,
+                at=datetime(2026, 11, 5, tzinfo=zone))
+    assert zone.calls == 1
+
+
+def test_observation_clock_cannot_launder_later_invalid_row() -> None:
+    later = alert(2, tenant="tenant-b")
+    zone = MutatingZone("tenant_id", TENANT)
+    zone.row = later
+    first = alert(1, observed_at=datetime(2026, 11, 5, tzinfo=zone))
+    with pytest.raises(RelatedAlertRejected):
+        project(first, later)
+    assert zone.calls == 0
+
+
+def test_mutated_uuid_contents_rejected_even_if_source_field_identity_is_stable() -> None:
+    row = alert(2)
+    original_uuid = row.event_id
+    zone = MutatingZone("int", 37)
+    # UUID is a frozen object whose numeric value can still be changed in process.
+    zone.row = original_uuid  # type: ignore[assignment]
+    with pytest.raises(RelatedAlertRejected):
+        project(alert(1), row, at=datetime(2026, 11, 5, tzinfo=zone))
+    assert zone.calls == 1
