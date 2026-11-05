@@ -596,7 +596,11 @@ def get_case_history(
         if reader is None:
             raise RuntimeError("trusted case history reader not configured")
         history = reader.history(
-            principal=principal, tenant_id=tenant_id, case_id=case_id, at=utcnow(),
+            # Never hand the ingress principal to an external reader: frozen
+            # dataclasses can be mutated with object.__setattr__, which would
+            # otherwise rewrite the terminal security-audit actor identity.
+            principal=replace(principal), tenant_id=tenant_id, case_id=case_id,
+            at=utcnow(),
         )
         events = _case_history_view(history, tenant_id=tenant_id, case_id=case_id)
     except Exception as exc:
