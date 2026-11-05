@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -294,17 +294,31 @@ def _export_report_value(value: object) -> object:
     return value
 
 
+def _scope_binding(scope: DataQualityScope) -> tuple[str, ...]:
+    """Canonical synthetic scope identity, not authenticated dataset evidence."""
+    return (
+        scope.tenant_id, scope.dataset_digest, scope.schema_version,
+        scope.mapping_version, scope.configuration_version,
+        _utc(scope.window_start).isoformat(),
+        _utc(scope.window_end).isoformat(),
+        _utc(scope.label_cutoff).isoformat(),
+    )
+
+
 @dataclass(frozen=True)
 class DataQualityReport:
     scope: DataQualityScope
     use_cases: tuple[Mapping[str, object], ...]
+    _retained_scope_binding: tuple[str, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # A frozen dataclass does not freeze dicts inside a tuple. Snapshot the
         # caller-owned tree at construction, including direct construction.
         if type(self.scope) is not DataQualityScope:
             raise ValueError("invalid aggregate report scope")
-        object.__setattr__(self, "scope", replace(self.scope))
+        retained = replace(self.scope)
+        object.__setattr__(self, "scope", retained)
+        object.__setattr__(self, "_retained_scope_binding", _scope_binding(retained))
         if (type(self.use_cases) is not tuple
                 or len(self.use_cases) != len(UseCase)
                 or any(not isinstance(row, Mapping) for row in self.use_cases)):
@@ -315,7 +329,17 @@ class DataQualityReport:
         )
 
     def to_dict(self) -> dict[str, object]:
-        """Serialize only safe schema names, aggregate counts and scope metadata."""
+        """Reject post-construction scope substitution before exporting counts."""
+        # Frozen dataclasses are not a security boundary: object.__setattr__
+        # can change the retained report scope, despite defensive input copying.
+        try:
+            if type(self.scope) is not DataQualityScope:
+                raise ValueError("typed retained scope required")
+            checked_scope = replace(self.scope)
+            if _scope_binding(checked_scope) != self._retained_scope_binding:
+                raise ValueError("report scope changed after construction")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("quality report scope integrity failed") from exc
         return {
             "schema_version": _SCHEMA_VERSION,
             "provisional_coverage_matrix_version": _COVERAGE_MATRIX_VERSION,
@@ -325,14 +349,14 @@ class DataQualityReport:
             "readiness_authorized": False,
             "enforcement_activated": False,
             "scope": {
-                "tenant_id": self.scope.tenant_id,
-                "dataset_digest": self.scope.dataset_digest,
-                "source_schema_version": self.scope.schema_version,
-                "mapping_version": self.scope.mapping_version,
-                "configuration_version": self.scope.configuration_version,
-                "window_start": _utc(self.scope.window_start).isoformat(),
-                "window_end": _utc(self.scope.window_end).isoformat(),
-                "label_cutoff": _utc(self.scope.label_cutoff).isoformat(),
+                "tenant_id": checked_scope.tenant_id,
+                "dataset_digest": checked_scope.dataset_digest,
+                "source_schema_version": checked_scope.schema_version,
+                "mapping_version": checked_scope.mapping_version,
+                "configuration_version": checked_scope.configuration_version,
+                "window_start": _utc(checked_scope.window_start).isoformat(),
+                "window_end": _utc(checked_scope.window_end).isoformat(),
+                "label_cutoff": _utc(checked_scope.label_cutoff).isoformat(),
             },
             "use_cases": [_export_report_value(row) for row in self.use_cases],
             "limitations": [
