@@ -557,9 +557,21 @@ def get_case_queue(
         if reader is None:
             raise RuntimeError("trusted ranked case reader not configured")
         at = utcnow()
+        # Never share the ingress-verified principal with an installed reader.
+        # A frozen dataclass is still mutable via object.__setattr__.
+        reader_principal = replace(principal)
         snapshot = reader.read(
-            principal=replace(principal), tenant_id=tenant_id, limit=limit, at=at,
+            principal=reader_principal, tenant_id=tenant_id, limit=limit, at=at,
         )
+        # Refuse a successful response after an adapter tampers with identity,
+        # capability, tenant scope or expiry. Validate types through dataclass
+        # reconstruction, and compare expiry as an absolute UTC instant.
+        if (
+            replace(reader_principal) != principal
+            or reader_principal.expires_at.astimezone(UTC)
+            != principal.expires_at.astimezone(UTC)
+        ):
+            raise ValueError("queue reader modified authenticated principal")
         view = project_case_queue(snapshot, tenant_id=tenant_id, limit=limit, at=at)
     except Exception as exc:
         _operation_audit(
