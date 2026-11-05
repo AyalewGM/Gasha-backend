@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from json import dumps
 from re import fullmatch
+from typing import cast
 from uuid import UUID
 
 _SCENARIOS = frozenset({
@@ -162,7 +163,7 @@ def project_related_alert_candidates(
         })
     # Stable canonical output regardless of record or group arrival order.
     groups.sort(key=lambda group: (
-        -int(group["source_event_count"]),
+        -cast(int, group["source_event_count"]),
         str(group["first_observed_at"]), str(group["candidate_ref"]),
     ))
     return {
