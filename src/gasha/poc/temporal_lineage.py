@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, fields, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
+from zoneinfo import ZoneInfo
 from hashlib import sha256
 from json import dumps
 from math import isfinite
@@ -32,7 +33,12 @@ def _tag(name: str, value: object) -> None:
 
 
 def _utc(name: str, value: object) -> datetime:
-    if not isinstance(value, datetime) or value.utcoffset() is None:
+    # Never run caller-defined datetime/tzinfo methods while checking lineage.
+    # The source and replay clock contracts accept only built-in/fixed-offset
+    # clocks or the standard ZoneInfo implementation, not callback-capable types.
+    if type(value) is not datetime or type(value.tzinfo) not in (timezone, ZoneInfo):
+        raise HistoricalLineageRejected(f"{name} must be timezone-aware")
+    if value.utcoffset() is None:
         raise HistoricalLineageRejected(f"{name} must be timezone-aware")
     return value.astimezone(UTC)
 
