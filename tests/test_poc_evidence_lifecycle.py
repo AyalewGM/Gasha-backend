@@ -1,6 +1,6 @@
 """#49 bounded offline proposal-kernel regression tests, not bank evidence."""
 from dataclasses import FrozenInstanceError, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -708,3 +708,78 @@ def test_proposal_rejects_deleted_lifecycle_field_before_artifact_read(missing: 
     assert reader.calls == 0
     if missing != "events":
         assert lifecycle.events is original_events
+
+
+class _ProposalHookZone(tzinfo):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def utcoffset(self, dt: datetime | None) -> timedelta | None:
+        self.calls += 1
+        return timedelta(0)
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return timedelta(0)
+
+    def tzname(self, dt: datetime | None) -> str | None:
+        return "hostile-proposal-zone"
+
+
+class _ProposalHookDateTime(datetime):
+    calls = 0
+
+    def utcoffset(self) -> timedelta | None:
+        type(self).calls += 1
+        return timedelta(0)
+
+    def astimezone(self, tz: tzinfo | None = None) -> datetime:
+        type(self).calls += 1
+        return super().astimezone(tz)
+
+
+@pytest.mark.parametrize("surface", [
+    "new_event", "replayed_event", "proposal_now", "mutated_principal_expiry",
+])
+@pytest.mark.parametrize("kind", ["custom_zone", "datetime_subclass"])
+def test_evidence_lifecycle_rejects_clock_hooks_without_side_effects(
+    surface: str, kind: str,
+) -> None:
+    lifecycle = submitted()
+    reader = ArtifactReader()
+    before = lifecycle.events
+    zone = _ProposalHookZone()
+    _ProposalHookDateTime.calls = 0
+    hostile = (
+        datetime(2026, 10, 31, 20, tzinfo=zone)
+        if kind == "custom_zone"
+        else _ProposalHookDateTime(2026, 10, 31, 20, tzinfo=UTC)
+    )
+    with pytest.raises(LifecycleRejected, match="timezone-aware|principal"):
+        if surface == "new_event":
+            EvidenceTransition(
+                EvidenceAction.VERIFY, VERIFIER.audit_actor, hostile,
+                lifecycle.packet.packet_digest(), UUID(int=1),
+            )
+        elif surface == "replayed_event":
+            forged = EvidenceTransition(
+                EvidenceAction.VERIFY, VERIFIER.audit_actor, NOW,
+                lifecycle.packet.packet_digest(), UUID(int=1),
+            )
+            object.__setattr__(forged, "at", hostile)
+            EvidenceLifecycle(lifecycle.packet, lifecycle.events + (forged,))
+        elif surface == "mutated_principal_expiry":
+            principal = actor("verifier-clock", Capability.EVIDENCE_VERIFY)
+            object.__setattr__(principal, "expires_at", hostile)
+            apply(
+                lifecycle, EvidenceAction.VERIFY, principal,
+                UUID(int=1), reader=reader,
+            )
+        else:
+            apply(
+                lifecycle, EvidenceAction.VERIFY, VERIFIER,
+                UUID(int=1), now=hostile, reader=reader,
+            )
+    assert zone.calls == 0
+    assert _ProposalHookDateTime.calls == 0
+    assert reader.calls == 0
+    assert lifecycle.events == before
