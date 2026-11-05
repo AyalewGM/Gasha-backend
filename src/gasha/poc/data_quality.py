@@ -476,7 +476,7 @@ def _owned_value(value: object, *, depth: int = 0, remaining: list[int]) -> obje
             key: _owned_value(item, depth=depth + 1, remaining=remaining)
             for key, item in value.items()
         }
-    if type(value) in (list, tuple):
+    if isinstance(value, (list, tuple)) and type(value) in (list, tuple):
         if len(value) > 1024:
             raise _SnapshotFailure("invalid.snapshot")
         copied = (
