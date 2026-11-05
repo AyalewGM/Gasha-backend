@@ -990,3 +990,56 @@ def test_equivalent_timezone_representation_keeps_original_scope_binding() -> No
     assert report.to_dict()["bank_data_verified"] is False
     assert report.to_dict()["readiness_authorized"] is False
     assert report.to_dict()["enforcement_activated"] is False
+
+
+@pytest.mark.parametrize("mutation", [
+    "forged-counts", "identical-but-replaced", "empty-tuple",
+    "mutable-list", "deleted-rows", "deleted-binding",
+])
+def test_retained_quality_aggregate_replacement_cannot_be_exported(
+    mutation: str,
+) -> None:
+    """Source-asserted KPI aggregates must not be swapped after validation."""
+    report = inspect_reference_quality(scope(), (
+        candidate(
+            "row-integrity", label=True,
+            confirmed_at=AT + timedelta(days=1), alerted=True,
+        ),
+    ))
+    baseline = report.to_dict()
+    assert baseline["use_cases"][0]["accepted"] == 1
+    assert baseline["bank_data_verified"] is False
+
+    if mutation == "forged-counts":
+        forged = baseline["use_cases"]
+        forged[0]["accepted"] = 999
+        forged[0]["labels"]["positive"] = 999
+        forged[0]["untrusted_identifier"] = "synthetic-opaque-marker"
+        object.__setattr__(report, "use_cases", tuple(forged))
+    elif mutation == "identical-but-replaced":
+        object.__setattr__(report, "use_cases", tuple(list(report.use_cases)))
+    elif mutation == "empty-tuple":
+        object.__setattr__(report, "use_cases", ())
+    elif mutation == "mutable-list":
+        object.__setattr__(report, "use_cases", list(report.use_cases))
+    elif mutation == "deleted-rows":
+        object.__delattr__(report, "use_cases")
+    else:
+        object.__delattr__(report, "_retained_use_cases")
+
+    with pytest.raises(ValueError, match="aggregate integrity failed"):
+        report.to_dict()
+
+
+def test_valid_retained_quality_aggregates_export_consistently() -> None:
+    report = inspect_reference_quality(scope(), (
+        candidate("untampered-row", label=False,
+                  confirmed_at=AT + timedelta(days=1), alerted=False),
+    ))
+    before = report.to_dict()
+    after = report.to_dict()
+    assert before == after
+    assert before is not after
+    assert before["use_cases"][0] is not after["use_cases"][0]
+    assert before["readiness_authorized"] is False
+    assert before["enforcement_activated"] is False
