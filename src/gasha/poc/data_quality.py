@@ -509,6 +509,15 @@ def _owned_observation(observation: QualityObservation) -> _OwnedObservation:
     correlation = event.correlation_id
     received = event.received_at
     original_payload = event.payload
+    if (
+        type(tenant) is not str
+        or type(schema) is not str
+        or (correlation is not None and type(correlation) is not str)
+    ):
+        raise _SnapshotFailure("invalid.snapshot")
+    # Preserve the existing malformed-source quality check without passing
+    # arbitrary objects (including containers with custom equality) onward.
+    safe_source = source if type(source) is str else None
     if type(original_payload) is dict:
         payload: object = _owned_value(original_payload, remaining=[4096])
     elif isinstance(original_payload, Mapping):
@@ -526,7 +535,7 @@ def _owned_observation(observation: QualityObservation) -> _OwnedObservation:
         or observation.confirmed_at is not confirmed
         or observation.alerted is not alerted
         or event.tenant_id != tenant
-        or event.source_system != source
+        or event.source_system is not source
         or event.schema_version != schema
         or event.correlation_id != correlation
         or event.received_at is not received
@@ -543,7 +552,7 @@ def _owned_observation(observation: QualityObservation) -> _OwnedObservation:
         raise _SnapshotFailure("invalid.snapshot")
     owned_event = event.model_copy(update={
         "tenant_id": tenant,
-        "source_system": source,
+        "source_system": safe_source,
         "schema_version": schema,
         "correlation_id": correlation,
         "received_at": safe_received,
