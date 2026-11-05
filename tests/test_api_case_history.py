@@ -81,12 +81,19 @@ class Reader:
         self.calls: list[tuple[str, UUID]] = []
         self.events: object = (synthetic_event(),)
         self.outage = False
+        self.principal_mutation: tuple[str, str] | None = None
+        self.fail_after_mutation = False
 
     def history(self, *, principal: TrustedPrincipal, tenant_id: str,
                 case_id: UUID, at: datetime) -> object:
         self.calls.append((tenant_id, case_id))
         assert isinstance(principal, TrustedPrincipal)
         assert at.tzinfo is not None
+        if self.principal_mutation is not None:
+            field, replacement = self.principal_mutation
+            object.__setattr__(principal, field, replacement)
+            if self.fail_after_mutation:
+                raise RuntimeError("synthetic reader mutated principal then failed")
         if self.outage:
             raise RuntimeError("synthetic storage outage")
         return self.events
@@ -405,3 +412,41 @@ def test_boolean_previous_revision_is_rejected_without_read_disclosure(wired_cas
     assert response.json() == {"detail": "case history unavailable"}
     assert any(e.result == "failed" and e.reason == "case_history_unavailable"
                for e in audit.events)
+
+
+@pytest.mark.parametrize(("field", "replacement"), [
+    ("subject", "synthetic-forged-actor-secret"),
+    ("issuer", "synthetic-forged-issuer-secret"),
+])
+@pytest.mark.parametrize("fail_after_mutation", [False, True])
+def test_case_reader_cannot_rewrite_authenticated_audit_actor(
+    wired_case_history, field: str, replacement: str, fail_after_mutation: bool,
+) -> None:
+    """A lower-trust callback must not mutate request identity used by audit.
+
+    Frozen verifier output is not deep in-process immutability. Without an
+    isolated callback copy, object.__setattr__ could make authorization and
+    terminal read records attribute different actors to the same request.
+    """
+    client, audit, reader = wired_case_history
+    expected_actor = identity().audit_actor
+    reader.principal_mutation = (field, replacement)
+    reader.fail_after_mutation = fail_after_mutation
+
+    response = client.get(path(), headers=token())
+    assert response.status_code == (503 if fail_after_mutation else 200)
+    if fail_after_mutation:
+        assert response.json() == {"detail": "case history unavailable"}
+    else:
+        assert response.json()["enforcement_activated"] is False
+    records = [
+        event for event in audit.events
+        if event.action == Capability.CASE_READ.value
+    ]
+    assert [event.result for event in records] == [
+        "authorized", "failed" if fail_after_mutation else "succeeded",
+    ]
+    assert {event.actor_ref for event in records} == {expected_actor}
+    assert reader.calls == [("tenant-a", CASE_ID)]
+    assert replacement not in response.text
+    assert replacement not in str(audit.events)
