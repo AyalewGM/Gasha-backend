@@ -533,12 +533,14 @@ def _owned_observation(observation: QualityObservation) -> _OwnedObservation:
         or event.payload is not original_payload
     ):
         raise _SnapshotFailure("invalid.snapshot")
-    if type(original_payload) is dict:
-        # Compare type-tagged values: bool and int must not compare equal.
-        if _typed_cohort_value(payload) != _typed_cohort_value(
+    # Type-tagged comparison: bool and int must not compare equal.
+    if (
+        type(original_payload) is dict
+        and _typed_cohort_value(payload) != _typed_cohort_value(
             _owned_value(original_payload, remaining=[4096])
-        ):
-            raise _SnapshotFailure("invalid.snapshot")
+        )
+    ):
+        raise _SnapshotFailure("invalid.snapshot")
     owned_event = event.model_copy(update={
         "tenant_id": tenant,
         "source_system": source,
