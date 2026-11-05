@@ -925,3 +925,68 @@ def test_unsupported_opaque_nested_identity_is_rejected_not_compared() -> None:
     assert row["accepted"] == 1 and row["rejected"] == 1
     assert row["checks"] == {"invalid.cohort_identity": 1}
     assert row["optional_signals"]["beneficiary_risk"]["available"]["count"] == 1
+
+
+@pytest.mark.parametrize(("field", "changed"), [
+    ("tenant_id", "other-synthetic-tenant"),
+    ("dataset_digest", "b" * 64),
+    ("schema_version", "2.0"),
+    ("mapping_version", "reference-2"),
+    ("configuration_version", "config-2"),
+    ("window_start", AT - timedelta(days=2)),
+    ("window_end", AT + timedelta(days=2)),
+    ("label_cutoff", AT + timedelta(days=5)),
+])
+def test_retained_report_scope_cannot_be_relabelled_after_creation(
+    field: str, changed: object,
+) -> None:
+    """No changed tenant/dataset/config/window may borrow earlier cohort counts."""
+    report = inspect_reference_quality(scope(), (candidate("scope-lock"),))
+    initial = report.to_dict()
+    assert initial["use_cases"][0]["accepted"] == 1
+    # Frozen dataclasses remain writable via this low-level mutation route.
+    object.__setattr__(report.scope, field, changed)
+    with pytest.raises(ValueError, match="scope integrity failed"):
+        report.to_dict()
+
+
+def test_replacing_retained_report_scope_with_valid_other_tenant_is_rejected() -> None:
+    report = inspect_reference_quality(scope(), (candidate("scope-replaced"),))
+    object.__setattr__(report, "scope", scope(tenant_id="other-synthetic-tenant"))
+    with pytest.raises(ValueError, match="scope integrity failed"):
+        report.to_dict()
+
+
+@pytest.mark.parametrize("change", [
+    {"tenant_id": "raw customer identifier"},
+    {"dataset_digest": "invalid-digest"},
+    {"window_start": datetime(2026, 1, 1, 12)},
+])
+def test_malformed_postconstruction_scope_fails_without_export(
+    change: dict[str, object],
+) -> None:
+    report = inspect_reference_quality(scope(), (candidate("scope-corrupt"),))
+    for name, value in change.items():
+        object.__setattr__(report.scope, name, value)
+    with pytest.raises(ValueError, match="scope integrity failed"):
+        report.to_dict()
+
+
+def test_deleted_retained_scope_field_fails_without_export() -> None:
+    report = inspect_reference_quality(scope(), (candidate("scope-deleted"),))
+    object.__delattr__(report.scope, "dataset_digest")
+    with pytest.raises(ValueError, match="scope integrity failed"):
+        report.to_dict()
+
+
+def test_equivalent_timezone_representation_keeps_original_scope_binding() -> None:
+    report = inspect_reference_quality(scope(), (candidate("scope-offset"),))
+    baseline = report.to_dict()
+    offset = timezone(timedelta(hours=-5))
+    object.__setattr__(
+        report.scope, "window_start", report.scope.window_start.astimezone(offset),
+    )
+    assert report.to_dict() == baseline
+    assert report.to_dict()["bank_data_verified"] is False
+    assert report.to_dict()["readiness_authorized"] is False
+    assert report.to_dict()["enforcement_activated"] is False
