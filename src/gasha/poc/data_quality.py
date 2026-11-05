@@ -474,7 +474,7 @@ def inspect_reference_quality(
     # same-UUID claim quarantines every such claim rather than letting input
     # order decide the accepted fraud/alert/label denominator. Invalid rows
     # do not reserve IDs or poison separately valid observations.
-    inspected: list[tuple[QualityObservation, _Result]] = []
+    inspected: list[tuple[UseCase, _Result, bool | None, datetime | None, bool | None]] = []
     first_claims: dict[tuple[UseCase, UUID], tuple[object, ...]] = {}
     conflicting_ids: set[tuple[UseCase, UUID]] = set()
     for observation in observations:
@@ -486,25 +486,35 @@ def inspect_reference_quality(
         ):
             raise ValueError("invalid quality observation type")
         check = _inspect(scope, observation)
-        inspected.append((observation, check))
+        # The second accounting pass must not reread caller-owned observations.
+        # A custom input Sequence (or an in-process producer) can mutate a
+        # previously yielded frozen dataclass via object.__setattr__. Capture
+        # the validated population assertions before the next input is read.
+        checked_uc = observation.use_case
+        checked_fraud = observation.confirmed_fraud
+        checked_confirmed_at = observation.confirmed_at
+        checked_alerted = observation.alerted
+        inspected.append((
+            checked_uc, check, checked_fraud, checked_confirmed_at, checked_alerted
+        ))
         if not check.failed_checks and check.event_id is not None:
-            key = (observation.use_case, check.event_id)
+            key = (checked_uc, check.event_id)
             try:
                 claim = _accepted_cohort_identity(observation, check)
             except (ValueError, TypeError, OverflowError, RecursionError):
                 # Opaque or malformed nested data cannot be compared safely.
                 # Quarantine this claim without poisoning a valid same-ID row.
-                inspected[-1] = (observation, replace(
-                    check, failed_checks=("invalid.cohort_identity",),
-                ))
+                inspected[-1] = (
+                    checked_uc, replace(check, failed_checks=("invalid.cohort_identity",)),
+                    checked_fraud, checked_confirmed_at, checked_alerted,
+                )
                 continue
             if key not in first_claims:
                 first_claims[key] = claim
             elif first_claims[key] != claim:
                 conflicting_ids.add(key)
     seen: set[tuple[UseCase, UUID]] = set()
-    for observation, check in inspected:
-        uc = observation.use_case
+    for uc, check, confirmed_fraud, confirmed_at, alerted in inspected:
         stats = counters[uc]
         stats["total"] += 1
         rejected = set(check.failed_checks)
@@ -529,19 +539,19 @@ def inspect_reference_quality(
         # Label clock and reference event clock are both untrusted; only an
         # explicitly observed, non-future label may enter accepted counts.
         mature = (
-            observation.confirmed_fraud is not None
-            and observation.confirmed_at is not None
+            confirmed_fraud is not None
+            and confirmed_at is not None
             and check.occurred_at is not None
-            and check.occurred_at <= _utc(observation.confirmed_at) <= _utc(scope.label_cutoff)
+            and check.occurred_at <= _utc(confirmed_at) <= _utc(scope.label_cutoff)
         )
         if mature:
-            stats["positive" if observation.confirmed_fraud else "negative"] += 1
+            stats["positive" if confirmed_fraud else "negative"] += 1
         else:
             stats["unlabelled"] += 1
-        if observation.alerted is None:
+        if alerted is None:
             stats["alert_unknown"] += 1
         else:
-            stats["alerted" if observation.alerted else "not_alerted"] += 1
+            stats["alerted" if alerted else "not_alerted"] += 1
     summaries: list[dict[str, object]] = []
     for uc in UseCase:
         stats = counters[uc]
