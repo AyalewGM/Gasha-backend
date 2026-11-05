@@ -1017,7 +1017,7 @@ def test_retained_quality_aggregate_replacement_cannot_be_exported(
         forged[0]["untrusted_identifier"] = "synthetic-opaque-marker"
         object.__setattr__(report, "use_cases", tuple(forged))
     elif mutation == "identical-but-replaced":
-        object.__setattr__(report, "use_cases", tuple(list(report.use_cases)))
+        object.__setattr__(report, "use_cases", (*report.use_cases,))
     elif mutation == "empty-tuple":
         object.__setattr__(report, "use_cases", ())
     elif mutation == "mutable-list":
