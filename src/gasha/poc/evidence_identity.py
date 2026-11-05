@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from hashlib import sha256
 from json import dumps
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from gasha.poc.readiness import EvidenceArea, Stage
 
@@ -36,7 +37,13 @@ def _digest(name: str, value: object) -> None:
 
 
 def _time(name: str, value: object) -> datetime:
-    if not isinstance(value, datetime) or value.utcoffset() is None:
+    # Validate the concrete clock implementation before calling timezone hooks:
+    # datetime subclasses and custom tzinfo objects can execute caller code.
+    if not isinstance(value, datetime) or type(value) is not datetime:
+        raise EvidenceIdentityRejected(f"{name} must be an allowed timezone-aware datetime")
+    if type(value.tzinfo) not in (timezone, ZoneInfo):
+        raise EvidenceIdentityRejected(f"{name} must be an allowed timezone-aware datetime")
+    if value.utcoffset() is None:
         raise EvidenceIdentityRejected(f"{name} must be timezone-aware")
     return value.astimezone(UTC)
 
