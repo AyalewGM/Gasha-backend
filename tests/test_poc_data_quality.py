@@ -1247,6 +1247,7 @@ def test_nested_payload_alias_rewrite_after_validation_cannot_change_identity() 
 
         def __iter__(self):
             yield first
+            assert isinstance(first.event.payload, dict)
             first.event.payload["intelligence"]["beneficiary_risk"] = 0.0
             first.event.payload["amount"] = "-1"
             yield second
