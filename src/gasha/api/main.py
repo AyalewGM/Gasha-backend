@@ -595,13 +595,22 @@ def get_case_history(
     try:
         if reader is None:
             raise RuntimeError("trusted case history reader not configured")
+        # Keep the authenticated ingress principal isolated from the reader.
+        # Frozen dataclasses can still be mutated via object.__setattr__.
+        reader_principal = replace(principal)
         history = reader.history(
-            # Never hand the ingress principal to an external reader: frozen
-            # dataclasses can be mutated with object.__setattr__, which would
-            # otherwise rewrite the terminal security-audit actor identity.
-            principal=replace(principal), tenant_id=tenant_id, case_id=case_id,
+            principal=reader_principal, tenant_id=tenant_id, case_id=case_id,
             at=utcnow(),
         )
+        # A misbehaving adapter must not return a successful read after
+        # altering its verified identity/scope/capabilities. Reconstruct to
+        # validate types, and compare UTC instants across DST folds.
+        if (
+            replace(reader_principal) != principal
+            or reader_principal.expires_at.astimezone(UTC)
+            != principal.expires_at.astimezone(UTC)
+        ):
+            raise ValueError("reader modified authenticated principal")
         events = _case_history_view(history, tenant_id=tenant_id, case_id=case_id)
     except Exception as exc:
         _operation_audit(
