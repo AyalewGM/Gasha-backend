@@ -310,6 +310,9 @@ class DataQualityReport:
     scope: DataQualityScope
     use_cases: tuple[Mapping[str, object], ...]
     _retained_scope_binding: tuple[str, ...] = field(init=False, repr=False, compare=False)
+    _retained_use_cases: tuple[Mapping[str, object], ...] = field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         # A frozen dataclass does not freeze dicts inside a tuple. Snapshot the
@@ -323,10 +326,12 @@ class DataQualityReport:
                 or len(self.use_cases) != len(UseCase)
                 or any(not isinstance(row, Mapping) for row in self.use_cases)):
             raise ValueError("invalid aggregate use-case rows")
-        object.__setattr__(
-            self, "use_cases",
-            tuple(_freeze_report_value(row) for row in self.use_cases),
-        )
+        frozen_rows = tuple(_freeze_report_value(row) for row in self.use_cases)
+        object.__setattr__(self, "use_cases", frozen_rows)
+        # A frozen dataclass can still be replaced with object.__setattr__.
+        # Retain the *owned immutable tuple* so a later forged aggregate cannot
+        # be exported under the original tenant/dataset/version scope.
+        object.__setattr__(self, "_retained_use_cases", frozen_rows)
 
     def to_dict(self) -> dict[str, object]:
         """Reject post-construction scope substitution before exporting counts."""
@@ -340,6 +345,14 @@ class DataQualityReport:
                 raise ValueError("report scope changed after construction")
         except (AttributeError, TypeError, ValueError) as exc:
             raise ValueError("quality report scope integrity failed") from exc
+        try:
+            if (
+                type(self.use_cases) is not tuple
+                or self.use_cases is not self._retained_use_cases
+            ):
+                raise ValueError("retained aggregate rows were replaced")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("quality report aggregate integrity failed") from exc
         return {
             "schema_version": _SCHEMA_VERSION,
             "provisional_coverage_matrix_version": _COVERAGE_MATRIX_VERSION,
