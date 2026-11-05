@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from enum import StrEnum
 from hashlib import sha256
 from json import dumps
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 _TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _TOKEN = re.compile(r"[0-9a-f]{64}\Z")
@@ -42,7 +43,15 @@ def _tag(value: object, name: str) -> None:
 
 
 def _time(value: object, name: str) -> datetime:
-    if not isinstance(value, datetime) or value.utcoffset() is None:
+    # Validate before invoking timezone methods: third-party tzinfo and
+    # datetime subclasses may execute callbacks that mutate reference evidence.
+    # The inert matcher supports only built-in datetime/timezone and ZoneInfo.
+    if (
+        type(value) is not datetime
+        or type(value.tzinfo) not in (timezone, ZoneInfo)
+    ):
+        raise RiskListRejected(f"{name} must be timezone aware with a trusted clock")
+    if value.utcoffset() is None:
         raise RiskListRejected(f"{name} must be timezone aware")
     return value.astimezone(UTC)
 
