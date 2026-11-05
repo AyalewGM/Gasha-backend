@@ -1043,3 +1043,67 @@ def test_valid_retained_quality_aggregates_export_consistently() -> None:
     assert before["use_cases"][0] is not after["use_cases"][0]
     assert before["readiness_authorized"] is False
     assert before["enforcement_activated"] is False
+
+
+def test_two_phase_aggregation_does_not_reread_modified_prior_observation() -> None:
+    """A later iterator step cannot reclassify earlier validated KPI populations."""
+    first = candidate(
+        "phase-snapshot-a", label=True, confirmed_at=AT + timedelta(hours=2),
+        alerted=True,
+    )
+    second = candidate(
+        "phase-snapshot-b", label=False, confirmed_at=AT + timedelta(hours=2),
+        alerted=False,
+    )
+
+    class RewritingSequence:
+        def __len__(self) -> int:
+            return 2
+
+        def __getitem__(self, index: int) -> QualityObservation:
+            return (first, second)[index]
+
+        def __iter__(self):
+            yield first
+            # The first observation has already passed inspection and cohort
+            # comparison. Its original values must be retained for accounting.
+            object.__setattr__(first, "use_case", UseCase.UC02)
+            object.__setattr__(first, "confirmed_fraud", False)
+            object.__setattr__(first, "confirmed_at", AT - timedelta(days=5))
+            object.__setattr__(first, "alerted", False)
+            yield second
+
+    exported = inspect_reference_quality(scope(), RewritingSequence()).to_dict()
+    uc01, uc02, uc03 = exported["use_cases"]
+    assert (uc01["total"], uc01["accepted"], uc01["rejected"]) == (2, 2, 0)
+    assert uc01["labels"] == {"positive": 1, "negative": 1, "unlabelled": 0}
+    assert uc01["alerts"] == {"alerted": 1, "not_alerted": 1, "unknown": 0}
+    assert (uc02["total"], uc03["total"]) == (0, 0)
+    assert exported["bank_data_verified"] is False
+    assert exported["enforcement_activated"] is False
+
+
+def test_two_phase_aggregation_does_not_admit_later_added_fraud_label() -> None:
+    """A label added after initial validation must remain unknown in this report."""
+    first = candidate("phase-unknown-a", label=None, alerted=None)
+    second = candidate("phase-unknown-b", label=None, alerted=None)
+
+    class RewritingSequence:
+        def __len__(self) -> int:
+            return 2
+
+        def __getitem__(self, index: int) -> QualityObservation:
+            return (first, second)[index]
+
+        def __iter__(self):
+            yield first
+            object.__setattr__(first, "confirmed_fraud", True)
+            object.__setattr__(first, "confirmed_at", AT + timedelta(hours=1))
+            object.__setattr__(first, "alerted", True)
+            yield second
+
+    exported = inspect_reference_quality(scope(), RewritingSequence()).to_dict()
+    row = exported["use_cases"][0]
+    assert row["accepted"] == 2
+    assert row["labels"] == {"positive": 0, "negative": 0, "unlabelled": 2}
+    assert row["alerts"] == {"alerted": 0, "not_alerted": 0, "unknown": 2}
