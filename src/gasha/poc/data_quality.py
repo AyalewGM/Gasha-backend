@@ -10,12 +10,13 @@ import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from math import isfinite
 from types import MappingProxyType
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from gasha.ingestion.contracts import InboundBankEvent
 
@@ -146,7 +147,7 @@ def _valid_optional_signal(value: object) -> bool:
         return False
 
 
-def _inspect(scope: DataQualityScope, observation: QualityObservation) -> _Result:
+def _inspect(scope: DataQualityScope, observation: _OwnedObservation) -> _Result:
     event = observation.event
     payload = event.payload
     codes: set[str] = set()
@@ -424,8 +425,133 @@ def _typed_cohort_value(value: object, *, depth: int = 0) -> tuple[object, ...]:
     raise ValueError("unsupported cohort identity value")
 
 
+@dataclass(frozen=True)
+class _OwnedObservation:
+    """Internal inspected view; no field aliases an untrusted input record."""
+
+    use_case: UseCase
+    event: InboundBankEvent
+    confirmed_fraud: object
+    confirmed_at: object
+    alerted: object
+
+
+class _SnapshotFailure(ValueError):
+    """Reason code for an input that cannot be safely detached."""
+
+
+def _owned_clock(value: object) -> object:
+    """Normalize only built-in / zoneinfo clocks, without untrusted tz callbacks."""
+    if type(value) is not datetime:
+        return value
+    zone = value.tzinfo
+    if zone is None:
+        return value  # _inspect reports the familiar invalid clock code.
+    if type(zone) not in (timezone, ZoneInfo):
+        raise _SnapshotFailure("invalid.snapshot")
+    return _utc(value)
+
+
+def _owned_value(value: object, *, depth: int = 0, remaining: list[int]) -> object:
+    """Copy bounded reference JSON with exact built-in types, never invoke hooks."""
+    remaining[0] -= 1
+    if remaining[0] < 0 or depth > 32:
+        raise _SnapshotFailure("invalid.snapshot")
+    if value is None or type(value) in (str, int, bool):
+        return value
+    if type(value) is float:
+        if not isfinite(value):
+            raise _SnapshotFailure("invalid.cohort_identity")
+        return value
+    if type(value) is Decimal:
+        if not value.is_finite():
+            raise _SnapshotFailure("invalid.cohort_identity")
+        return value
+    if type(value) is datetime:
+        return _owned_clock(value)
+    if type(value) is dict:
+        if len(value) > 1024 or any(type(key) is not str for key in value):
+            raise _SnapshotFailure("invalid.snapshot")
+        return {
+            key: _owned_value(item, depth=depth + 1, remaining=remaining)
+            for key, item in value.items()
+        }
+    if type(value) in (list, tuple):
+        if len(value) > 1024:
+            raise _SnapshotFailure("invalid.snapshot")
+        copied = (
+            _owned_value(item, depth=depth + 1, remaining=remaining)
+            for item in value
+        )
+        return tuple(copied) if type(value) is tuple else list(copied)
+    if isinstance(value, (Mapping, Sequence)):
+        raise _SnapshotFailure("invalid.snapshot")
+    raise _SnapshotFailure("invalid.cohort_identity")
+
+
+def _owned_observation(observation: QualityObservation) -> _OwnedObservation:
+    """Take a single callback-free, bounded snapshot before inspection/identity.
+
+    We reject opaque Mapping subclasses and custom timezone implementations
+    instead of trusting their get/iteration/utcoffset methods. Re-read and
+    compare exact primitive fields and the detached payload to detect aliases
+    changed while copying. This is synthetic caller isolation, not protection
+    against privileged concurrent code or trusted Bank source attestation.
+    """
+    event = observation.event
+    uc = observation.use_case
+    fraud = observation.confirmed_fraud
+    confirmed = observation.confirmed_at
+    alerted = observation.alerted
+    tenant = event.tenant_id
+    source = event.source_system
+    schema = event.schema_version
+    correlation = event.correlation_id
+    received = event.received_at
+    original_payload = event.payload
+    if type(original_payload) is dict:
+        payload: object = _owned_value(original_payload, remaining=[4096])
+    elif isinstance(original_payload, Mapping):
+        raise _SnapshotFailure("invalid.snapshot")
+    else:
+        # Preserve existing invalid.payload / required-field diagnostics for
+        # malformed adapter-bypass data without retaining mutable list aliases.
+        payload = None
+    safe_received = _owned_clock(received)
+    safe_confirmed = _owned_clock(confirmed)
+    if (
+        observation.event is not event
+        or observation.use_case is not uc
+        or observation.confirmed_fraud is not fraud
+        or observation.confirmed_at is not confirmed
+        or observation.alerted is not alerted
+        or event.tenant_id != tenant
+        or event.source_system != source
+        or event.schema_version != schema
+        or event.correlation_id != correlation
+        or event.received_at is not received
+        or event.payload is not original_payload
+    ):
+        raise _SnapshotFailure("invalid.snapshot")
+    if type(original_payload) is dict:
+        # Compare type-tagged values: bool and int must not compare equal.
+        if _typed_cohort_value(payload) != _typed_cohort_value(
+            _owned_value(original_payload, remaining=[4096])
+        ):
+            raise _SnapshotFailure("invalid.snapshot")
+    owned_event = event.model_copy(update={
+        "tenant_id": tenant,
+        "source_system": source,
+        "schema_version": schema,
+        "correlation_id": correlation,
+        "received_at": safe_received,
+        "payload": payload,
+    })
+    return _OwnedObservation(uc, owned_event, fraud, safe_confirmed, alerted)
+
+
 def _accepted_cohort_identity(
-    observation: QualityObservation, result: _Result
+    observation: _OwnedObservation, result: _Result
 ) -> tuple[object, ...]:
     """Ephemeral equality for accepted records, never exported as evidence.
 
@@ -485,22 +611,29 @@ def inspect_reference_quality(
             or not isinstance(observation.event, InboundBankEvent)
         ):
             raise ValueError("invalid quality observation type")
-        check = _inspect(scope, observation)
-        # The second accounting pass must not reread caller-owned observations.
-        # A custom input Sequence (or an in-process producer) can mutate a
-        # previously yielded frozen dataclass via object.__setattr__. Capture
-        # the validated population assertions before the next input is read.
+        # All validation, deduplication and accounting consume one detached
+        # snapshot. Invalid callback-capable inputs are quarantined before any
+        # caller-controlled Mapping or timezone method can execute.
         checked_uc = observation.use_case
-        checked_fraud = observation.confirmed_fraud
-        checked_confirmed_at = observation.confirmed_at
-        checked_alerted = observation.alerted
+        try:
+            owned = _owned_observation(observation)
+        except _SnapshotFailure as exc:
+            inspected.append((
+                checked_uc, _Result((str(exc),), (), None, None, (), ()),
+                None, None, None,
+            ))
+            continue
+        check = _inspect(scope, owned)
+        checked_fraud = owned.confirmed_fraud
+        checked_confirmed_at = owned.confirmed_at
+        checked_alerted = owned.alerted
         inspected.append((
             checked_uc, check, checked_fraud, checked_confirmed_at, checked_alerted
         ))
         if not check.failed_checks and check.event_id is not None:
             key = (checked_uc, check.event_id)
             try:
-                claim = _accepted_cohort_identity(observation, check)
+                claim = _accepted_cohort_identity(owned, check)
             except (ValueError, TypeError, OverflowError, RecursionError):
                 # Opaque or malformed nested data cannot be compared safely.
                 # Quarantine this claim without poisoning a valid same-ID row.
