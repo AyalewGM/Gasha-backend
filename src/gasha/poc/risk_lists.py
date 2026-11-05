@@ -10,11 +10,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
-from zoneinfo import ZoneInfo
 from enum import StrEnum
 from hashlib import sha256
 from json import dumps
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 _TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _TOKEN = re.compile(r"[0-9a-f]{64}\Z")
