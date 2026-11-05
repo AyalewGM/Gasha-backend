@@ -1,6 +1,6 @@
 """Issue #44: synthetic-only, version-pinned list matcher regressions."""
 from dataclasses import FrozenInstanceError, replace
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -424,3 +424,84 @@ def test_valid_request_subject_copies_preserve_match_only_result() -> None:
     assert not report.enforcement_activated
     with pytest.raises(RiskListRejected, match="duplicate subject"):
         lookup(original, subjects=(BANK, independent))
+
+
+class _CallbackZone(tzinfo):
+    """Caller-owned zone whose methods must never run in reference matching."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        self.calls += 1
+        return timedelta(0)
+
+    def dst(self, dt: datetime | None) -> timedelta:
+        self.calls += 1
+        return timedelta(0)
+
+    def tzname(self, dt: datetime | None) -> str:
+        self.calls += 1
+        return "untrusted"
+
+
+class _CallbackDateTime(datetime):
+    """A datetime subtype can also override clock methods without a custom zone."""
+
+    calls = 0
+
+    def utcoffset(self) -> timedelta:
+        type(self).calls += 1
+        return timedelta(0)
+
+    def astimezone(self, tz: tzinfo | None = None) -> datetime:
+        type(self).calls += 1
+        return super().astimezone(tz)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["effective_from", "effective_until", "revoked_at", "published_at", "event_at"],
+)
+def test_reference_clocks_reject_untrusted_timezones_without_callbacks(field: str) -> None:
+    zone = _CallbackZone()
+    hostile = datetime(2026, 10, 31, 12, tzinfo=zone)
+    with pytest.raises(RiskListRejected, match="trusted clock"):
+        if field == "published_at":
+            replace(snapshot(), published_at=hostile)
+        elif field == "event_at":
+            lookup(snapshot(entry(1, RiskListKind.BLOCK)), at=hostile)
+        else:
+            replace(entry(1, RiskListKind.BLOCK), **{field: hostile})
+    assert zone.calls == 0
+
+
+@pytest.mark.parametrize(
+    "field", ["published_at", "effective_from", "effective_until", "revoked_at"]
+)
+def test_damaged_reference_clock_fails_before_digest_or_match(field: str) -> None:
+    zone = _CallbackZone()
+    original = snapshot(entry(1, RiskListKind.BLOCK))
+    target = original if field == "published_at" else original.entries[0]
+    object.__setattr__(
+        target, field, datetime(2026, 10, 31, 12, tzinfo=zone)
+    )
+    with pytest.raises(RiskListRejected, match="trusted clock"):
+        original.digest()
+    with pytest.raises(RiskListRejected, match="trusted clock"):
+        lookup(original)
+    assert zone.calls == 0
+
+
+@pytest.mark.parametrize("field", ["published_at", "effective_from", "event_at"])
+def test_datetime_subtype_rejected_before_overridden_clock_methods(field: str) -> None:
+    _CallbackDateTime.calls = 0
+    hostile = _CallbackDateTime(2026, 10, 31, 12, tzinfo=UTC)
+    with pytest.raises(RiskListRejected, match="trusted clock"):
+        if field == "published_at":
+            replace(snapshot(), published_at=hostile)
+        elif field == "event_at":
+            lookup(snapshot(entry(1, RiskListKind.WATCH)), at=hostile)
+        else:
+            replace(entry(1, RiskListKind.WATCH), effective_from=hostile)
+    assert _CallbackDateTime.calls == 0
