@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import json
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from uuid import NAMESPACE_URL, uuid5
 from zoneinfo import ZoneInfo
 
@@ -1107,3 +1107,155 @@ def test_two_phase_aggregation_does_not_admit_later_added_fraud_label() -> None:
     assert row["accepted"] == 2
     assert row["labels"] == {"positive": 0, "negative": 0, "unlabelled": 2}
     assert row["alerts"] == {"alerted": 0, "not_alerted": 0, "unknown": 2}
+
+
+
+@pytest.mark.parametrize("clock_field", ["confirmed_at", "received_at"])
+def test_callback_timezone_cannot_reclassify_synthetic_cohort(clock_field: str) -> None:
+    """Reject arbitrary clock providers before utcoffset can mutate input."""
+    valid = candidate(
+        "clock-hook", label=True, confirmed_at=AT + timedelta(hours=2),
+        alerted=True,
+    )
+    invalid = candidate(
+        "clock-hook", label=True, confirmed_at=AT + timedelta(hours=2),
+        alerted=True,
+    )
+    calls: list[str] = []
+
+    class MutatingZone(tzinfo):
+        def utcoffset(self, dt: datetime | None) -> timedelta:
+            calls.append("utcoffset")
+            object.__setattr__(invalid, "use_case", UseCase.UC02)
+            object.__setattr__(invalid, "confirmed_fraud", False)
+            object.__setattr__(invalid, "alerted", False)
+            object.__setattr__(invalid, "confirmed_at", None)
+            return timedelta(0)
+
+        def dst(self, dt: datetime | None) -> timedelta:
+            return timedelta(0)
+
+        def tzname(self, dt: datetime | None) -> str:
+            return "ATTACKER"
+
+    malicious_time = datetime(2026, 1, 1, 12, tzinfo=MutatingZone())
+    if clock_field == "confirmed_at":
+        object.__setattr__(invalid, "confirmed_at", malicious_time)
+    else:
+        object.__setattr__(
+            invalid, "event",
+            invalid.event.model_copy(update={"received_at": malicious_time}),
+        )
+    baseline = result_for(valid)
+    for rows in ((invalid, valid), (valid, invalid)):
+        report = inspect_reference_quality(scope(), rows).to_dict()
+        uc01, uc02, uc03 = report["use_cases"]
+        assert (uc01["total"], uc01["accepted"], uc01["rejected"]) == (2, 1, 1)
+        assert uc01["checks"] == {"invalid.snapshot": 1}
+        assert uc01["labels"] == baseline["labels"]
+        assert uc01["alerts"] == baseline["alerts"]
+        assert uc01["optional_signals"] == baseline["optional_signals"]
+        assert uc02["total"] == uc03["total"] == 0
+        assert report["bank_data_verified"] is False
+        assert report["enforcement_activated"] is False
+        assert calls == []  # A custom callback never receives execution.
+
+
+@pytest.mark.parametrize("hook", ["get", "items", "__iter__", "__getitem__"])
+def test_custom_payload_mapping_hooks_cannot_change_scope_or_labels(hook: str) -> None:
+    """Opaque mappings are quarantined without invoking any user hook."""
+    valid = candidate(
+        "mapping-hook", label=True, confirmed_at=AT + timedelta(hours=2),
+        alerted=True,
+    )
+    invalid = candidate(
+        "mapping-hook", label=True, confirmed_at=AT + timedelta(hours=2),
+        alerted=True,
+    )
+    calls: list[str] = []
+
+    def rewrite() -> None:
+        calls.append(hook)
+        object.__setattr__(invalid, "use_case", UseCase.UC03)
+        object.__setattr__(invalid, "confirmed_fraud", False)
+        object.__setattr__(invalid, "alerted", False)
+        object.__setattr__(invalid, "confirmed_at", None)
+        object.__setattr__(invalid, "event", invalid.event.model_copy(update={
+            "tenant_id": "wrong-synthetic-tenant",
+        }))
+
+    class AdversarialMapping(dict):
+        def get(self, key: str, default: object = None) -> object:
+            if hook == "get":
+                rewrite()
+            return super().get(key, default)
+
+        def items(self):
+            if hook == "items":
+                rewrite()
+            return super().items()
+
+        def __iter__(self):
+            if hook == "__iter__":
+                rewrite()
+            return super().__iter__()
+
+        def __getitem__(self, key: str) -> object:
+            if hook == "__getitem__":
+                rewrite()
+            return super().__getitem__(key)
+
+    payload = AdversarialMapping(dict(invalid.event.payload))
+    object.__setattr__(invalid, "event", invalid.event.model_copy(update={"payload": payload}))
+    baseline = result_for(valid)
+    for rows in ((invalid, valid), (valid, invalid)):
+        report = inspect_reference_quality(scope(), rows).to_dict()
+        uc01, uc02, uc03 = report["use_cases"]
+        assert uc01["total"] == 2
+        assert (uc01["accepted"], uc01["rejected"]) == (1, 1)
+        assert uc01["checks"] == {"invalid.snapshot": 1}
+        assert uc01["labels"] == baseline["labels"]
+        assert uc01["alerts"] == baseline["alerts"]
+        assert uc02["total"] == uc03["total"] == 0
+        assert calls == []
+        exported = json.dumps(report, allow_nan=False)
+        for forbidden in (
+            "synthetic-customer-secret",
+            "synthetic-account-secret",
+            "synthetic-beneficiary-secret",
+            "synthetic-correlation-secret",
+        ):
+            assert forbidden not in exported
+
+
+def test_nested_payload_alias_rewrite_after_validation_cannot_change_identity() -> None:
+    """An iterator mutation cannot alter the already detached first event."""
+    first = candidate(
+        "payload-alias-a",
+        payload_changes={"intelligence": {"beneficiary_risk": 0.5}},
+        label=True, confirmed_at=AT + timedelta(hours=2), alerted=True,
+    )
+    second = candidate("payload-alias-b", label=False,
+                       confirmed_at=AT + timedelta(hours=2), alerted=False)
+
+    class RewritingSequence:
+        def __len__(self) -> int:
+            return 2
+
+        def __getitem__(self, index: int) -> QualityObservation:
+            return (first, second)[index]
+
+        def __iter__(self):
+            yield first
+            first.event.payload["intelligence"]["beneficiary_risk"] = 0.0
+            first.event.payload["amount"] = "-1"
+            yield second
+
+    report = inspect_reference_quality(scope(), RewritingSequence()).to_dict()
+    row = report["use_cases"][0]
+    assert (row["total"], row["accepted"], row["rejected"]) == (2, 2, 0)
+    assert row["labels"] == {"positive": 1, "negative": 1, "unlabelled": 0}
+    assert row["alerts"] == {"alerted": 1, "not_alerted": 1, "unknown": 0}
+    assert row["optional_signals"]["beneficiary_risk"]["available"]["count"] == 1
+    assert report["readiness_authorized"] is False
+    assert report["enforcement_activated"] is False
