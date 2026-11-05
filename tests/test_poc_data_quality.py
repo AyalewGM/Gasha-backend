@@ -1260,3 +1260,59 @@ def test_nested_payload_alias_rewrite_after_validation_cannot_change_identity() 
     assert row["optional_signals"]["beneficiary_risk"]["available"]["count"] == 1
     assert report["readiness_authorized"] is False
     assert report["enforcement_activated"] is False
+
+@pytest.mark.parametrize("clock_field", ["confirmed_at", "received_at"])
+def test_datetime_subclass_clock_is_quarantined_before_callbacks(
+    clock_field: str,
+) -> None:
+    """Untrusted datetime subclasses must never execute custom clock methods."""
+    valid = candidate(
+        "datetime-subclass", label=True, confirmed_at=AT + timedelta(hours=2),
+        alerted=True,
+    )
+    invalid = candidate(
+        "datetime-subclass", label=True, confirmed_at=AT + timedelta(hours=2),
+        alerted=True,
+    )
+    callbacks: list[str] = []
+
+    class MutatingDateTime(datetime):
+        def utcoffset(self) -> timedelta | None:
+            callbacks.append("utcoffset")
+            object.__setattr__(invalid, "use_case", UseCase.UC02)
+            object.__setattr__(invalid, "confirmed_fraud", False)
+            object.__setattr__(invalid, "alerted", False)
+            raise RuntimeError("untrusted datetime callback invoked")
+
+        def astimezone(self, tz: tzinfo | None = None) -> datetime:
+            callbacks.append("astimezone")
+            raise RuntimeError("untrusted datetime conversion invoked")
+
+    hostile = MutatingDateTime(2026, 1, 1, 14, tzinfo=UTC)
+    if clock_field == "confirmed_at":
+        object.__setattr__(invalid, "confirmed_at", hostile)
+    else:
+        object.__setattr__(
+            invalid, "event",
+            invalid.event.model_copy(update={"received_at": hostile}),
+        )
+    baseline = result_for(valid)
+    for rows in ((invalid, valid), (valid, invalid)):
+        report = inspect_reference_quality(scope(), rows).to_dict()
+        uc01, uc02, uc03 = report["use_cases"]
+        assert (uc01["total"], uc01["accepted"], uc01["rejected"]) == (2, 1, 1)
+        assert uc01["checks"] == {"invalid.snapshot": 1}
+        assert uc01["labels"] == baseline["labels"]
+        assert uc01["alerts"] == baseline["alerts"]
+        assert uc01["optional_signals"] == baseline["optional_signals"]
+        assert uc02["total"] == uc03["total"] == 0
+        assert callbacks == []
+        assert report["bank_data_verified"] is False
+        assert report["readiness_authorized"] is False
+        assert report["enforcement_activated"] is False
+        serialized = json.dumps(report, allow_nan=False)
+        for secret in (
+            "synthetic-customer-secret", "synthetic-account-secret",
+            "synthetic-beneficiary-secret", "synthetic-correlation-secret",
+        ):
+            assert secret not in serialized

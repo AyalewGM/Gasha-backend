@@ -443,6 +443,10 @@ class _SnapshotFailure(ValueError):
 def _owned_clock(value: datetime | None) -> datetime | None:
     """Normalize only built-in / zoneinfo clocks, without untrusted tz callbacks."""
     if type(value) is not datetime:
+        # A datetime subclass may override utcoffset/astimezone and execute
+        # callbacks during validation. Reject it before invoking any method.
+        if issubclass(type(value), datetime):
+            raise _SnapshotFailure("invalid.snapshot")
         return value
     zone = value.tzinfo
     if zone is None:
