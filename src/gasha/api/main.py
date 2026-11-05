@@ -15,11 +15,12 @@ from hashlib import sha256
 from typing import Annotated, NoReturn, Protocol
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette._utils import get_route_path
 
+from gasha.cases.queue import CaseQueueSnapshot, project_case_queue
 from gasha.cases.timeline import (
     AuthorizedAssignee,
     BankExecution,
@@ -176,6 +177,20 @@ class TrustedDecisionContextProvider(Protocol):
     ) -> TrustedDecisionContext: ...
 
 
+class TrustedCaseQueueReader(Protocol):
+    """Installed #45 read-only ranked view, not a Bank scoring authority.
+
+    Reader MUST use the verified tenant principal and policy, bind each item to
+    one durable immutable case and trusted scenario evidence, and honor limit.
+    The default protected app has no reader; request data never installs one.
+    """
+
+    def read(
+        self, *, principal: TrustedPrincipal, tenant_id: str,
+        limit: int, at: datetime,
+    ) -> CaseQueueSnapshot: ...
+
+
 class TrustedCaseHistoryReader(Protocol):
     """Server-installed, principal-scoped, immutable #45 history reader.
 
@@ -277,6 +292,8 @@ app.state.decision_context_provider = None
 app.state.outcome_ingestion = None
 # No bank case reader is installed by default; the endpoint fails closed.
 app.state.case_history_reader = None
+# No ranked case reader or Bank-approved prioritization policy is installed.
+app.state.case_queue_reader = None
 # No case mutation can be enabled by request flags or a frontend role.
 app.state.case_transition_writer = None
 
@@ -516,6 +533,45 @@ def _case_history_view(
             "bank_execution": "unknown",
         })
     return projection
+
+
+@app.get("/v1/tenants/{tenant_id}/cases/queue")
+def get_case_queue(
+    tenant_id: str,
+    request: Request,
+    principal: Annotated[TrustedPrincipal, Depends(get_principal)],
+    limit: int = Query(default=25, ge=1, le=100),
+) -> dict[str, object]:
+    """Read-only queue contract for a future authorized analyst workspace.
+
+    External ranking and scenario provenance are not verified by this route.
+    It is inoperative without a trusted tenant-scoped installed reader.
+    """
+    action = Capability.CASE_READ
+    audit_scope = uuid4()  # Unique server-generated reference for this queue read.
+    _require_action(request, principal, tenant_id, action, event_id=audit_scope)
+    reader: TrustedCaseQueueReader | None = getattr(
+        request.app.state, "case_queue_reader", None
+    )
+    try:
+        if reader is None:
+            raise RuntimeError("trusted ranked case reader not configured")
+        at = utcnow()
+        snapshot = reader.read(
+            principal=replace(principal), tenant_id=tenant_id, limit=limit, at=at,
+        )
+        view = project_case_queue(snapshot, tenant_id=tenant_id, limit=limit, at=at)
+    except Exception as exc:
+        _operation_audit(
+            request, principal, tenant_id, audit_scope, action,
+            "failed", "case_queue_unavailable",
+        )
+        raise HTTPException(status_code=503, detail="case queue unavailable") from exc
+    _operation_audit(
+        request, principal, tenant_id, audit_scope, action,
+        "succeeded", "case_queue_read",
+    )
+    return view
 
 
 @app.get("/v1/tenants/{tenant_id}/cases/{case_id}/history")
