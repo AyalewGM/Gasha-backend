@@ -126,7 +126,9 @@ class DemoReader:
         self.calls.append(("queue", tenant_id))
         self._check(principal, tenant_id, at)
         return CaseQueueSnapshot(
-            tenant_id=TENANTS[1] if self.invalid_snapshot else tenant_id,
+            tenant_id=(
+                TENANTS[1] if tenant_id == TENANTS[0] else TENANTS[0]
+            ) if self.invalid_snapshot else tenant_id,
             ranking_policy_version=POLICY, generated_at=at,
             items=(self.cases[tenant_id],)[:limit],
         )
@@ -172,32 +174,37 @@ def auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def test_queue_to_history_preserves_lineage_and_no_bank_authority(analyst_demo) -> None:
+@pytest.mark.parametrize("tenant", TENANTS)
+def test_queue_to_history_preserves_lineage_and_no_bank_authority(
+    analyst_demo, tenant: str,
+) -> None:
     verifier, audit, reader = analyst_demo
-    token = verifier.issue(TENANTS[0])
+    token = verifier.issue(tenant)
     client = TestClient(app)
-    queue = client.get(url(TENANTS[0]), headers=auth(token))
+    queue = client.get(url(tenant), headers=auth(token))
     assert queue.status_code == 200, queue.text
     data = queue.json()
     assert data["ranking_policy_version"] == POLICY
     assert data["bank_ranking_approved"] is False
     assert data["enforcement_activated"] is False
     item = data["items"][0]
-    assert item["scenario_ids"] == ["APP-01", "ATO-02"]
+    assert item["scenario_ids"] == (
+        ["APP-01", "ATO-02"] if tenant == TENANTS[0] else ["MM-01", "MM-05"]
+    )
     assert item["bank_execution"] == "unknown"
-    history = client.get(url(TENANTS[0], UUID(item["case_id"])), headers=auth(token))
+    history = client.get(url(tenant, UUID(item["case_id"])), headers=auth(token))
     assert history.status_code == 200, history.text
     event = history.json()["events"][0]
     assert event["source_event_id"] == item["source_event_id"]
     assert event["source_context_ref"] == item["source_context_ref"]
     assert event["bank_execution"] == "unknown"
     assert history.json()["enforcement_activated"] is False
-    assert reader.calls == [("queue", TENANTS[0]), ("history", TENANTS[0])]
+    assert reader.calls == [("queue", tenant), ("history", tenant)]
     assert [e.result for e in audit.events if e.action == "case.read"] == [
         "authorized", "succeeded", "authorized", "succeeded",
     ]
     assert token not in queue.text + history.text + str(audit.events)
-    assert TENANTS[0] not in str(audit.events)
+    assert tenant not in str(audit.events)
     assert "idempotency_ref" not in history.text
 
 
@@ -209,6 +216,8 @@ def test_second_fictional_tenant_and_cross_scope_are_isolated(analyst_demo) -> N
     b = client.get(url(TENANTS[1]), headers=auth(second))
     assert a.status_code == b.status_code == 200
     assert a.json()["items"][0]["case_id"] != b.json()["items"][0]["case_id"]
+    assert a.json()["items"][0]["source_event_id"] != b.json()["items"][0]["source_event_id"]
+    assert a.json()["items"][0]["source_context_ref"] != b.json()["items"][0]["source_context_ref"]
     assert b.json()["items"][0]["scenario_ids"] == ["MM-01", "MM-05"]
     # Wrong-tenant URL is hidden, and a foreign case ID cannot be read via B.
     assert client.get(url(TENANTS[0]), headers={
@@ -217,6 +226,13 @@ def test_second_fictional_tenant_and_cross_scope_are_isolated(analyst_demo) -> N
     }).status_code == 404
     assert client.get(
         url(TENANTS[1], reader.cases[TENANTS[0]].case_id), headers=auth(second),
+    ).status_code == 404
+    assert client.get(url(TENANTS[1]), headers={
+        **auth(first), "X-Tenant-Id": TENANTS[1], "X-Role": "admin",
+        "X-Forwarded-Prefix": "/forged",
+    }).status_code == 404
+    assert client.get(
+        url(TENANTS[0], reader.cases[TENANTS[1]].case_id), headers=auth(first),
     ).status_code == 404
     assert first not in str(audit.events) and second not in str(audit.events)
     assert all(e.bank_execution is BankExecution.UNKNOWN
@@ -286,24 +302,26 @@ def test_revocation_after_success_never_serves_cached_history(analyst_demo) -> N
     assert reader.calls == [("queue", TENANTS[0])]
 
 
+@pytest.mark.parametrize("tenant", TENANTS)
 @pytest.mark.parametrize("broken", ["audit", "reader", "wrong-tenant", "bad-lineage"])
 def test_server_dependency_or_evidence_failures_never_return_queue_data(
-    analyst_demo, broken: str,
+    analyst_demo, tenant: str, broken: str,
 ) -> None:
     verifier, audit, reader = analyst_demo
-    token = verifier.issue(TENANTS[0])
+    other = TENANTS[1] if tenant == TENANTS[0] else TENANTS[0]
+    token = verifier.issue(tenant)
     audit.offline = broken == "audit"
     reader.offline = broken == "reader"
     reader.invalid_snapshot = broken == "wrong-tenant"
     if broken == "bad-lineage":
-        case = reader.cases[TENANTS[0]]
-        reader.cases[TENANTS[0]] = replace(
-            case, history=(replace(case.history[0], tenant_id=TENANTS[1]),),
+        case = reader.cases[tenant]
+        reader.cases[tenant] = replace(
+            case, history=(replace(case.history[0], tenant_id=other),),
         )
-    response = TestClient(app).get(url(TENANTS[0]), headers=auth(token))
+    response = TestClient(app).get(url(tenant), headers=auth(token))
     assert response.status_code == 503
     assert "items" not in response.json()
-    assert reader.calls == ([] if broken == "audit" else [("queue", TENANTS[0])])
+    assert reader.calls == ([] if broken == "audit" else [("queue", tenant)])
     assert token not in response.text + str(audit.events)
 
 
@@ -319,6 +337,27 @@ def test_history_outage_and_unknown_case_do_not_leak_evidence(analyst_demo) -> N
     assert denied.status_code == 503
     assert "events" not in denied.json()
     assert any(e.result == "failed" for e in audit.events)
+
+
+@pytest.mark.parametrize("tenant", TENANTS)
+def test_malformed_history_is_denied_for_either_tenant(
+    analyst_demo, tenant: str,
+) -> None:
+    verifier, audit, reader = analyst_demo
+    other = TENANTS[1] if tenant == TENANTS[0] else TENANTS[0]
+    original = reader.cases[tenant]
+    reader.cases[tenant] = replace(
+        original, history=(replace(original.history[0], tenant_id=other),),
+    )
+    token = verifier.issue(tenant)
+    response = TestClient(app).get(
+        url(tenant, original.case_id), headers=auth(token),
+    )
+    assert response.status_code == 503
+    assert "events" not in response.json()
+    assert reader.calls == [("history", tenant)]
+    assert any(e.result == "failed" for e in audit.events)
+    assert token not in response.text + str(audit.events)
 
 
 def test_read_only_demo_has_no_authorized_case_mutation(analyst_demo) -> None:
