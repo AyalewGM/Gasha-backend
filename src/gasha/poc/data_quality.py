@@ -431,16 +431,16 @@ class _OwnedObservation:
 
     use_case: UseCase
     event: InboundBankEvent
-    confirmed_fraud: object
-    confirmed_at: object
-    alerted: object
+    confirmed_fraud: bool | None
+    confirmed_at: datetime | None
+    alerted: bool | None
 
 
 class _SnapshotFailure(ValueError):
     """Reason code for an input that cannot be safely detached."""
 
 
-def _owned_clock(value: object) -> object:
+def _owned_clock(value: datetime | None) -> datetime | None:
     """Normalize only built-in / zoneinfo clocks, without untrusted tz callbacks."""
     if type(value) is not datetime:
         return value
