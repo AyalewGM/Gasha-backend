@@ -1,7 +1,6 @@
 """#45 FR-32: synthetic candidate grouping; no Bank execution or case merge."""
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
-from itertools import permutations
 from random import Random
 from uuid import UUID
 
