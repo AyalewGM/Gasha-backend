@@ -1,6 +1,6 @@
 """#42 HTTP-level negative and positive tests, using only synthetic credentials."""
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -1133,3 +1133,65 @@ def test_protected_context_freshness_uses_absolute_utc_during_dst_fold(
             assert response.json()["operating_mode"] == "shadow"
             assert response.json()["effective_action"] == "no_action_shadow"
     assert store.store.outcomes("tenant-a", UUID(str(payload["event_id"]))) == ()
+
+
+def test_corrupted_verifier_expiry_fails_at_ingress_before_bad_json_parse(wired) -> None:
+    client, audit, _ = wired
+    calls: list[str] = []
+
+    class CallbackTimezone(tzinfo):
+        def utcoffset(self, dt: datetime | None) -> timedelta:
+            calls.append("utcoffset")
+            return timedelta(0)
+
+        def dst(self, dt: datetime | None) -> timedelta:
+            calls.append("dst")
+            return timedelta(0)
+
+    corrupted = identity()
+    object.__setattr__(
+        corrupted, "expires_at", datetime(2030, 1, 1, tzinfo=CallbackTimezone())
+    )
+    app.state.identity_verifier = Verifier({"unsafe-clock": corrupted})
+    response = client.post(
+        "/v1/decisions", content="{",
+        headers={**headers("unsafe-clock"), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "identity unavailable"
+    assert calls == []
+    assert any(
+        event.action == "authenticate" and event.result == "denied"
+        and event.reason == "identity_unavailable"
+        for event in audit.events
+    )
+    assert all(event.action != Capability.DECISION_SUBMIT.value for event in audit.events)
+
+
+def test_forged_datetime_class_expiry_is_redacted_before_body_parse(wired) -> None:
+    client, audit, store = wired
+    calls: list[str] = []
+
+    class ForgedDatetime:
+        @property
+        def __class__(self) -> type[datetime]:
+            calls.append("__class__")
+            return datetime
+
+    corrupted = identity()
+    object.__setattr__(corrupted, "expires_at", ForgedDatetime())
+    app.state.identity_verifier = Verifier({"forged-clock": corrupted})
+    response = client.post(
+        "/v1/decisions", content="{",
+        headers={**headers("forged-clock"), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "identity unavailable"
+    assert calls == []
+    assert any(
+        event.action == "authenticate" and event.result == "denied"
+        and event.reason == "identity_unavailable"
+        for event in audit.events
+    )
+    assert all(event.action != Capability.DECISION_SUBMIT.value for event in audit.events)
+    assert store.store.outcomes("tenant-a", uuid4()) == ()
