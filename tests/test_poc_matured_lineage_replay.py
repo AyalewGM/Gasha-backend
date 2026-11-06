@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from json import dumps
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -497,3 +498,99 @@ def test_future_label_value_is_not_embedded_in_eligible_replay_identity() -> Non
     assert check((event, lineage))["cohort_digest"] == check(
         (masked_alternative, lineage),
     )["cohort_digest"]
+
+
+class _ReplayCallbackTZ(tzinfo):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        self.calls += 1
+        return timedelta(0)
+
+    def dst(self, dt: datetime | None) -> timedelta:
+        return timedelta(0)
+
+    def tzname(self, dt: datetime | None) -> str:
+        return "untrusted"
+
+
+class _ReplayCallbackDateTime(datetime):
+    calls = 0
+
+    def utcoffset(self) -> timedelta:
+        type(self).calls += 1
+        return timedelta(0)
+
+
+def _replay_hostile_clock(kind: str) -> tuple[datetime, _ReplayCallbackTZ | None]:
+    if kind == "tzinfo":
+        zone = _ReplayCallbackTZ()
+        return datetime(2026, 1, 10, 9, tzinfo=zone), zone
+    _ReplayCallbackDateTime.calls = 0
+    return _ReplayCallbackDateTime(2026, 1, 10, 9, tzinfo=UTC), None
+
+
+def _assert_replay_clock_uninvoked(zone: _ReplayCallbackTZ | None) -> None:
+    assert (zone.calls if zone is not None else _ReplayCallbackDateTime.calls) == 0
+
+
+@pytest.mark.parametrize("kind", ["tzinfo", "datetime_subclass"])
+@pytest.mark.parametrize("field", ["window_start", "window_end", "label_cutoff"])
+def test_offline_cohort_constructor_rejects_hostile_clock_before_callback(
+    field: str, kind: str,
+) -> None:
+    hostile, zone = _replay_hostile_clock(kind)
+    with pytest.raises(HistoricalLineageRejected, match="timezone-aware cohort clock"):
+        scope(**{field: hostile})
+    _assert_replay_clock_uninvoked(zone)
+
+
+@pytest.mark.parametrize("kind", ["tzinfo", "datetime_subclass"])
+@pytest.mark.parametrize("field", ["window_start", "window_end", "label_cutoff"])
+def test_mutated_cohort_scope_fails_before_decision_or_timezone_hook(
+    kind: str, field: str,
+) -> None:
+    original = scope()
+    hostile, zone = _replay_hostile_clock(kind)
+    object.__setattr__(original, field, hostile)
+    decision_calls = 0
+
+    def decision_clock() -> datetime:
+        nonlocal decision_calls
+        decision_calls += 1
+        return AT
+
+    with pytest.raises(HistoricalLineageRejected, match="timezone-aware cohort clock"):
+        replay_offline_matured_lineage(
+            original, (), (), policy(), clock=decision_clock,
+        )
+    _assert_replay_clock_uninvoked(zone)
+    assert decision_calls == 0
+
+
+def test_valid_offset_scope_preserves_cohort_digest_and_maturity_denominators() -> None:
+    row = sample(1, confirmed_at=AT + timedelta(days=2))
+    baseline = check(row)
+    offset = timezone(timedelta(hours=-5))
+    equivalent = scope(
+        window_start=AT.astimezone(offset),
+        window_end=(AT + timedelta(minutes=5)).astimezone(offset),
+        label_cutoff=(AT + timedelta(days=10)).astimezone(offset),
+    )
+    result = replay_offline_matured_lineage(
+        equivalent, (row[0],), (row[1],), policy(),
+    ).to_dict()
+    for field in ("cohort_digest", "evaluation_digest", "maturity", "confusion_counts"):
+        assert result[field] == baseline[field]
+
+
+def test_valid_zoneinfo_dst_fold_scope_normalizes_to_distinct_utc_instants() -> None:
+    zone = ZoneInfo("America/New_York")
+    start = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=0)
+    end = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=1)
+    cutoff = datetime(2026, 11, 1, 2, 30, tzinfo=zone)
+    checked = scope(window_start=start, window_end=end, label_cutoff=cutoff)
+    assert checked.window_start < checked.window_end < checked.label_cutoff
+    assert checked.window_start.tzinfo is UTC
+    assert checked.window_end.tzinfo is UTC

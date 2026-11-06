@@ -11,10 +11,11 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from hashlib import sha256
 from json import dumps
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from gasha.domain.models import DecisionPolicy
 from gasha.poc.historical import (
@@ -37,7 +38,11 @@ COHORT_DIGEST_VERSION = "synthetic-matured-lineage-cohort-input-v2"
 
 
 def _utc(value: datetime) -> datetime:
-    if not isinstance(value, datetime) or value.utcoffset() is None:
+    # Reject caller-defined clock callbacks before invoking any datetime or
+    # timezone methods; this is synthetic validation, not Bank time attestation.
+    if type(value) is not datetime or type(value.tzinfo) not in (timezone, ZoneInfo):
+        raise HistoricalLineageRejected("timezone-aware cohort clock required")
+    if value.utcoffset() is None:
         raise HistoricalLineageRejected("timezone-aware cohort clock required")
     return value.astimezone(UTC)
 
