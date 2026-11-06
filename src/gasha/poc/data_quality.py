@@ -15,6 +15,7 @@ from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from math import isfinite
 from types import MappingProxyType
+from typing import cast
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -486,11 +487,14 @@ def _owned_value(value: object, *, depth: int = 0, remaining: list[int]) -> obje
             for key, item in value.items()
         }
     if type(value) in (list, tuple):
-        if len(value) > 1024:
+        # The preceding exact-class gate makes this cast safe; unlike an
+        # isinstance check, it never probes a forged __class__ descriptor.
+        items = cast(list[object] | tuple[object, ...], value)
+        if len(items) > 1024:
             raise _SnapshotFailure("invalid.snapshot")
         copied = (
             _owned_value(item, depth=depth + 1, remaining=remaining)
-            for item in value
+            for item in items
         )
         return tuple(copied) if type(value) is tuple else list(copied)
     # ABC checks on the actual class cannot execute an instance's forged
