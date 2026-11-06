@@ -46,7 +46,7 @@ def _trusted_utc(value: object) -> datetime | None:
     datetime subclasses and arbitrary tzinfo implementations are rejected.
     This checks clock shape, not a Bank verifier's trustworthiness.
     """
-    if not isinstance(value, datetime) or type(value) is not datetime:
+    if type(value) is not datetime:
         return None
     if type(value.tzinfo) not in (timezone, ZoneInfo):
         return None

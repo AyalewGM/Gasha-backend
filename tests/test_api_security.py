@@ -1166,3 +1166,32 @@ def test_corrupted_verifier_expiry_fails_at_ingress_before_bad_json_parse(wired)
         for event in audit.events
     )
     assert all(event.action != Capability.DECISION_SUBMIT.value for event in audit.events)
+
+
+def test_forged_datetime_class_expiry_is_redacted_before_body_parse(wired) -> None:
+    client, audit, store = wired
+    calls: list[str] = []
+
+    class ForgedDatetime:
+        @property
+        def __class__(self) -> type[datetime]:
+            calls.append("__class__")
+            return datetime
+
+    corrupted = identity()
+    object.__setattr__(corrupted, "expires_at", ForgedDatetime())
+    app.state.identity_verifier = Verifier({"forged-clock": corrupted})
+    response = client.post(
+        "/v1/decisions", content="{",
+        headers={**headers("forged-clock"), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "identity unavailable"
+    assert calls == []
+    assert any(
+        event.action == "authenticate" and event.result == "denied"
+        and event.reason == "identity_unavailable"
+        for event in audit.events
+    )
+    assert all(event.action != Capability.DECISION_SUBMIT.value for event in audit.events)
+    assert store.store.outcomes("tenant-a", uuid4()) == ()

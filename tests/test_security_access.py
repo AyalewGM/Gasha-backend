@@ -200,3 +200,45 @@ def test_authenticate_revalidates_mutated_principal_expiry_before_callback(
     with pytest.raises(IdentityUnavailable, match="invalid verifier"):
         authenticate("Bearer synthetic", Verifier(trusted), now=NOW)
     assert calls == []
+
+
+class _ForgedDatetimeClass:
+    """Non-datetime object that executes a getter when isinstance checks __class__."""
+
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+
+    @property
+    def __class__(self) -> type[datetime]:
+        self.calls.append("__class__")
+        return datetime
+
+
+def test_principal_constructor_rejects_forged_datetime_class_without_getter() -> None:
+    calls: list[str] = []
+    forged = _ForgedDatetimeClass(calls)
+    with pytest.raises(ValueError, match="credential expiry"):
+        principal(expires_at=forged)
+    assert calls == []
+
+
+def test_authenticate_rejects_forged_now_before_verifier_or_getter() -> None:
+    calls: list[str] = []
+    forged = _ForgedDatetimeClass(calls)
+
+    class UnexpectedVerifier:
+        def verify(self, bearer: str) -> TrustedPrincipal:
+            pytest.fail("unsafe clock must be denied before verifier invocation")
+
+    with pytest.raises(IdentityUnavailable, match="trusted UTC clock"):
+        authenticate("Bearer synthetic", UnexpectedVerifier(), now=forged)  # type: ignore[arg-type]
+    assert calls == []
+
+
+def test_authenticate_rejects_forged_mutated_expiry_without_getter() -> None:
+    calls: list[str] = []
+    trusted = principal()
+    object.__setattr__(trusted, "expires_at", _ForgedDatetimeClass(calls))
+    with pytest.raises(IdentityUnavailable, match="invalid verifier expiry"):
+        authenticate("Bearer synthetic", Verifier(trusted), now=NOW)
+    assert calls == []
