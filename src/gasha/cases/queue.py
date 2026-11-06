@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from gasha.cases.timeline import CaseEvent, CaseOperation, validate_case_history
 
@@ -65,6 +66,7 @@ def project_case_queue(
         or type(limit) is not int
         or not 1 <= limit <= 100
         or type(at) is not datetime
+        or type(at.tzinfo) not in (timezone, ZoneInfo)
         or at.utcoffset() is None
     ):
         raise CaseQueueRejected("typed tenant-scoped queue request required")
@@ -74,6 +76,8 @@ def project_case_queue(
         or type(snapshot.ranking_policy_version) is not str
         or _VERSION.fullmatch(snapshot.ranking_policy_version) is None
         or type(snapshot.generated_at) is not datetime
+        # A reader-owned timezone callback must not execute before validation.
+        or type(snapshot.generated_at.tzinfo) not in (timezone, ZoneInfo)
         or snapshot.generated_at.utcoffset() is None
         or snapshot.generated_at.astimezone(UTC) > at.astimezone(UTC)
         or type(snapshot.items) is not tuple
