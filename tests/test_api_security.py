@@ -1195,3 +1195,100 @@ def test_forged_datetime_class_expiry_is_redacted_before_body_parse(wired) -> No
     )
     assert all(event.action != Capability.DECISION_SUBMIT.value for event in audit.events)
     assert store.store.outcomes("tenant-a", uuid4()) == ()
+
+
+def _hostile_context_clock(kind: str, calls: list[str]) -> object:
+    """Synthetic in-process provider clocks, never Bank credentials or data."""
+    class ForgedDatetime:
+        @property
+        def __class__(self) -> type[datetime]:
+            calls.append("__class__")
+            return datetime
+
+    class CallbackTimezone(tzinfo):
+        def utcoffset(self, dt: datetime | None) -> timedelta:
+            calls.append("utcoffset")
+            return timedelta(0)
+
+        def dst(self, dt: datetime | None) -> timedelta:
+            calls.append("dst")
+            return timedelta(0)
+
+    class CallbackDatetime(datetime):
+        def utcoffset(self) -> timedelta:
+            calls.append("utcoffset")
+            return timedelta(0)
+
+    if kind == "forged_class":
+        return ForgedDatetime()
+    if kind == "callback_tzinfo":
+        return datetime(2030, 1, 1, tzinfo=CallbackTimezone())
+    if kind == "datetime_subclass":
+        return CallbackDatetime(2030, 1, 1, tzinfo=UTC)
+    raise AssertionError("unexpected clock test variant")
+
+
+@pytest.mark.parametrize("field", ["collected_at", "expires_at"])
+@pytest.mark.parametrize("kind", ["forged_class", "callback_tzinfo", "datetime_subclass"])
+def test_context_creation_rejects_callback_clocks_before_execution(
+    field: str, kind: str,
+) -> None:
+    calls: list[str] = []
+    clock = _hostile_context_clock(kind, calls)
+    collected_at: object = NOW - timedelta(minutes=2)
+    expires_at: object = NOW + timedelta(minutes=30)
+    if field == "collected_at":
+        collected_at = clock
+    else:
+        expires_at = clock
+    with pytest.raises(ValueError, match="trusted event-bound decision provenance"):
+        _dst_decision_context(collected_at, expires_at)  # type: ignore[arg-type]
+    assert calls == []
+
+
+@pytest.mark.parametrize("field", ["collected_at", "expires_at"])
+@pytest.mark.parametrize("kind", ["forged_class", "callback_tzinfo", "datetime_subclass"])
+def test_context_reference_revalidates_corrupted_provider_clocks(
+    field: str, kind: str,
+) -> None:
+    calls: list[str] = []
+    context = _dst_decision_context(NOW - timedelta(minutes=1), NOW + timedelta(minutes=30))
+    object.__setattr__(context, field, _hostile_context_clock(kind, calls))
+    with pytest.raises(ValueError, match="invalid decision context validity window"):
+        _ = context.context_ref
+    assert calls == []
+
+
+@pytest.mark.parametrize("path", ["/v1/decisions", "/v1/evaluations"])
+@pytest.mark.parametrize("root_path", ["", "/bank"])
+@pytest.mark.parametrize("field", ["collected_at", "expires_at"])
+@pytest.mark.parametrize("kind", ["forged_class", "callback_tzinfo", "datetime_subclass"])
+def test_protected_context_rejects_corrupted_clocks_with_redacted_audit(
+    wired, path: str, root_path: str, field: str, kind: str,
+) -> None:
+    _, audit, store = wired
+    calls: list[str] = []
+
+    class MalformedContextProvider:
+        def resolve(self, transaction, principal):
+            context = ContextProvider().resolve(transaction, principal)
+            object.__setattr__(context, field, _hostile_context_clock(kind, calls))
+            return context
+
+    app.state.decision_context_provider = MalformedContextProvider()
+    payload = tx()
+    response = TestClient(app, root_path=root_path).post(
+        f"{root_path}{path}", json={"transaction": payload}, headers=headers(),
+    )
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "decision unavailable" if path.endswith("decisions")
+        else "evaluation unavailable"
+    }
+    assert "X-Gasha-Context-Ref" not in response.headers
+    assert calls == []
+    actions = [e for e in audit.events if e.action == Capability.DECISION_SUBMIT.value]
+    assert [e.result for e in actions] == ["authorized", "failed"]
+    assert actions[0].attempt_ref == actions[1].attempt_ref
+    assert actions[0].event_ref == actions[1].event_ref
+    assert store.store.outcomes("tenant-a", UUID(str(payload["event_id"]))) == ()
