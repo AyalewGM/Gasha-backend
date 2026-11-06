@@ -1316,3 +1316,127 @@ def test_datetime_subclass_clock_is_quarantined_before_callbacks(
             "synthetic-beneficiary-secret", "synthetic-correlation-secret",
         ):
             assert secret not in serialized
+
+
+@pytest.mark.parametrize("clock_kind", ["custom_timezone", "datetime_subclass"])
+@pytest.mark.parametrize("field", ["window_start", "window_end", "label_cutoff"])
+def test_scope_clock_rejects_callbacks_before_constructor_validation(
+    field: str, clock_kind: str,
+) -> None:
+    """No untrusted clock callback may execute while binding synthetic scope."""
+    calls: list[str] = []
+
+    class CallbackTimezone(tzinfo):
+        def utcoffset(self, dt: datetime | None) -> timedelta:
+            calls.append("timezone")
+            return timedelta(0)
+
+        def dst(self, dt: datetime | None) -> timedelta:
+            return timedelta(0)
+
+        def tzname(self, dt: datetime | None) -> str:
+            return "callback"
+
+    class CallbackDateTime(datetime):
+        def utcoffset(self) -> timedelta | None:
+            calls.append("datetime_subclass")
+            return timedelta(0)
+
+    hostile: datetime = (
+        datetime(2026, 1, 1, 12, tzinfo=CallbackTimezone())
+        if clock_kind == "custom_timezone"
+        else CallbackDateTime(2026, 1, 1, 12, tzinfo=UTC)
+    )
+    with pytest.raises(ValueError):
+        scope(**{field: hostile})
+    assert calls == []
+
+
+@pytest.mark.parametrize("clock_kind", ["custom_timezone", "datetime_subclass"])
+def test_label_clock_rejects_callbacks_before_observation_validation(clock_kind: str) -> None:
+    """A malicious synthetic label clock cannot run during record construction."""
+    calls: list[str] = []
+
+    class CallbackTimezone(tzinfo):
+        def utcoffset(self, dt: datetime | None) -> timedelta:
+            calls.append("timezone")
+            return timedelta(0)
+
+        def dst(self, dt: datetime | None) -> timedelta:
+            return timedelta(0)
+
+        def tzname(self, dt: datetime | None) -> str:
+            return "callback"
+
+    class CallbackDateTime(datetime):
+        def utcoffset(self) -> timedelta | None:
+            calls.append("datetime_subclass")
+            return timedelta(0)
+
+    hostile: datetime = (
+        datetime(2026, 1, 2, 12, tzinfo=CallbackTimezone())
+        if clock_kind == "custom_timezone"
+        else CallbackDateTime(2026, 1, 2, 12, tzinfo=UTC)
+    )
+    with pytest.raises(ValueError):
+        QualityObservation(
+            use_case=UseCase.UC01, event=candidate().event,
+            confirmed_fraud=True, confirmed_at=hostile,
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("clock_kind", ["custom_timezone", "datetime_subclass"])
+def test_report_rejects_mutated_scope_clock_without_callback(clock_kind: str) -> None:
+    """A tampered frozen scope cannot execute clock hooks during report export."""
+    calls: list[str] = []
+
+    class CallbackTimezone(tzinfo):
+        def utcoffset(self, dt: datetime | None) -> timedelta:
+            calls.append("timezone")
+            return timedelta(0)
+
+        def dst(self, dt: datetime | None) -> timedelta:
+            return timedelta(0)
+
+        def tzname(self, dt: datetime | None) -> str:
+            return "callback"
+
+    class CallbackDateTime(datetime):
+        def utcoffset(self) -> timedelta | None:
+            calls.append("datetime_subclass")
+            return timedelta(0)
+
+    hostile: datetime = (
+        datetime(2026, 1, 1, 12, tzinfo=CallbackTimezone())
+        if clock_kind == "custom_timezone"
+        else CallbackDateTime(2026, 1, 1, 12, tzinfo=UTC)
+    )
+    report = inspect_reference_quality(scope(), (candidate(),))
+    object.__setattr__(report.scope, "window_start", hostile)
+    with pytest.raises(ValueError, match="scope integrity"):
+        report.to_dict()
+    assert calls == []
+
+
+def test_scope_and_label_clocks_keep_builtin_timezone_and_dst_support() -> None:
+    """Built-in fixed offsets and ZoneInfo still normalize as instants."""
+    fixed = timezone(timedelta(hours=3))
+    start = datetime(2026, 1, 1, 14, tzinfo=fixed)
+    end = datetime(2026, 1, 1, 17, tzinfo=fixed)
+    cutoff = datetime(2026, 1, 2, 15, tzinfo=fixed)
+    s = scope(window_start=start, window_end=end, label_cutoff=cutoff)
+    assert s.window_start == start
+    labelled = QualityObservation(
+        use_case=UseCase.UC01, event=candidate("builtin-timezone").event,
+        confirmed_fraud=False, confirmed_at=datetime(2026, 1, 2, 12, tzinfo=UTC),
+    )
+    report = inspect_reference_quality(s, (labelled,)).to_dict()
+    assert report["use_cases"][0]["accepted"] == 1
+    assert report["use_cases"][0]["labels"]["negative"] == 1
+    zone = ZoneInfo("America/New_York")
+    dst_start = datetime(2026, 11, 1, 1, tzinfo=zone, fold=0)
+    dst_end = datetime(2026, 11, 1, 1, tzinfo=zone, fold=1)
+    dst_scope = scope(window_start=dst_start, window_end=dst_end,
+                      label_cutoff=dst_end + timedelta(days=1))
+    assert dst_scope.window_start.utcoffset() != dst_scope.window_end.utcoffset()
