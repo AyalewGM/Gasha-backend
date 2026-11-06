@@ -39,7 +39,8 @@ class LifecycleRejected(ValueError):
 
 def _safe_utc(value: object, *, reason: str) -> datetime:
     """Normalize only built-in clock values; never execute caller timezone hooks."""
-    if not isinstance(value, datetime) or type(value) is not datetime:
+    # Reject before isinstance(): a forged __class__ property can execute code.
+    if type(value) is not datetime:
         raise LifecycleRejected(reason)
     if type(value.tzinfo) not in (timezone, ZoneInfo):
         raise LifecycleRejected(reason)

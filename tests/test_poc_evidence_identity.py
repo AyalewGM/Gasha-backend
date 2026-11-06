@@ -485,3 +485,38 @@ def test_evidence_runtime_clock_substitution_fails_before_hooks(
         original.packet_digest()
     assert zone.calls == 0
     assert _HookDateTime.calls == 0
+
+
+class _PretendDateTime:
+    """Non-datetime object whose __class__ getter has observable side effects."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    @property
+    def __class__(self) -> type[datetime]:
+        self.calls += 1
+        return datetime
+
+
+@pytest.mark.parametrize("surface", [
+    "window_start", "window_end", "collected_at", "expires_at", "now",
+    "mutated_binding", "mutated_record",
+])
+def test_evidence_forged_class_clock_rejected_before_callback(surface: str) -> None:
+    hostile: Any = _PretendDateTime()
+    with pytest.raises(EvidenceIdentityRejected, match="timezone-aware"):
+        if surface in ("window_start", "window_end"):
+            replace(binding(), **{surface: hostile})
+        elif surface in ("collected_at", "expires_at"):
+            replace(record(), **{surface: hostile})
+        elif surface == "now":
+            assert_packet_current(packet(), expected=binding(), now=hostile)
+        else:
+            original = packet()
+            if surface == "mutated_binding":
+                object.__setattr__(original.binding, "window_end", hostile)
+            else:
+                object.__setattr__(original.records[0], "collected_at", hostile)
+            original.packet_digest()
+    assert hostile.calls == 0
