@@ -783,3 +783,55 @@ def test_evidence_lifecycle_rejects_clock_hooks_without_side_effects(
     assert _ProposalHookDateTime.calls == 0
     assert reader.calls == 0
     assert lifecycle.events == before
+
+
+class _PretendProposalDateTime:
+    """An isinstance(datetime) callback trap; not a valid clock."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    @property
+    def __class__(self) -> type[datetime]:
+        self.calls += 1
+        return datetime
+
+
+@pytest.mark.parametrize("surface", [
+    "new_event", "replayed_event", "proposal_now", "mutated_principal_expiry",
+])
+def test_proposal_forged_class_clock_rejected_without_reader(
+    surface: str,
+) -> None:
+    lifecycle = submitted()
+    reader = ArtifactReader()
+    before = lifecycle.events
+    hostile: Any = _PretendProposalDateTime()
+    with pytest.raises(LifecycleRejected, match="timezone-aware|principal"):
+        if surface == "new_event":
+            EvidenceTransition(
+                EvidenceAction.VERIFY, VERIFIER.audit_actor, hostile,
+                lifecycle.packet.packet_digest(), UUID(int=1),
+            )
+        elif surface == "replayed_event":
+            event = EvidenceTransition(
+                EvidenceAction.VERIFY, VERIFIER.audit_actor, NOW,
+                lifecycle.packet.packet_digest(), UUID(int=1),
+            )
+            object.__setattr__(event, "at", hostile)
+            EvidenceLifecycle(lifecycle.packet, lifecycle.events + (event,))
+        elif surface == "mutated_principal_expiry":
+            principal = actor("verifier-clock-class", Capability.EVIDENCE_VERIFY)
+            object.__setattr__(principal, "expires_at", hostile)
+            apply(
+                lifecycle, EvidenceAction.VERIFY, principal,
+                UUID(int=1), reader=reader,
+            )
+        else:
+            apply(
+                lifecycle, EvidenceAction.VERIFY, VERIFIER,
+                UUID(int=1), now=hostile, reader=reader,
+            )
+    assert hostile.calls == 0
+    assert reader.calls == 0
+    assert lifecycle.events == before
