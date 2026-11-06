@@ -49,7 +49,12 @@ _OPTIONAL_SIGNALS: dict[UseCase, tuple[str, ...]] = {
 
 
 def _utc(value: datetime) -> datetime:
-    if not isinstance(value, datetime) or value.utcoffset() is None:
+    # Do not invoke caller-defined datetime/tzinfo methods while validating
+    # synthetic dataset scope, label clocks or retained report identity.
+    # Those callbacks can mutate evidence before the fail-closed checks run.
+    if type(value) is not datetime or type(value.tzinfo) not in (timezone, ZoneInfo):
+        raise ValueError("timestamp must be timezone aware with a trusted clock")
+    if value.utcoffset() is None:
         raise ValueError("timestamp must be timezone aware")
     return value.astimezone(UTC)
 
