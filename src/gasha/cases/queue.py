@@ -23,6 +23,17 @@ _SCENARIOS = frozenset({
 _ACTIVE = frozenset({CaseOperation.CREATE, CaseOperation.TRIAGE, CaseOperation.ASSIGN})
 
 
+def valid_scenario_ids(scenario_ids: tuple[str, ...]) -> bool:
+    """Validate concrete, deterministic, source-declared scenario vocabulary."""
+    return (
+        type(scenario_ids) is tuple
+        and bool(scenario_ids)
+        and all(type(scenario) is str and scenario in _SCENARIOS
+                for scenario in scenario_ids)
+        and scenario_ids == tuple(sorted(set(scenario_ids)))
+    )
+
+
 class CaseQueueRejected(ValueError):
     """Queue is not a complete, tenant-safe, canonical read projection."""
 
@@ -96,11 +107,7 @@ def project_case_queue(
             or type(item.source_event_id) is not UUID
             or type(item.source_context_ref) is not str
             or _DIGEST.fullmatch(item.source_context_ref) is None
-            or type(item.scenario_ids) is not tuple
-            or not item.scenario_ids
-            or any(type(scenario) is not str or scenario not in _SCENARIOS
-                   for scenario in item.scenario_ids)
-            or item.scenario_ids != tuple(sorted(set(item.scenario_ids)))
+            or not valid_scenario_ids(item.scenario_ids)
             or type(item.history) is not tuple
             or not item.history
             or item.case_id in seen_cases
