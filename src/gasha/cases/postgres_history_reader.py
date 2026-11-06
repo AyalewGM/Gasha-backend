@@ -26,6 +26,43 @@ from gasha.security.access import (
 )
 
 
+def authorized_case_read(
+    *, principal: TrustedPrincipal, tenant_id: str, at: datetime,
+) -> TrustedPrincipal:
+    """Common pre-DB / pre-ranking #42 authorization used by both #45 readers.
+
+    This checks trusted concrete clocks before invoking timezone code and
+    copies the principal to prevent in-process ranking adapter mutation.
+    """
+    if type(principal) is not TrustedPrincipal:
+        raise AuthorizationRejected("trusted principal required")
+    if (
+        type(tenant_id) is not str
+        or not tenant_id
+        or tenant_id != tenant_id.strip()
+        or type(at) is not datetime
+        or type(at.tzinfo) not in (timezone, ZoneInfo)
+        or at.utcoffset() is None
+    ):
+        raise CaseRejected("typed tenant-scoped history selector required")
+    # Frozen principal fields can be corrupted by an in-process adapter.
+    # Check their concrete clocks before reconstructing/using them.
+    if (
+        type(principal.expires_at) is not datetime
+        or type(principal.expires_at.tzinfo) not in (timezone, ZoneInfo)
+    ):
+        raise AuthorizationRejected("invalid principal expiry")
+    try:
+        accepted = replace(principal)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise AuthorizationRejected("invalid principal") from exc
+    if accepted.expires_at.astimezone(UTC) <= at.astimezone(UTC):
+        raise AuthorizationRejected("expired principal")
+    authorize(accepted, tenant_id=tenant_id, capability=Capability.CASE_READ)
+
+    return accepted
+
+
 class ExplicitPostgresCaseHistoryReader:
     """Request-scoped read bridge; never installs a Bank/session/queue source.
 
@@ -44,32 +81,11 @@ class ExplicitPostgresCaseHistoryReader:
         self, *, principal: TrustedPrincipal, tenant_id: str,
         case_id: UUID, at: datetime,
     ) -> tuple[CaseEvent, ...]:
-        if type(principal) is not TrustedPrincipal:
-            raise AuthorizationRejected("trusted principal required")
-        if (
-            type(tenant_id) is not str
-            or not tenant_id
-            or tenant_id != tenant_id.strip()
-            or type(case_id) is not UUID
-            or type(at) is not datetime
-            or type(at.tzinfo) not in (timezone, ZoneInfo)
-            or at.utcoffset() is None
-        ):
-            raise CaseRejected("typed tenant-scoped history selector required")
-        # Frozen principal fields can be corrupted by an in-process adapter.
-        # Check their concrete clocks before reconstructing/using them.
-        if (
-            type(principal.expires_at) is not datetime
-            or type(principal.expires_at.tzinfo) not in (timezone, ZoneInfo)
-        ):
-            raise AuthorizationRejected("invalid principal expiry")
-        try:
-            accepted = replace(principal)
-        except (ValueError, TypeError, AttributeError) as exc:
-            raise AuthorizationRejected("invalid principal") from exc
-        if accepted.expires_at.astimezone(UTC) <= at.astimezone(UTC):
-            raise AuthorizationRejected("expired principal")
-        authorize(accepted, tenant_id=tenant_id, capability=Capability.CASE_READ)
+        if type(case_id) is not UUID:
+            raise CaseRejected("typed case ID required")
+        accepted = authorized_case_read(
+            principal=principal, tenant_id=tenant_id, at=at,
+        )
 
         # Open only after all authorization checks, use an exclusive
         # transaction/connection for this read, and always release it.
