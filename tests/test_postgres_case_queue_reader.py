@@ -359,18 +359,19 @@ def test_empty_queue_and_limits_have_no_database_side_effects() -> None:
 
 def test_invalid_scenario_references_fail_before_database() -> None:
     variants = (("APP-99",), ("APP-01", "APP-01"), ("MM-01", "APP-01"), ())
+    opens: list[str] = []
+
+    def forbidden_connection():
+        opens.append("unexpected database")
+        raise AssertionError("invalid rank reached database")
+
     for scenarios in variants:
+        opens.clear()
         ref = reference()
         bad = RankedCaseReference(
             ref.case_id, ref.source_event_id, CONTEXT, scenarios,
         )
         ranking = Ranking({TENANTS[0]: selection(TENANTS[0], bad)})
-        opens: list[str] = []
-
-        def forbidden_connection():
-            opens.append("unexpected database")
-            raise AssertionError("invalid rank reached database")
-
         reader = ExplicitPostgresCaseQueueReader(
             connections=forbidden_connection, ranking=ranking,
         )
