@@ -267,27 +267,27 @@ def case_command_fingerprints(
 
 
 def _check_command(command: CaseCommand) -> None:
-    if not isinstance(command, CaseCommand):
+    if type(command) is not CaseCommand:
         raise CaseRejected("typed case command required")
-    if (not isinstance(command.tenant_id, str) or not command.tenant_id.strip()
+    if (type(command.tenant_id) is not str or not command.tenant_id.strip()
             or command.tenant_id != command.tenant_id.strip()
-            or not isinstance(command.case_id, UUID)
-            or not isinstance(command.source_event_id, UUID)
-            or not isinstance(command.operation, CaseOperation)
+            or type(command.case_id) is not UUID
+            or type(command.source_event_id) is not UUID
+            or type(command.operation) is not CaseOperation
             or type(command.expected_revision) is not int
             or command.expected_revision < 0
-            or not isinstance(command.idempotency_key, str)
+            or type(command.idempotency_key) is not str
             or fullmatch(r"[0-9a-f]{32}", command.idempotency_key) is None
-            or not isinstance(command.reason_code, CaseReason)
+            or type(command.reason_code) is not CaseReason
             or command.reason_code not in _REASONS[command.operation]):
         raise CaseRejected("invalid case command")
     if command.operation in {CaseOperation.DISPOSE, CaseOperation.CORRECT}:
-        if not isinstance(command.disposition, CaseDisposition):
+        if type(command.disposition) is not CaseDisposition:
             raise CaseRejected("typed disposition required")
     elif command.disposition is not None:
         raise CaseRejected("disposition allowed only for disposition/correction")
     if command.operation is CaseOperation.DISPOSE:
-        if not isinstance(command.disposition, CaseDisposition):
+        if type(command.disposition) is not CaseDisposition:
             raise CaseRejected("typed disposition required")
         required_reason = {
             CaseDisposition.FRAUD: CaseReason.FRAUD_EVIDENCE,
@@ -297,9 +297,9 @@ def _check_command(command: CaseCommand) -> None:
         if command.reason_code is not required_reason[command.disposition]:
             raise CaseRejected("disposition/reason mismatch")
     if command.operation is CaseOperation.ASSIGN:
-        if (not isinstance(command.assignee, AuthorizedAssignee)
+        if (type(command.assignee) is not AuthorizedAssignee
                 or command.assignee.tenant_id != command.tenant_id
-                or not isinstance(command.assignee.actor_ref, str)
+                or type(command.assignee.actor_ref) is not str
                 or fullmatch(r"[0-9a-f]{64}", command.assignee.actor_ref) is None):
             raise CaseRejected("server-resolved tenant assignee required")
     elif command.assignee is not None:
@@ -317,7 +317,7 @@ def advance_case(
     (or use a separately reviewed outbox). Never trust a client-supplied history.
     """
     _check_command(command)
-    if not isinstance(principal, TrustedPrincipal):
+    if type(principal) is not TrustedPrincipal:
         raise CaseRejected("trusted authenticated principal required")
     # Authorization precedes even a duplicate replay: revoked scope cannot re-read.
     authorize(principal, tenant_id=command.tenant_id,
@@ -330,18 +330,29 @@ def advance_case(
         raise CaseRejected("trusted timezone-aware time required")
     # A typed principal can be stale when a verifier result is reused. Check the
     # absolute instant; equal-zone DST folds cannot be compared by wall clock.
-    if principal.expires_at.astimezone(UTC) <= at.astimezone(UTC):
+    # A frozen verifier result can be corrupted by an in-process adapter after
+    # construction. Validate the actual clock type before timezone callbacks.
+    expiry = principal.expires_at
+    if (
+        type(expiry) is not datetime
+        or type(expiry.tzinfo) not in (timezone, ZoneInfo)
+        or expiry.utcoffset() is None
+    ):
+        raise AuthorizationRejected("invalid principal expiry")
+    if expiry.astimezone(UTC) <= at.astimezone(UTC):
         raise AuthorizationRejected("expired principal")
-    if not isinstance(history, tuple) or any(not isinstance(e, CaseEvent) for e in history):
+    if type(history) is not tuple or any(type(e) is not CaseEvent for e in history):
         raise CaseRejected("trusted immutable history required")
     try:
         resolved = source.resolve(command.tenant_id, command.source_event_id)
     except Exception as exc:
         raise CaseSourceUnavailable("trusted evaluation lookup unavailable") from exc
-    if (not isinstance(resolved, VerifiedEvaluation)
+    if (type(resolved) is not VerifiedEvaluation
+            or type(resolved.tenant_id) is not str
             or resolved.tenant_id != command.tenant_id
+            or type(resolved.event_id) is not UUID
             or resolved.event_id != command.source_event_id
-            or not isinstance(resolved.context_ref, str)
+            or type(resolved.context_ref) is not str
             or fullmatch(r"[0-9a-f]{64}", resolved.context_ref) is None):
         raise CaseSourceUnavailable("tenant-bound evaluation unavailable")
 
