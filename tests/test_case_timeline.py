@@ -12,6 +12,7 @@ from gasha.cases.timeline import (
     CaseCommand,
     CaseConflict,
     CaseDisposition,
+    CaseEvent,
     CaseOperation,
     CaseReason,
     CaseRejected,
