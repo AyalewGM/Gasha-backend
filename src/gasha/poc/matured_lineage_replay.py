@@ -187,6 +187,17 @@ class OfflineLineageReplayResult:
                 metrics.false_positives,
                 metrics.false_positives + metrics.true_negatives, "no_labeled_negatives",
             ),
+            # F1 and FNR consume only matured, labelled confusion populations.
+            # No positives / alerts is undefined, never a fabricated perfect score.
+            "f1": _rate(
+                2 * metrics.true_positives,
+                2 * metrics.true_positives + metrics.false_positives + metrics.false_negatives,
+                "no_positive_labels_or_alerts",
+            ),
+            "false_negative_rate": _rate(
+                metrics.false_negatives,
+                metrics.true_positives + metrics.false_negatives, "no_labeled_positives",
+            ),
             "bank_data_verified": False,
             "bank_kpi_approved": False,
             "readiness_authorized": False,
