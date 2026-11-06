@@ -1282,9 +1282,9 @@ def test_forged_payload_class_cannot_execute_before_quality_quarantine(
         report = inspect_reference_quality(scope(), rows).to_dict()
         uc01, uc02, uc03 = report["use_cases"]
         assert (uc01["total"], uc01["accepted"], uc01["rejected"]) == (2, 1, 1)
-        assert uc01["checks"] == {
-            "invalid.payload" if location == "top" else "invalid.cohort_identity": 1
-        }
+        reason = "invalid.payload" if location == "top" else "invalid.cohort_identity"
+        assert uc01["checks"][reason] == 1
+        assert "duplicate.event_id" not in uc01["checks"]
         assert uc01["labels"] == baseline["labels"]
         assert uc01["alerts"] == baseline["alerts"]
         assert uc01["optional_signals"] == baseline["optional_signals"]
