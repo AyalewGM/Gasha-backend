@@ -67,16 +67,16 @@ class TrustedPrincipal:
     expires_at: datetime
 
     def __post_init__(self) -> None:
-        if not all(isinstance(value, str) and value.strip() for value in (
+        if not all(type(value) is str and value.strip() for value in (
             self.subject, self.issuer, self.credential_ref,
         )):
             raise ValueError("principal provenance is required")
-        if not isinstance(self.tenant_ids, frozenset) or not self.tenant_ids or any(
-            not isinstance(tenant, str) or not tenant.strip() for tenant in self.tenant_ids
+        if type(self.tenant_ids) is not frozenset or not self.tenant_ids or any(
+            type(tenant) is not str or not tenant.strip() for tenant in self.tenant_ids
         ):
             raise ValueError("nonempty trusted tenant scope is required")
-        if not isinstance(self.capabilities, frozenset) or any(
-            not isinstance(capability, Capability) for capability in self.capabilities
+        if type(self.capabilities) is not frozenset or any(
+            type(capability) is not Capability for capability in self.capabilities
         ):
             raise ValueError("typed immutable capabilities are required")
         if _trusted_utc(self.expires_at) is None:
@@ -183,13 +183,30 @@ def authorize(
     principal: TrustedPrincipal, *, tenant_id: str, capability: Capability
 ) -> None:
     """Default deny; tenant mismatch is not evidence of tenant existence."""
-    if not isinstance(tenant_id, str) or not tenant_id.strip():
+    if type(principal) is not TrustedPrincipal:
+        raise AuthorizationRejected("trusted principal required")
+    if type(tenant_id) is not str or not tenant_id.strip():
         raise AuthorizationRejected("invalid tenant scope")
-    if not isinstance(capability, Capability):
+    if type(capability) is not Capability:
         raise AuthorizationRejected("invalid capability")
-    if tenant_id not in principal.tenant_ids:
+    # A provider adapter can return subclassed containers or an in-process
+    # component can corrupt a frozen record after construction. Reject these
+    # *before* calling callback-capable __contains__/__eq__ during RBAC.
+    try:
+        scopes = principal.tenant_ids
+        capabilities = principal.capabilities
+    except AttributeError as exc:
+        raise AuthorizationRejected("invalid principal scope") from exc
+    if (
+        type(scopes) is not frozenset or not scopes
+        or any(type(item) is not str or not item.strip() for item in scopes)
+        or type(capabilities) is not frozenset
+        or any(type(item) is not Capability for item in capabilities)
+    ):
+        raise AuthorizationRejected("invalid principal scope")
+    if tenant_id not in scopes:
         raise AuthorizationRejected("tenant scope denied")
-    if capability not in principal.capabilities:
+    if capability not in capabilities:
         raise AuthorizationRejected("capability denied")
 
 
