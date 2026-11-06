@@ -11,12 +11,15 @@ import re
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timezone
+from datetime import datetime, timezone
 from typing import Protocol
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from gasha.cases.postgres_timeline import PostgresCaseTimelineService
+from gasha.cases.postgres_history_reader import (
+    ExplicitPostgresCaseHistoryReader,
+    authorized_case_read,
+)
 from gasha.cases.queue import (
     CaseQueueRejected,
     CaseQueueSnapshot,
@@ -24,12 +27,7 @@ from gasha.cases.queue import (
     project_case_queue,
 )
 from gasha.postgres import Connection
-from gasha.security.access import (
-    AuthorizationRejected,
-    Capability,
-    TrustedPrincipal,
-    authorize,
-)
+from gasha.security.access import TrustedPrincipal
 
 _VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
 
@@ -73,36 +71,23 @@ class ExplicitPostgresCaseQueueReader:
         self, *, connections: Callable[[], AbstractContextManager[Connection]],
         ranking: TrustedRankingSource,
     ) -> None:
-        self._connections = connections
+        self._history_reader = ExplicitPostgresCaseHistoryReader(connections=connections)
         self._ranking = ranking
 
     def read(
         self, *, principal: TrustedPrincipal, tenant_id: str,
         limit: int, at: datetime,
     ) -> CaseQueueSnapshot:
-        if type(principal) is not TrustedPrincipal:
-            raise AuthorizationRejected("trusted principal required")
         if (
-            type(tenant_id) is not str or not tenant_id
-            or tenant_id != tenant_id.strip()
-            or type(limit) is not int or not 1 <= limit <= 100
+            type(limit) is not int or not 1 <= limit <= 100
             or type(at) is not datetime
             or type(at.tzinfo) not in (timezone, ZoneInfo)
             or at.utcoffset() is None
         ):
             raise CaseQueueRejected("typed tenant-scoped queue request required")
-        if (
-            type(principal.expires_at) is not datetime
-            or type(principal.expires_at.tzinfo) not in (timezone, ZoneInfo)
-        ):
-            raise AuthorizationRejected("invalid principal expiry")
-        try:
-            accepted = replace(principal)
-        except (ValueError, TypeError, AttributeError) as exc:
-            raise AuthorizationRejected("invalid principal") from exc
-        if accepted.expires_at.astimezone(UTC) <= at.astimezone(UTC):
-            raise AuthorizationRejected("expired principal")
-        authorize(accepted, tenant_id=tenant_id, capability=Capability.CASE_READ)
+        accepted = authorized_case_read(
+            principal=principal, tenant_id=tenant_id, at=at,
+        )
 
         # Never let a ranking adapter mutate the principal later used for SQL.
         selection = self._ranking.select(
@@ -137,23 +122,25 @@ class ExplicitPostgresCaseQueueReader:
             seen_cases.add(item.case_id)
             seen_sources.add(item.source_event_id)
 
+        # Each ranked history reuses #130's exact authorization and immutable
+        # row/JSON verification, on its own request-scoped read transaction.
+        # These are sequential reads, NOT an atomic point-in-time snapshot:
+        # a concurrent case change may invalidate the whole result; the
+        # Bank installation must implement approved snapshot semantics first.
         ranked: list[RankedCase] = []
-        if selection.items:
-            with self._connections() as connection:
-                service = PostgresCaseTimelineService(connection)
-                for position, item in enumerate(selection.items, 1):
-                    history = service.history(
-                        principal=accepted, tenant_id=tenant_id,
-                        case_id=item.case_id, at=at,
-                    )
-                    if not history:
-                        raise CaseQueueRejected("ranked case unavailable")
-                    ranked.append(RankedCase(
-                        rank=position, case_id=item.case_id,
-                        source_event_id=item.source_event_id,
-                        source_context_ref=item.source_context_ref,
-                        scenario_ids=item.scenario_ids, history=history,
-                    ))
+        for position, item in enumerate(selection.items, 1):
+            history = self._history_reader.history(
+                principal=accepted, tenant_id=tenant_id,
+                case_id=item.case_id, at=at,
+            )
+            if not history:
+                raise CaseQueueRejected("ranked case unavailable")
+            ranked.append(RankedCase(
+                rank=position, case_id=item.case_id,
+                source_event_id=item.source_event_id,
+                source_context_ref=item.source_context_ref,
+                scenario_ids=item.scenario_ids, history=history,
+            ))
         snapshot = CaseQueueSnapshot(
             tenant_id=tenant_id,
             ranking_policy_version=selection.ranking_policy_version,
