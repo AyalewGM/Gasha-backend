@@ -668,3 +668,38 @@ def test_alerted_negative_yields_defined_zero_f1_but_undefined_fnr() -> None:
         "numerator": 0, "denominator": 0, "value": None,
         "undefined_reason": "no_labeled_positives",
     }
+
+
+def test_false_negative_only_is_not_missing_detection_rate() -> None:
+    # A matured fraud event with no alert is a false negative, not a
+    # zero-population undefined case and not a perfect detection result.
+    output = check(sample(
+        231, risk=0.2, label=True,
+        confirmed_at=AT + timedelta(days=2),
+    ))
+    assert output["confusion_counts"]["false_negative"] == 1
+    assert output["confusion_counts"]["true_positive"] == 0
+    assert output["f1"] == {
+        "numerator": 0, "denominator": 1, "value": 0.0,
+        "undefined_reason": None,
+    }
+    assert output["false_negative_rate"] == {
+        "numerator": 1, "denominator": 1, "value": 1.0,
+        "undefined_reason": None,
+    }
+    assert output["precision"]["value"] is None
+    assert output["bank_data_verified"] is False
+    assert output["enforcement_activated"] is False
+
+
+def test_f1_fnr_serialized_schema_has_distinct_report_version() -> None:
+    # v1 did not serialize F1/FNR. Explicitly version the expanded shape
+    # rather than implying the old evidence digest signs new output fields.
+    output = check(sample(
+        232, confirmed_at=AT + timedelta(days=2),
+    ))
+    assert output["report_version"] == "synthetic-matured-lineage-replay-v2"
+    assert "f1" in output and "false_negative_rate" in output
+    assert output["source"] == "synthetic_caller_asserted"
+    assert output["readiness_authorized"] is False
+    dumps(output, sort_keys=True, allow_nan=False)

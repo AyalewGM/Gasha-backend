@@ -31,7 +31,9 @@ from gasha.poc.temporal_lineage import (
 
 _TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
-REPORT_VERSION = "synthetic-matured-lineage-replay-v1"
+# v2 adds F1/FNR fields to the serialized synthetic report. Bind the schema
+# version into evaluation_digest so older v1 evidence is never conflated.
+REPORT_VERSION = "synthetic-matured-lineage-replay-v2"
 EVALUATION_VERSION = "synthetic-matured-lineage-evaluation-v1"
 SCORER_VERSION = "decision-service-max-signal-v1"
 COHORT_DIGEST_VERSION = "synthetic-matured-lineage-cohort-input-v2"
