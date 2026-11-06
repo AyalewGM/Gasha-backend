@@ -1,6 +1,6 @@
 """#45 inert transition-kernel tests; no bank case storage or proxy enabled."""
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -18,6 +18,7 @@ from gasha.cases.timeline import (
     CaseSourceUnavailable,
     VerifiedEvaluation,
     advance_case,
+    validate_case_history,
 )
 from gasha.security.access import AuthorizationRejected, Capability, TrustedPrincipal
 
@@ -296,3 +297,44 @@ def test_case_kernel_rejects_exact_credential_expiry():
     with pytest.raises(AuthorizationRejected, match="expired principal"):
         step((), command(CaseOperation.CREATE, 0),
              identity=replace(principal(), expires_at=NOW), at=NOW)
+class HostileCaseTimezone(tzinfo):
+    """An injected clock must never execute its callback in the case kernel."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def utcoffset(self, dt: datetime | None) -> timedelta | None:
+        self.calls += 1
+        raise AssertionError("injected case clock callback executed")
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return timedelta(0)
+
+
+def test_case_history_rejects_reader_clock_without_executing_custom_timezone() -> None:
+    history, _ = step((), command(CaseOperation.CREATE, 0))
+    hostile = HostileCaseTimezone()
+    tainted = replace(history[0], recorded_at=NOW.replace(tzinfo=hostile))
+    with pytest.raises(CaseRejected, match="malformed case history"):
+        validate_case_history((tainted,), tenant_id="tenant-a", case_id=CASE)
+    assert hostile.calls == 0
+    assert history[0].recorded_at == NOW
+
+
+def test_case_transition_rejects_custom_clock_before_source_lookup() -> None:
+    hostile = HostileCaseTimezone()
+    with pytest.raises(CaseRejected, match="trusted timezone-aware time"):
+        step((), command(CaseOperation.CREATE, 0), at=NOW.replace(tzinfo=hostile))
+    assert hostile.calls == 0
+
+
+@pytest.mark.parametrize("zone", [
+    timezone(timedelta(hours=5, minutes=30)),
+    ZoneInfo("America/New_York"),
+])
+def test_case_history_preserves_standard_timezone_absolute_instants(zone: tzinfo) -> None:
+    at = NOW.astimezone(zone)
+    history, event = step((), command(CaseOperation.CREATE, 0), at=at)
+    validate_case_history(history, tenant_id="tenant-a", case_id=CASE)
+    assert event.recorded_at == NOW
+    assert history[0].bank_execution is BankExecution.UNKNOWN
