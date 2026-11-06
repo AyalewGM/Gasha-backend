@@ -78,3 +78,23 @@ trust and audit; Independent QA should reproduce default-disabled and
 cross-tenant/partial-result denials. Separate Unified Engineering Lead
 decides internal integration only. Issue #45 and #49 Bank-facing acceptance
 remain open. No merge, self-approval, deployment or enforcement is authorized.
+
+
+### Queue reader composition after #130 (bounded internal integration)
+
+The queue adapter calls the merged `ExplicitPostgresCaseHistoryReader.history`
+for every selected case, sharing the exact principal/clock/tenant/CAPABILITY_CASE_READ
+validation primitive and the canonical PostgreSQL history verifier. Each case
+gets its **own database connection and read transaction**; no transaction or
+repeatable-read snapshot is shared across the ranked queue. In particular,
+`PostgresCaseTimelineService.history` ends every read with `rollback()`.
+The query is **best-effort sequential observation**, not a point-in-time or
+linearizable multi-case snapshot and not proof of Bank ranking freshness.
+
+The queue builds its result in memory, validates every ranked reference against
+the complete stored lifecycle, and emits **nothing** until all cases pass. A
+second-case concurrent change, missing/tampered history, or connection failure
+fails the *entire* protected request with redacted audit. Security/Architecture
+must approve a versioned transactional snapshot design and Bank-authorized
+ranking provenance before any operational Bank use. `bank_ranking_approved`
+and `enforcement_activated` remain false; default app wiring is unchanged.

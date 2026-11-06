@@ -329,3 +329,164 @@ def test_tampered_history_fails_whole_ranked_queue_with_redacted_audit(
     assert [e.result for e in audit.events if e.action == "case.read"] == [
         "authorized", "failed",
     ]
+
+
+def test_empty_queue_and_limits_have_no_database_side_effects() -> None:
+    ranking = Ranking({TENANTS[0]: selection()})
+    opens: list[str] = []
+
+    def forbidden_connection():
+        opens.append("unexpected database")
+        raise AssertionError("empty queue opened database")
+
+    reader = ExplicitPostgresCaseQueueReader(
+        connections=forbidden_connection, ranking=ranking,
+    )
+    for limit in (1, 100):
+        snapshot = reader.read(
+            principal=principal(), tenant_id=TENANTS[0], limit=limit, at=AT,
+        )
+        assert snapshot.items == ()
+        assert snapshot.ranking_policy_version == "synthetic-ranked-v1"
+    for limit in (0, 101):
+        with pytest.raises(CaseQueueRejected):
+            reader.read(
+                principal=principal(), tenant_id=TENANTS[0], limit=limit, at=AT,
+            )
+    assert ranking.calls == 2
+    assert opens == []
+
+
+def test_invalid_scenario_references_fail_before_database() -> None:
+    variants = (("APP-99",), ("APP-01", "APP-01"), ("MM-01", "APP-01"), ())
+    for scenarios in variants:
+        ref = reference()
+        bad = RankedCaseReference(
+            ref.case_id, ref.source_event_id, CONTEXT, scenarios,
+        )
+        ranking = Ranking({TENANTS[0]: selection(TENANTS[0], bad)})
+        opens: list[str] = []
+
+        def forbidden_connection():
+            opens.append("unexpected database")
+            raise AssertionError("invalid rank reached database")
+
+        reader = ExplicitPostgresCaseQueueReader(
+            connections=forbidden_connection, ranking=ranking,
+        )
+        with pytest.raises(CaseQueueRejected):
+            reader.read(
+                principal=principal(), tenant_id=TENANTS[0], limit=1, at=AT,
+            )
+        assert ranking.calls == 1
+        assert not opens
+
+
+def _create_additional_case(schema_name: str, tenant: str) -> RankedCaseReference:
+    case_id, event_id = uuid4(), uuid4()
+    with connect(schema_name) as connection:
+        PostgresCaseTimelineService(connection).apply(
+            CaseCommand(
+                tenant_id=tenant, case_id=case_id, source_event_id=event_id,
+                operation=CaseOperation.CREATE, expected_revision=0,
+                idempotency_key=uuid4().hex,
+                reason_code=CaseReason.SOURCE_EVALUATION,
+            ),
+            principal=principal(
+                tenant, caps=frozenset({Capability.CASE_READ, Capability.CASE_CREATE}),
+            ),
+            source=Source(), at=AT,
+        )
+    return reference(case_id, event_id)
+
+
+def test_multi_case_queue_uses_per_case_history_reader_transactions(
+    installed_synthetic_queue,
+) -> None:
+    schema_name, refs, ranking, _, audit, factory, client = installed_synthetic_queue
+    tenant = TENANTS[0]
+    additional = _create_additional_case(schema_name, tenant)
+    ranking.selections[tenant] = selection(tenant, refs[tenant], additional)
+    response = client.get(queue_url(tenant) + "?limit=2", headers=auth(tenant))
+    assert response.status_code == 200, response.text
+    assert [item["case_id"] for item in response.json()["items"]] == [
+        str(refs[tenant].case_id), str(additional.case_id),
+    ]
+    # Each #130 history read closes its own connection/read transaction.
+    # This proves no queue-wide repeatable-read snapshot is being claimed.
+    assert factory.calls == 2
+    assert [event.result for event in audit.events if event.action == "case.read"] == [
+        "authorized", "succeeded",
+    ]
+
+
+def test_concurrent_second_case_corruption_fails_entire_queue(
+    installed_synthetic_queue,
+) -> None:
+    schema_name, refs, ranking, _, audit, _, client = installed_synthetic_queue
+    tenant = TENANTS[0]
+    additional = _create_additional_case(schema_name, tenant)
+    ranking.selections[tenant] = selection(tenant, refs[tenant], additional)
+
+    class CorruptBeforeSecondRead:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            if self.calls == 2:
+                # Simulate a different connection changing the second case
+                # between independent reads. No partial queue may escape.
+                with connect(schema_name) as updater:
+                    updater.execute(
+                        """UPDATE analyst_case_events
+                           SET event_json = jsonb_set(
+                               event_json, '{tenant_id}', to_jsonb(%s::text))
+                           WHERE tenant_id = %s AND case_id = %s""",
+                        (TENANTS[1], tenant, additional.case_id),
+                    )
+                    updater.commit()
+            return connect(schema_name)
+
+    connections = CorruptBeforeSecondRead()
+    app.state.case_queue_reader = ExplicitPostgresCaseQueueReader(
+        connections=connections, ranking=ranking,
+    )
+    response = client.get(queue_url(tenant) + "?limit=2", headers=auth(tenant))
+    assert response.status_code == 503
+    assert response.json() == {"detail": "case queue unavailable"}
+    assert "items" not in response.text
+    assert tenant not in response.text
+    assert TENANTS[1] not in response.text
+    assert connections.calls == 2
+    assert [event.result for event in audit.events if event.action == "case.read"] == [
+        "authorized", "failed",
+    ]
+
+
+def test_second_case_connection_outage_never_returns_partial_queue(
+    installed_synthetic_queue,
+) -> None:
+    schema_name, refs, ranking, _, audit, _, client = installed_synthetic_queue
+    tenant = TENANTS[0]
+    additional = _create_additional_case(schema_name, tenant)
+    ranking.selections[tenant] = selection(tenant, refs[tenant], additional)
+    calls = []
+
+    def failing_second_connection():
+        calls.append(True)
+        if len(calls) == 2:
+            raise RuntimeError("synthetic sensitive connection error")
+        return connect(schema_name)
+
+    app.state.case_queue_reader = ExplicitPostgresCaseQueueReader(
+        connections=failing_second_connection, ranking=ranking,
+    )
+    response = client.get(queue_url(tenant) + "?limit=2", headers=auth(tenant))
+    assert response.status_code == 503
+    assert response.json() == {"detail": "case queue unavailable"}
+    assert "sensitive" not in response.text
+    assert len(calls) == 2
+    assert [event.result for event in audit.events if event.action == "case.read"] == [
+        "authorized", "failed",
+    ]

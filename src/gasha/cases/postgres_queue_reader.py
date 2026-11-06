@@ -25,6 +25,7 @@ from gasha.cases.queue import (
     CaseQueueSnapshot,
     RankedCase,
     project_case_queue,
+    valid_scenario_ids,
 )
 from gasha.postgres import Connection
 from gasha.security.access import TrustedPrincipal
@@ -79,7 +80,9 @@ class ExplicitPostgresCaseQueueReader:
         limit: int, at: datetime,
     ) -> CaseQueueSnapshot:
         if (
-            type(limit) is not int or not 1 <= limit <= 100
+            type(tenant_id) is not str or not tenant_id
+            or tenant_id != tenant_id.strip()
+            or type(limit) is not int or not 1 <= limit <= 100
             or type(at) is not datetime
             or type(at.tzinfo) not in (timezone, ZoneInfo)
             or at.utcoffset() is None
@@ -112,9 +115,7 @@ class ExplicitPostgresCaseQueueReader:
                 or type(item.source_event_id) is not UUID
                 or type(item.source_context_ref) is not str
                 or re.fullmatch(r"[0-9a-f]{64}", item.source_context_ref) is None
-                or type(item.scenario_ids) is not tuple
-                or not item.scenario_ids
-                or any(type(scenario) is not str for scenario in item.scenario_ids)
+                or not valid_scenario_ids(item.scenario_ids)
                 or item.case_id in seen_cases
                 or item.source_event_id in seen_sources
             ):
