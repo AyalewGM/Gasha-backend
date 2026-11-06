@@ -491,3 +491,81 @@ def test_second_case_connection_outage_never_returns_partial_queue(
     assert [event.result for event in audit.events if event.action == "case.read"] == [
         "authorized", "failed",
     ]
+
+
+# #132 current-main integration: reject mutated verifier output before ranking/SQL.
+class _HostileTenantScope(frozenset[str]):
+    def __contains__(self, value: object) -> bool:
+        raise AssertionError("untrusted scope membership invoked")
+
+    def __iter__(self):
+        raise AssertionError("untrusted scope iteration invoked")
+
+
+class _HostileCapabilityScope(frozenset[Capability]):
+    def __contains__(self, value: object) -> bool:
+        raise AssertionError("untrusted capability membership invoked")
+
+    def __iter__(self):
+        raise AssertionError("untrusted capability iteration invoked")
+
+
+class _HostileText(str):
+    def __hash__(self) -> int:
+        return hash(str(self))
+
+    def __eq__(self, value: object) -> bool:
+        raise AssertionError("untrusted string equality invoked")
+
+    def strip(self, chars: str | None = None) -> str:
+        raise AssertionError("untrusted string strip invoked")
+
+
+@pytest.mark.parametrize(("field", "corruption"), [
+    ("tenant_ids", _HostileTenantScope({TENANTS[0]})),
+    ("tenant_ids", frozenset({_HostileText(TENANTS[0])})),
+    ("capabilities", _HostileCapabilityScope({Capability.CASE_READ})),
+    ("capabilities", frozenset({"case.read"})),
+    ("subject", _HostileText("synthetic-queue")),
+    ("issuer", _HostileText("synthetic-verifier")),
+    ("credential_ref", _HostileText("synthetic-only")),
+])
+def test_merged_pr132_rejects_mutated_principal_before_rank_or_db(
+    field: str, corruption: object,
+) -> None:
+    ranking = Ranking({TENANTS[0]: selection(TENANTS[0])})
+    opened: list[bool] = []
+
+    def forbidden_connection():
+        opened.append(True)
+        raise AssertionError("forbidden DB acquisition")
+
+    reader = ExplicitPostgresCaseQueueReader(
+        connections=forbidden_connection, ranking=ranking,
+    )
+    actor = principal()
+    object.__setattr__(actor, field, corruption)
+    with pytest.raises(AuthorizationRejected):
+        reader.read(principal=actor, tenant_id=TENANTS[0], limit=1, at=AT)
+    assert ranking.calls == 0
+    assert not opened
+
+
+def test_merged_pr132_preserves_empty_authorized_queue_without_db() -> None:
+    ranking = Ranking({TENANTS[0]: selection(TENANTS[0])})
+    opened: list[bool] = []
+
+    def forbidden_connection():
+        opened.append(True)
+        raise AssertionError("empty authorized queue opened DB")
+
+    reader = ExplicitPostgresCaseQueueReader(
+        connections=forbidden_connection, ranking=ranking,
+    )
+    snapshot = reader.read(
+        principal=principal(), tenant_id=TENANTS[0], limit=1, at=AT,
+    )
+    assert snapshot.tenant_id == TENANTS[0]
+    assert snapshot.items == ()
+    assert ranking.calls == 1
+    assert not opened
