@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from hashlib import sha256
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo
@@ -475,3 +475,75 @@ def test_valid_synthetic_clock_still_reports_nonnegative_latency() -> None:
     assert report["alert_latency"]["count"] == 1
     assert report["alert_latency"]["mean_seconds"] == 120.0
     assert report["alert_latency"]["missing_count"] == 0
+
+
+class _CallbackTimezone(tzinfo):
+    """A valid datetime may carry a callback-capable untrusted tzinfo."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        self.calls += 1
+        raise AssertionError("untrusted timezone callback executed")
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return None
+
+    def tzname(self, dt: datetime | None) -> str | None:
+        return "untrusted"
+
+
+class _CallbackDatetime(datetime):
+    """Datetime subclasses also cannot be trusted as a clock boundary."""
+
+    calls = 0
+
+    def utcoffset(self) -> timedelta:
+        type(self).calls += 1
+        raise AssertionError("untrusted datetime callback executed")
+
+
+@pytest.mark.parametrize("field", [
+    "as_of",
+    "source_event_at",
+    "alert_emitted_at",
+    "mutated_source_event_at",
+    "mutated_alert_emitted_at",
+])
+def test_synthetic_metric_clock_rejects_untrusted_timezone_before_callback(
+    field: str,
+) -> None:
+    history = _done()
+    bad_zone = _CallbackTimezone()
+    malicious_clock = datetime(2026, 11, 1, 18, tzinfo=bad_zone)
+    if field == "as_of":
+        with pytest.raises(CaseMetricsRejected):
+            _report(history, as_of=malicious_clock)
+    elif field.startswith("mutated_"):
+        clock = _clock(history)
+        object.__setattr__(clock, field.removeprefix("mutated_"), malicious_clock)
+        with pytest.raises(CaseMetricsRejected):
+            _report(history, clocks=(clock,))
+    else:
+        with pytest.raises(CaseMetricsRejected):
+            replace(_clock(history), **{field: malicious_clock})
+    assert bad_zone.calls == 0
+
+
+@pytest.mark.parametrize("field", [
+    "as_of", "source_event_at", "alert_emitted_at",
+])
+def test_synthetic_metric_clock_rejects_datetime_subclass_before_callback(
+    field: str,
+) -> None:
+    history = _done()
+    _CallbackDatetime.calls = 0
+    malicious_clock = _CallbackDatetime(2026, 11, 1, 18, tzinfo=UTC)
+    if field == "as_of":
+        with pytest.raises(CaseMetricsRejected):
+            _report(history, as_of=malicious_clock)
+    else:
+        with pytest.raises(CaseMetricsRejected):
+            replace(_clock(history), **{field: malicious_clock})
+    assert _CallbackDatetime.calls == 0

@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from gasha.cases.timeline import (
     CaseDisposition,
@@ -26,8 +27,15 @@ class CaseMetricsRejected(ValueError):
 
 
 def _instant(value: datetime) -> datetime:
-    if type(value) is not datetime or value.utcoffset() is None:
-        raise CaseMetricsRejected("timezone-aware timestamp required")
+    # Exact datetime is not enough: its tzinfo may still execute an untrusted
+    # utcoffset() callback before the synthetic metric can reject the record.
+    # Only built-in fixed offsets and the concrete IANA timezone are supported.
+    if (
+        type(value) is not datetime
+        or type(value.tzinfo) not in (timezone, ZoneInfo)
+        or value.utcoffset() is None
+    ):
+        raise CaseMetricsRejected("timezone-aware trusted timestamp required")
     return value.astimezone(UTC)
 
 
