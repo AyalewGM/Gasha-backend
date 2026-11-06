@@ -8,7 +8,8 @@ No bank action, rule update, database write or outbound effect occurs here.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
+from zoneinfo import ZoneInfo
 from enum import StrEnum
 from hashlib import sha256
 from json import dumps
@@ -198,6 +199,8 @@ def validate_case_history(
                 and (type(event.assignee_ref) is not str
                      or fullmatch(r"[0-9a-f]{64}", event.assignee_ref) is None))
             or type(event.recorded_at) is not datetime
+            # Reader-provided tzinfo may run arbitrary code on utcoffset().
+            or type(event.recorded_at.tzinfo) not in (timezone, ZoneInfo)
             or event.recorded_at.utcoffset() is None
             or event.bank_execution is not BankExecution.UNKNOWN
         ):
@@ -319,7 +322,11 @@ def advance_case(
     # Authorization precedes even a duplicate replay: revoked scope cannot re-read.
     authorize(principal, tenant_id=command.tenant_id,
               capability=_CAPABILITIES[command.operation])
-    if not isinstance(at, datetime) or at.utcoffset() is None:
+    if (
+        type(at) is not datetime
+        or type(at.tzinfo) not in (timezone, ZoneInfo)
+        or at.utcoffset() is None
+    ):
         raise CaseRejected("trusted timezone-aware time required")
     # A typed principal can be stale when a verifier result is reused. Check the
     # absolute instant; equal-zone DST folds cannot be compared by wall clock.
