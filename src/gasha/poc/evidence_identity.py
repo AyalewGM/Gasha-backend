@@ -39,7 +39,8 @@ def _digest(name: str, value: object) -> None:
 def _time(name: str, value: object) -> datetime:
     # Validate the concrete clock implementation before calling timezone hooks:
     # datetime subclasses and custom tzinfo objects can execute caller code.
-    if not isinstance(value, datetime) or type(value) is not datetime:
+    # isinstance() may call a forged __class__ property before rejecting an object.
+    if type(value) is not datetime:
         raise EvidenceIdentityRejected(f"{name} must be an allowed timezone-aware datetime")
     if type(value.tzinfo) not in (timezone, ZoneInfo):
         raise EvidenceIdentityRejected(f"{name} must be an allowed timezone-aware datetime")
