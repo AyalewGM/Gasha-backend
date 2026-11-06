@@ -594,3 +594,77 @@ def test_valid_zoneinfo_dst_fold_scope_normalizes_to_distinct_utc_instants() -> 
     assert checked.window_start < checked.window_end < checked.label_cutoff
     assert checked.window_start.tzinfo is UTC
     assert checked.window_end.tzinfo is UTC
+
+
+def test_matured_f1_and_fnr_use_only_labeled_confusion_denominators() -> None:
+    """TP=FP=TN=FN=1: F1=2/(2+1+1), FNR=1/(1+1)."""
+    matured = AT + timedelta(days=2)
+    rows = (
+        sample(201, risk=0.95, label=True, confirmed_at=matured),
+        sample(202, risk=0.95, label=False, confirmed_at=matured),
+        sample(203, risk=0.2, label=False, confirmed_at=matured),
+        sample(204, risk=0.2, label=True, confirmed_at=matured),
+        sample(205, risk=0.95, label=True, confirmed_at=AT + timedelta(days=11)),
+        sample(206, risk=0.2, label=None),
+    )
+    result = replay_offline_matured_lineage(
+        scope(), tuple(event for event, _ in rows),
+        tuple(lineage for _, lineage in rows), policy(),
+    )
+    summary = result.to_dict()
+    assert summary["confusion_counts"] == {
+        "true_positive": 1, "false_positive": 1, "true_negative": 1,
+        "false_negative": 1, "unlabeled": 2,
+    }
+    assert summary["f1"] == {
+        "numerator": 2, "denominator": 4, "value": 0.5, "undefined_reason": None,
+    }
+    assert summary["false_negative_rate"] == {
+        "numerator": 1, "denominator": 2, "value": 0.5, "undefined_reason": None,
+    }
+    assert summary["maturity"]["excluded_future_labels"] == 1
+    # Reporting derived rates does not change the existing bound identities.
+    assert summary["cohort_digest"] == result.cohort_digest
+    assert summary["policy_digest"] == result.policy_digest
+    assert summary["evaluation_digest"] == result.evaluation_digest
+    assert check(*reversed(rows))["f1"] == summary["f1"]
+    encoded = dumps(summary, allow_nan=False, sort_keys=True)
+    assert "private-customer-123" not in encoded
+    assert "private-account-123" not in encoded
+    assert "private-beneficiary-123" not in encoded
+
+
+@pytest.mark.parametrize("rows", [
+    (),
+    (sample(211, confirmed_at=AT + timedelta(days=11)),),
+    (sample(212, label=True), sample(213, label=None)),
+])
+def test_f1_and_fnr_undefined_without_matured_positives_or_alerts(
+    rows: tuple[tuple[HistoricalTransactionEvent, HistoricalFeatureEnvelope], ...],
+) -> None:
+    output = check(*rows)
+    assert output["f1"] == {
+        "numerator": 0, "denominator": 0, "value": None,
+        "undefined_reason": "no_positive_labels_or_alerts",
+    }
+    assert output["false_negative_rate"] == {
+        "numerator": 0, "denominator": 0, "value": None,
+        "undefined_reason": "no_labeled_positives",
+    }
+    dumps(output, allow_nan=False)
+
+
+def test_alerted_negative_yields_defined_zero_f1_but_undefined_fnr() -> None:
+    # F1 has a labeled false positive denominator; FNR has no true positives.
+    output = check(sample(
+        221, risk=0.95, label=False,
+        confirmed_at=AT + timedelta(days=2),
+    ))
+    assert output["f1"] == {
+        "numerator": 0, "denominator": 1, "value": 0.0,
+        "undefined_reason": None,
+    }
+    assert output["false_negative_rate"] == {
+        "numerator": 0, "denominator": 0, "value": None,
+        "undefined_reason": "no_labeled_positives",
+    }
