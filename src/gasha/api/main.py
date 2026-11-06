@@ -10,10 +10,11 @@ import json
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from hashlib import sha256
 from typing import Annotated, NoReturn, Protocol
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
@@ -76,6 +77,21 @@ def _safe_version_metadata(value: object) -> bool:
     )
 
 
+def _context_utc(value: object) -> datetime | None:
+    """Reject callback-capable provider clocks before timezone operations.
+
+    Mirrors the accepted credential-clock shape boundary. This verifies clock
+    types, not the authority of an installed Bank context provider.
+    """
+    if type(value) is not datetime:
+        return None
+    if type(value.tzinfo) not in (timezone, ZoneInfo):
+        return None
+    if value.utcoffset() is None:
+        return None
+    return value.astimezone(UTC)
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class TrustedDecisionContext:
     """Immutable server-selected, event-bound policy and signal snapshot.
@@ -107,6 +123,8 @@ class TrustedDecisionContext:
         collected_at: datetime,
         expires_at: datetime,
     ) -> None:
+        collected_utc = _context_utc(collected_at)
+        expires_utc = _context_utc(expires_at)
         if (
             not isinstance(tenant_id, str) or not tenant_id.strip()
             or not isinstance(event_id, UUID)
@@ -114,13 +132,10 @@ class TrustedDecisionContext:
             or not isinstance(intelligence, IntelligenceSnapshot)
             or not _safe_version_metadata(signal_source_version)
             or not _safe_version_metadata(signal_version)
-            or not isinstance(collected_at, datetime)
-            or collected_at.utcoffset() is None
-            or not isinstance(expires_at, datetime)
-            or expires_at.utcoffset() is None
-            # Compare absolute instants: equal-zone ZoneInfo folds otherwise
-            # compare local wall time and can admit an expired validity window.
-            or expires_at.astimezone(UTC) <= collected_at.astimezone(UTC)
+            or collected_utc is None
+            or expires_utc is None
+            # Compare absolute instants: ZoneInfo folds can share a wall clock.
+            or expires_utc <= collected_utc
         ):
             raise ValueError("trusted event-bound decision provenance required")
         policy_snapshot = policy.model_dump_json()
@@ -151,14 +166,18 @@ class TrustedDecisionContext:
         # NUL-joining arbitrary provider strings lets distinct (source, version)
         # tuples have identical preimages. Canonical JSON binds names and types,
         # with a domain/schema tag and normalized UTC instants.
+        collected_utc = _context_utc(self.collected_at)
+        expires_utc = _context_utc(self.expires_at)
+        if collected_utc is None or expires_utc is None or expires_utc <= collected_utc:
+            raise ValueError("invalid decision context validity window")
         preimage = {
             "schema": "gasha-context-ref-v2",
             "tenant_id": self.tenant_id,
             "event_id": str(self.event_id),
             "signal_source_version": self.signal_source_version,
             "signal_version": self.signal_version,
-            "collected_at": self.collected_at.astimezone(UTC).isoformat(),
-            "expires_at": self.expires_at.astimezone(UTC).isoformat(),
+            "collected_at": collected_utc.isoformat(),
+            "expires_at": expires_utc.isoformat(),
             "signal_sha256": self._signal_digest,
             "policy_json": self._policy_snapshot,
         }
@@ -451,21 +470,22 @@ def _trusted_context(
         raise HTTPException(
             status_code=503, detail="trusted decision context unavailable"
         ) from exc
-    now = utcnow().astimezone(UTC)
+    now_utc = _context_utc(utcnow())
+    if type(context) is not TrustedDecisionContext:
+        raise HTTPException(status_code=503, detail="trusted decision context unavailable")
+    collected_utc = _context_utc(context.collected_at)
+    expires_utc = _context_utc(context.expires_at)
     if (
-        not isinstance(context, TrustedDecisionContext)
+        now_utc is None
         or context.tenant_id != tx.tenant_id
         or context.event_id != tx.event_id
         or not _safe_version_metadata(context.signal_source_version)
         or not _safe_version_metadata(context.signal_version)
-        or not isinstance(context.collected_at, datetime)
-        or context.collected_at.utcoffset() is None
-        or not isinstance(context.expires_at, datetime)
-        or context.expires_at.utcoffset() is None
-        # ZoneInfo repeated local time in a DST fold compares by wall clock
-        # when both operands share tzinfo. Enforce freshness by UTC instants.
-        or context.collected_at.astimezone(UTC) > now
-        or context.expires_at.astimezone(UTC) <= now
+        or collected_utc is None
+        or expires_utc is None
+        # ZoneInfo repeated wall time is not a UTC-instant freshness check.
+        or collected_utc > now_utc
+        or expires_utc <= now_utc
     ):
         raise HTTPException(status_code=503, detail="trusted decision context unavailable")
     return context

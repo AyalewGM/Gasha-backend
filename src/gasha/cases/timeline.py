@@ -298,6 +298,9 @@ def _check_command(command: CaseCommand) -> None:
             raise CaseRejected("disposition/reason mismatch")
     if command.operation is CaseOperation.ASSIGN:
         if (type(command.assignee) is not AuthorizedAssignee
+                # Frozen dataclass annotations do not enforce runtime field types.
+                # Reject adapter-mutated tenants before any overloaded comparison.
+                or type(command.assignee.tenant_id) is not str
                 or command.assignee.tenant_id != command.tenant_id
                 or type(command.assignee.actor_ref) is not str
                 or fullmatch(r"[0-9a-f]{64}", command.assignee.actor_ref) is None):

@@ -423,3 +423,82 @@ def test_case_kernel_rejects_forged_server_evaluation_without_callback() -> None
         step((), command(CaseOperation.CREATE, 0),
              lookup=MutatedEvaluationLookup())
     assert bad_tenant.calls == 0
+
+
+@pytest.mark.parametrize("false_equal", [False, True])
+def test_assign_rejects_mutated_assignee_tenant_without_untrusted_comparison(
+    false_equal: bool,
+) -> None:
+    """An exact dataclass can contain a forged tenant despite its field annotation."""
+
+    class MaliciousTenant:
+        def __init__(self) -> None:
+            self.comparisons = 0
+
+        def __ne__(self, other: object) -> bool:
+            self.comparisons += 1
+            if false_equal:
+                return False
+            raise AssertionError("untrusted tenant __ne__ executed")
+
+        def __eq__(self, other: object) -> bool:
+            self.comparisons += 1
+            if false_equal:
+                return True
+            raise AssertionError("untrusted tenant __eq__ executed")
+
+    class NeverLookup:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def resolve(self, tenant_id, event_id):
+            self.calls += 1
+            raise AssertionError("source lookup before assignee rejection")
+
+    history = lifecycle()[:2]
+    before = tuple(history)
+    tainted = MaliciousTenant()
+    assignee = AuthorizedAssignee("tenant-a", "a" * 64)
+    object.__setattr__(assignee, "tenant_id", tainted)
+    lookup = NeverLookup()
+
+    with pytest.raises(CaseRejected, match="server-resolved tenant assignee required"):
+        step(history, command(CaseOperation.ASSIGN, 2, assignee=assignee), lookup=lookup)
+    assert tainted.comparisons == 0
+    assert lookup.calls == 0
+    assert history == before  # No case event appended; the kernel has no audit/writer port.
+    assert all(event.bank_execution is BankExecution.UNKNOWN for event in history)
+
+
+def test_assign_concrete_tenant_controls_still_propose_only_inert_case_event() -> None:
+    """Wrong-tenant rejects before source lookup; valid tenant remains functional."""
+
+    class CountingLookup(Lookup):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def resolve(self, tenant_id, event_id):
+            self.calls += 1
+            return super().resolve(tenant_id, event_id)
+
+    history = lifecycle()[:2]
+    lookup = CountingLookup()
+    with pytest.raises(CaseRejected, match="server-resolved tenant assignee required"):
+        step(history, command(
+            CaseOperation.ASSIGN, 2,
+            assignee=AuthorizedAssignee("tenant-b", "a" * 64),
+        ), lookup=lookup)
+    assert lookup.calls == 0
+    assert len(history) == 2
+
+    next_history, event = step(history, command(
+        CaseOperation.ASSIGN, 2,
+        assignee=AuthorizedAssignee("tenant-a", "a" * 64),
+    ), lookup=lookup)
+    assert lookup.calls == 1
+    assert history == next_history[:2]  # Proposed append only; no persistence.
+    assert len(next_history) == 3
+    assert event.operation is CaseOperation.ASSIGN
+    assert event.assignee_ref == "a" * 64
+    assert event.bank_execution is BankExecution.UNKNOWN
