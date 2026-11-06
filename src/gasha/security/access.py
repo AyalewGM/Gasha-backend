@@ -7,11 +7,12 @@ No header, JSON claim or frontend role is accepted as a principal by itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from enum import StrEnum
 from hashlib import sha256
 from json import dumps
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 
 class Capability(StrEnum):
@@ -38,6 +39,22 @@ class Capability(StrEnum):
     CASE_FEEDBACK = "case.feedback"
 
 
+def _trusted_utc(value: object) -> datetime | None:
+    """Validate clock types before any callback-capable time operation.
+
+    Built-in UTC/fixed offsets and ZoneInfo (including DST folds) are allowed;
+    datetime subclasses and arbitrary tzinfo implementations are rejected.
+    This checks clock shape, not a Bank verifier's trustworthiness.
+    """
+    if not isinstance(value, datetime) or type(value) is not datetime:
+        return None
+    if type(value.tzinfo) not in (timezone, ZoneInfo):
+        return None
+    if value.utcoffset() is None:
+        return None
+    return value.astimezone(UTC)
+
+
 @dataclass(frozen=True, slots=True)
 class TrustedPrincipal:
     """Trusted output of a bank-approved verifier, never constructed from request JSON."""
@@ -62,8 +79,8 @@ class TrustedPrincipal:
             not isinstance(capability, Capability) for capability in self.capabilities
         ):
             raise ValueError("typed immutable capabilities are required")
-        if not isinstance(self.expires_at, datetime) or self.expires_at.utcoffset() is None:
-            raise ValueError("timezone-aware credential expiry is required")
+        if _trusted_utc(self.expires_at) is None:
+            raise ValueError("standard timezone-aware credential expiry is required")
 
     @property
     def audit_actor(self) -> str:
@@ -130,7 +147,8 @@ def authenticate(
     bearer_header: str | None, verifier: CredentialVerifier | None, *, now: datetime
 ) -> TrustedPrincipal:
     """Reject missing, malformed, expired, revoked or unverifiable identity."""
-    if not isinstance(now, datetime) or now.utcoffset() is None:
+    now_utc = _trusted_utc(now)
+    if now_utc is None:
         raise IdentityUnavailable("trusted UTC clock required")
     if bearer_header is None or not bearer_header.startswith("Bearer "):
         raise CredentialRejected("bearer credential required")
@@ -145,11 +163,18 @@ def authenticate(
         raise
     except Exception as exc:
         raise IdentityUnavailable("identity verifier unavailable") from exc
-    if not isinstance(principal, TrustedPrincipal):
+    if type(principal) is not TrustedPrincipal:
         raise IdentityUnavailable("invalid verifier result")
-    # Compare absolute instants: ZoneInfo fold=0/fold=1 values sharing one
-    # tzinfo can otherwise compare by local wall time across a DST fallback.
-    if principal.expires_at.astimezone(UTC) <= now.astimezone(UTC):
+    # A verifier can return an earlier record whose frozen expiry was corrupted
+    # by low-level mutation. Revalidate before executing any timezone callback.
+    try:
+        expiry_utc = _trusted_utc(principal.expires_at)
+    except AttributeError:
+        raise IdentityUnavailable("invalid verifier result") from None
+    if expiry_utc is None:
+        raise IdentityUnavailable("invalid verifier expiry")
+    # UTC instant comparisons preserve ZoneInfo fold=0/fold=1 distinctions.
+    if expiry_utc <= now_utc:
         raise CredentialRejected("credential expired")
     return principal
 
