@@ -9,8 +9,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
-from zoneinfo import ZoneInfo
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from gasha.cases.timeline import CaseEvent, CaseOperation, validate_case_history
 
