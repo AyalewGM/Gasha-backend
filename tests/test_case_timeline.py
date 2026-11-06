@@ -338,3 +338,87 @@ def test_case_history_preserves_standard_timezone_absolute_instants(zone: tzinfo
     validate_case_history(history, tenant_id="tenant-a", case_id=CASE)
     assert event.recorded_at == NOW
     assert history[0].bank_execution is BankExecution.UNKNOWN
+
+class ForgedCaseClass:
+    """Opaque adapter value with a side-effecting forged __class__ getter."""
+
+    def __init__(self, claimed: type) -> None:
+        self.claimed = claimed
+        self.calls = 0
+
+    @property
+    def __class__(self) -> type:
+        self.calls += 1
+        raise AssertionError("untrusted case adapter __class__ executed")
+
+
+@pytest.mark.parametrize(("field", "claimed"), [
+    ("tenant_id", str),
+    ("operation", CaseOperation),
+    ("reason_code", CaseReason),
+    ("idempotency_key", str),
+])
+def test_case_command_rejects_forged_classes_without_callbacks(field, claimed) -> None:
+    value = ForgedCaseClass(claimed)
+    cmd = command(CaseOperation.CREATE, 0)
+    object.__setattr__(cmd, field, value)
+    with pytest.raises(CaseRejected, match="invalid case command"):
+        step((), cmd, lookup=Lookup())
+    assert value.calls == 0
+
+
+def test_case_kernel_rejects_forged_principal_without_callback() -> None:
+    value = ForgedCaseClass(TrustedPrincipal)
+    with pytest.raises(CaseRejected, match="trusted authenticated principal"):
+        step((), command(CaseOperation.CREATE, 0), identity=value)
+    assert value.calls == 0
+
+
+def test_case_kernel_rejects_forged_history_event_without_callback() -> None:
+    value = ForgedCaseClass(CaseEvent)
+    with pytest.raises(CaseRejected, match="trusted immutable history"):
+        step((value,), command(CaseOperation.CREATE, 0))
+    assert value.calls == 0
+
+
+@pytest.mark.parametrize("kind", ["hostile_timezone", "forged", "datetime_subclass"])
+def test_case_kernel_rejects_corrupted_principal_expiry_before_lookup(kind) -> None:
+    identity = principal()
+    hostile = HostileCaseTimezone()
+    forged = ForgedCaseClass(datetime)
+
+    class UntrustedDatetime(datetime):
+        def astimezone(self, tz=None):
+            raise AssertionError("untrusted expiry astimezone executed")
+
+    expiry = {
+        "hostile_timezone": NOW.replace(tzinfo=hostile),
+        "forged": forged,
+        "datetime_subclass": UntrustedDatetime(2026, 10, 31, 19, tzinfo=UTC),
+    }[kind]
+    object.__setattr__(identity, "expires_at", expiry)
+
+    class NeverLookup:
+        def resolve(self, tenant_id, event_id):
+            raise AssertionError("source lookup must not run on invalid expiry")
+
+    with pytest.raises(AuthorizationRejected, match="invalid principal expiry"):
+        step((), command(CaseOperation.CREATE, 0), identity=identity,
+             lookup=NeverLookup())
+    assert hostile.calls == 0
+    assert forged.calls == 0
+
+
+def test_case_kernel_rejects_forged_server_evaluation_without_callback() -> None:
+    bad_tenant = ForgedCaseClass(str)
+    verified = VerifiedEvaluation("tenant-a", SOURCE, CONTEXT)
+    object.__setattr__(verified, "tenant_id", bad_tenant)
+
+    class MutatedEvaluationLookup:
+        def resolve(self, tenant_id, event_id):
+            return verified
+
+    with pytest.raises(CaseSourceUnavailable, match="tenant-bound evaluation"):
+        step((), command(CaseOperation.CREATE, 0),
+             lookup=MutatedEvaluationLookup())
+    assert bad_tenant.calls == 0
