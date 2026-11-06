@@ -1,7 +1,8 @@
 """#42/#45 authenticated, fail-closed, UNWIRED multi-scenario ranked queue contract."""
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -353,3 +354,69 @@ def test_queue_reader_cannot_modify_authenticated_principal(
     assert reader.calls == [("tenant-a", 25)]
     assert "synthetic-forged" not in response.text
     assert "synthetic-forged" not in str(audit.events)
+class HostileQueueTimezone(tzinfo):
+    """A forged server-reader timezone must not execute when reading cases."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def utcoffset(self, dt: datetime | None) -> timedelta | None:
+        self.calls += 1
+        raise AssertionError("injected queue clock callback executed")
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return timedelta(0)
+
+
+@pytest.mark.parametrize("clock_location", ["snapshot", "history"])
+def test_case_queue_rejects_callback_clock_before_any_custom_code(
+    wired_queue, clock_location: str,
+) -> None:
+    client, reader, audit = wired_queue
+    hostile = HostileQueueTimezone()
+    bad_clock = datetime.now(UTC).replace(tzinfo=hostile)
+
+    def tainted(snapshot: CaseQueueSnapshot) -> CaseQueueSnapshot:
+        if clock_location == "snapshot":
+            return replace(snapshot, generated_at=bad_clock)
+        row = snapshot.items[0]
+        bad_row = replace(row, history=(
+            replace(row.history[0], recorded_at=bad_clock),
+        ))
+        return replace(snapshot, items=(bad_row,))
+
+    reader.change = tainted
+    response = client.get(endpoint(), headers=bearer())
+    assert response.status_code == 503
+    assert response.json() == {"detail": "case queue unavailable"}
+    assert hostile.calls == 0
+    assert reader.calls == [("tenant-a", 25)]
+    assert [entry.result for entry in audit.events
+            if entry.action == Capability.CASE_READ.value] == ["authorized", "failed"]
+    assert "injected queue clock" not in response.text
+
+
+@pytest.mark.parametrize("zone", [
+    timezone(timedelta(hours=-4)),
+    ZoneInfo("America/New_York"),
+])
+def test_case_queue_accepts_standard_offset_and_zoneinfo_clocks(
+    wired_queue, zone: tzinfo,
+) -> None:
+    client, reader, _ = wired_queue
+
+    def converted(snapshot: CaseQueueSnapshot) -> CaseQueueSnapshot:
+        row = snapshot.items[0]
+        local_event = replace(
+            row.history[0], recorded_at=row.history[0].recorded_at.astimezone(zone),
+        )
+        return replace(
+            snapshot, generated_at=snapshot.generated_at.astimezone(zone),
+            items=(replace(row, history=(local_event,)),),
+        )
+
+    reader.change = converted
+    response = client.get(endpoint(), headers=bearer())
+    assert response.status_code == 200, response.text
+    assert response.json()["bank_ranking_approved"] is False
+    assert response.json()["enforcement_activated"] is False
