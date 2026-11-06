@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from uuid import NAMESPACE_URL, uuid5
@@ -1226,6 +1227,90 @@ def test_custom_payload_mapping_hooks_cannot_change_scope_or_labels(hook: str) -
             "synthetic-correlation-secret",
         ):
             assert forbidden not in exported
+
+
+@pytest.mark.parametrize(
+    ("location", "claimed_class"),
+    [
+        ("top", Mapping),
+        ("top", dict),
+        ("nested", list),
+        ("nested", tuple),
+        ("nested", Mapping),
+        ("nested", Sequence),
+    ],
+)
+@pytest.mark.parametrize("raise_on_read", [False, True])
+def test_forged_payload_class_cannot_execute_before_quality_quarantine(
+    location: str, claimed_class: type[object], raise_on_read: bool,
+) -> None:
+    """Snapshot inspection must not call a caller's forged __class__ getter."""
+    valid = candidate(
+        "forged-payload-class",
+        label=True, confirmed_at=AT + timedelta(hours=2), alerted=True,
+    )
+    invalid = candidate(
+        "forged-payload-class",
+        label=True, confirmed_at=AT + timedelta(hours=2), alerted=True,
+    )
+    calls: list[str] = []
+
+    class ForgedClass:
+        @property
+        def __class__(self) -> type[object]:
+            calls.append("__class__")
+            object.__setattr__(invalid, "use_case", UseCase.UC03)
+            object.__setattr__(invalid, "confirmed_fraud", False)
+            object.__setattr__(invalid, "alerted", False)
+            if raise_on_read:
+                raise RuntimeError("forged class getter was executed")
+            return claimed_class
+
+    forged = ForgedClass()
+    payload: object
+    if location == "top":
+        payload = forged
+    else:
+        owned = dict(invalid.event.payload)
+        owned["untrusted_extra"] = forged
+        payload = owned
+    object.__setattr__(
+        invalid, "event", invalid.event.model_copy(update={"payload": payload})
+    )
+    baseline = result_for(valid)
+    for rows in ((invalid, valid), (valid, invalid)):
+        report = inspect_reference_quality(scope(), rows).to_dict()
+        uc01, uc02, uc03 = report["use_cases"]
+        assert (uc01["total"], uc01["accepted"], uc01["rejected"]) == (2, 1, 1)
+        reason = "invalid.payload" if location == "top" else "invalid.cohort_identity"
+        assert uc01["checks"][reason] == 1
+        assert "duplicate.event_id" not in uc01["checks"]
+        assert uc01["labels"] == baseline["labels"]
+        assert uc01["alerts"] == baseline["alerts"]
+        assert uc01["optional_signals"] == baseline["optional_signals"]
+        assert uc02["total"] == uc03["total"] == 0
+        assert calls == []
+        serialized = json.dumps(report, allow_nan=False)
+        assert "synthetic-customer-secret" not in serialized
+        assert report["bank_data_verified"] is False
+        assert report["enforcement_activated"] is False
+
+
+def test_forged_event_class_is_rejected_without_running_property() -> None:
+    """The top-level event type gate must not invoke __class__ either."""
+    bad = candidate("forged-event-class")
+    calls: list[str] = []
+
+    class ForgedEvent:
+        @property
+        def __class__(self) -> type[InboundBankEvent]:
+            calls.append("__class__")
+            return InboundBankEvent
+
+    object.__setattr__(bad, "event", ForgedEvent())
+    with pytest.raises(ValueError, match="invalid quality observation type"):
+        inspect_reference_quality(scope(), (bad,))
+    assert calls == []
 
 
 def test_nested_payload_alias_rewrite_after_validation_cannot_change_identity() -> None:

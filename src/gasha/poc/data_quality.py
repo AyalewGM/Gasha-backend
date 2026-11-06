@@ -15,6 +15,7 @@ from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from math import isfinite
 from types import MappingProxyType
+from typing import cast
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -485,15 +486,20 @@ def _owned_value(value: object, *, depth: int = 0, remaining: list[int]) -> obje
             key: _owned_value(item, depth=depth + 1, remaining=remaining)
             for key, item in value.items()
         }
-    if isinstance(value, (list, tuple)) and type(value) in (list, tuple):
-        if len(value) > 1024:
+    if type(value) in (list, tuple):
+        # The preceding exact-class gate makes this cast safe; unlike an
+        # isinstance check, it never probes a forged __class__ descriptor.
+        items = cast(list[object] | tuple[object, ...], value)
+        if len(items) > 1024:
             raise _SnapshotFailure("invalid.snapshot")
         copied = (
             _owned_value(item, depth=depth + 1, remaining=remaining)
-            for item in value
+            for item in items
         )
         return tuple(copied) if type(value) is tuple else list(copied)
-    if isinstance(value, (Mapping, Sequence)):
+    # ABC checks on the actual class cannot execute an instance's forged
+    # __class__ property. The earlier isinstance checks could invoke it.
+    if issubclass(type(value), (Mapping, Sequence)):
         raise _SnapshotFailure("invalid.snapshot")
     raise _SnapshotFailure("invalid.cohort_identity")
 
@@ -529,7 +535,8 @@ def _owned_observation(observation: QualityObservation) -> _OwnedObservation:
     safe_source = source if type(source) is str else None
     if type(original_payload) is dict:
         payload: object = _owned_value(original_payload, remaining=[4096])
-    elif isinstance(original_payload, Mapping):
+    elif issubclass(type(original_payload), Mapping):
+        # Do not consult an opaque payload's forged __class__ descriptor.
         raise _SnapshotFailure("invalid.snapshot")
     else:
         # Preserve existing invalid.payload / required-field diagnostics for
@@ -628,7 +635,7 @@ def inspect_reference_quality(
             raise ValueError("expected validated QualityObservation")
         if (
             type(observation.use_case) is not UseCase
-            or not isinstance(observation.event, InboundBankEvent)
+            or type(observation.event) is not InboundBankEvent
         ):
             raise ValueError("invalid quality observation type")
         # All validation, deduplication and accounting consume one detached
