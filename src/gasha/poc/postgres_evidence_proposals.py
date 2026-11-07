@@ -8,11 +8,12 @@ or use its events as authority for enforcement or stage promotion.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from hashlib import sha256
 from json import dumps
 from re import fullmatch
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from gasha.poc.evidence_identity import EvidenceIdentityRejected, EvidencePacket
 from gasha.poc.evidence_lifecycle import (
@@ -163,11 +164,23 @@ class PostgresEvidenceProposalLedger:
             or packet.binding.installation_id != self._installation_id
         ):
             raise EvidenceLedgerRejected("configured installation scope mismatch")
-        if not isinstance(now, datetime) or now.utcoffset() is None:
+        # Concrete type checks must precede callback-capable datetime operations.
+        # A forged __class__ can fool isinstance(); custom tzinfo hooks can run
+        # during utcoffset()/astimezone() before any SQL or authorization.
+        if type(now) is not datetime or type(now.tzinfo) not in (timezone, ZoneInfo):
+            raise EvidenceLedgerRejected("trusted timezone-aware clock required")
+        if now.utcoffset() is None:
             raise EvidenceLedgerRejected("trusted timezone-aware clock required")
         if type(expected_revision) is not int or expected_revision < 0:
             raise EvidenceLedgerRejected("nonnegative expected revision required")
-        if principal.expires_at.astimezone(UTC) <= now.astimezone(UTC):
+        # A frozen principal can still be corrupted by in-process adapters.
+        # Reject mutated expiry clocks before converting or reading artifacts.
+        expiry = principal.expires_at
+        if type(expiry) is not datetime or type(expiry.tzinfo) not in (timezone, ZoneInfo):
+            raise EvidenceLedgerRejected("invalid credential expiry")
+        if expiry.utcoffset() is None:
+            raise EvidenceLedgerRejected("invalid credential expiry")
+        if expiry.astimezone(UTC) <= now.astimezone(UTC):
             raise EvidenceLedgerRejected("expired principal")
         # Check tenant and action BEFORE touching a packet row or artifact reader.
         authorize(
