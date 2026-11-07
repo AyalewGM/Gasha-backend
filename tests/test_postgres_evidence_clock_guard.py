@@ -6,6 +6,7 @@ deployment or enforcement authority is installed by this test.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from typing import ClassVar
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -94,7 +95,7 @@ class HostileZone(tzinfo):
 
 
 class HostileDatetime(datetime):
-    callbacks: list[str] = []
+    callbacks: ClassVar[list[str]] = []
 
     def utcoffset(self) -> timedelta:
         self.callbacks.append("offset")
