@@ -223,7 +223,11 @@ def test_one_session_reads_matching_queue_and_immutable_history_with_durable_aud
     assert [row["result"] for row in rows if row["action"] == "case.read"] == [
         "authorized", "succeeded",
     ] * 4
-    assert len({row["attempt_ref"] for row in rows}) == 4
+    # The case fixture also writes two separate atomic case.create audit rows.
+    # Four HTTP requests must each use one fresh attempt ID across their events.
+    read_attempts = {row["attempt_ref"] for row in rows if row["action"] == "case.read"}
+    assert len(read_attempts) == 4
+    assert len({row["attempt_ref"] for row in rows}) == 6
     assert all(len(row["attempt_ref"]) == 32 for row in rows)
     assert all(row["tenant_ref"] in {tenant_audit_ref(""), *map(tenant_audit_ref, TENANTS)}
                for row in rows)
@@ -288,4 +292,6 @@ def test_durable_audit_failure_blocks_both_readers_before_database(lab):
         assert response.json() == {"detail": "security audit unavailable"}
     assert factory.calls == 0
     assert ranking.calls == 0
-    assert events(schema) == []
+    # Only the two durable case.create fixture audits may remain; a rejected
+    # HTTP request must not append an authentication or case-read event.
+    assert [row["action"] for row in events(schema)] == ["case.create"] * 2
