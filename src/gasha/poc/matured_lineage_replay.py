@@ -31,7 +31,9 @@ from gasha.poc.temporal_lineage import (
 
 _TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
-REPORT_VERSION = "synthetic-matured-lineage-replay-v1"
+# v2 adds F1/FNR fields to the serialized synthetic report. Bind the schema
+# version into evaluation_digest so older v1 evidence is never conflated.
+REPORT_VERSION = "synthetic-matured-lineage-replay-v2"
 EVALUATION_VERSION = "synthetic-matured-lineage-evaluation-v1"
 SCORER_VERSION = "decision-service-max-signal-v1"
 COHORT_DIGEST_VERSION = "synthetic-matured-lineage-cohort-input-v2"
@@ -186,6 +188,17 @@ class OfflineLineageReplayResult:
             "false_positive_rate": _rate(
                 metrics.false_positives,
                 metrics.false_positives + metrics.true_negatives, "no_labeled_negatives",
+            ),
+            # F1 and FNR consume only matured, labelled confusion populations.
+            # No positives / alerts is undefined, never a fabricated perfect score.
+            "f1": _rate(
+                2 * metrics.true_positives,
+                2 * metrics.true_positives + metrics.false_positives + metrics.false_negatives,
+                "no_positive_labels_or_alerts",
+            ),
+            "false_negative_rate": _rate(
+                metrics.false_negatives,
+                metrics.true_positives + metrics.false_negatives, "no_labeled_positives",
             ),
             "bank_data_verified": False,
             "bank_kpi_approved": False,
