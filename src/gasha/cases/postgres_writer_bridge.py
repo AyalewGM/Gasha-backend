@@ -11,10 +11,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from re import fullmatch
 from typing import Protocol
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from gasha.api.main import CaseTransitionInput
 from gasha.cases.postgres_timeline import PostgresCaseTimelineService
@@ -131,6 +132,9 @@ class ExplicitPostgresCaseTransitionWriter:
             or type(case_id) is not UUID
             or type(proposal) is not CaseTransitionInput
             or type(at) is not datetime
+            # Validate timezone implementation before any callback-capable
+            # utcoffset(); an installed clock provider is not a trust boundary.
+            or type(at.tzinfo) not in (timezone, ZoneInfo)
             or at.utcoffset() is None
         ):
             raise CaseRejected("typed protected case transition required")
