@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -340,10 +341,9 @@ def test_authorized_tenant_history_foreign_case_is_not_found_and_redacted(lab):
     assert read_events[2]["attempt_ref"] == read_events[3]["attempt_ref"]
     assert read_events[0]["attempt_ref"] != read_events[2]["attempt_ref"]
     assert all(row["tenant_ref"] == tenant_audit_ref(first) for row in read_events)
-    from hashlib import sha256
     for pair, case_id in ((read_events[:2], foreign_case),
                           (read_events[2:], unknown_case)):
-        expected_ref = sha256(f"{first}\\0{case_id}".encode()).hexdigest()
+        expected_ref = sha256((first + chr(0) + str(case_id)).encode()).hexdigest()
         assert all(row["event_ref"] == expected_ref for row in pair)
     redacted = str(added)
     for secret in (
