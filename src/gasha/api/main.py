@@ -437,7 +437,20 @@ def _require_action(
             request, capability.value, "denied", principal.audit_actor, tenant_id,
             "authorization_denied", event_id=event_id,
         )
-        status = 404 if tenant_id not in principal.tenant_ids else 403
+        # authorize() rejects corrupted or subclassed tenant containers before
+        # membership. Its denial handler must not re-enter those callbacks.
+        # Keep 404 concealment only for a validated concrete tenant scope;
+        # malformed principal scopes receive the uniform 403 denial.
+        scopes = getattr(principal, "tenant_ids", None)
+        status = (
+            404 if (
+                type(tenant_id) is str
+                and type(scopes) is frozenset
+                and bool(scopes)
+                and all(type(scope) is str and bool(scope.strip()) for scope in scopes)
+                and tenant_id not in scopes
+            ) else 403
+        )
         raise HTTPException(status_code=status, detail="not authorized") from exc
     _audit(
         request, capability.value, "authorized", principal.audit_actor, tenant_id,
