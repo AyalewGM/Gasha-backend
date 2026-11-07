@@ -195,7 +195,7 @@ def events(schema: str):
         ).fetchall()
 
 
-def test_one_session_reads_matching_queue_and_immutable_history_with_durable_audit(lab):
+def test_same_fictional_bearer_reads_queue_history_with_durable_audit(lab):
     schema, refs, _, ranking, factory, _, client = lab
     for tenant in TENANTS:
         queue_response = client.get(queue(tenant), headers=auth(tenant))
