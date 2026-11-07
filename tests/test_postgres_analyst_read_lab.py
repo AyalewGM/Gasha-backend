@@ -295,3 +295,59 @@ def test_durable_audit_failure_blocks_both_readers_before_database(lab):
     # Only the two durable case.create fixture audits may remain; a rejected
     # HTTP request must not append an authentication or case-read event.
     assert [row["action"] for row in events(schema)] == ["case.create"] * 2
+
+
+def test_authorized_tenant_history_foreign_case_is_not_found_and_redacted(lab):
+    """An A-authorized history lookup must not enumerate B's real stored case.
+
+    Unlike an A-bearer/B-route denial, this reaches the tenant-qualified SQL
+    reader and its durable audit after successful tenant A authorization.
+    """
+    schema, refs, _, _, factory, _, client = lab
+    first, second = TENANTS
+    foreign_case = refs[second].case_id
+    unknown_case = uuid4()
+    before = len(events(schema))
+
+    foreign = client.get(history(first, foreign_case), headers=auth(first))
+    unknown = client.get(history(first, unknown_case), headers=auth(first))
+    for response in (foreign, unknown):
+        assert response.status_code == 404
+        assert response.json() == {"detail": "case not found"}
+        assert "events" not in response.text
+        exposed = response.text + str(dict(response.headers))
+        for secret in (
+            first, second, str(foreign_case), str(refs[second].source_event_id),
+            SOURCE_CONTEXT, "test-only-not-a-bank-credential",
+        ):
+            assert secret not in exposed
+    assert dict(foreign.headers) == dict(unknown.headers)
+    # Both requests reached the actual PostgreSQL history reader, not just
+    # the authorization middleware, and neither returned a foreign row.
+    assert factory.calls == 2
+
+    added = events(schema)[before:]
+    read_events = [row for row in added if row["action"] == "case.read"]
+    assert [row["result"] for row in read_events] == [
+        "authorized", "not_found", "authorized", "not_found",
+    ]
+    assert [row["reason"] for row in read_events] == [
+        "allowed", "case_not_found", "allowed", "case_not_found",
+    ]
+    assert not any(row["result"] == "succeeded" for row in read_events)
+    # Each authorized→not_found pair has a stable, distinct server attempt ID.
+    assert read_events[0]["attempt_ref"] == read_events[1]["attempt_ref"]
+    assert read_events[2]["attempt_ref"] == read_events[3]["attempt_ref"]
+    assert read_events[0]["attempt_ref"] != read_events[2]["attempt_ref"]
+    assert all(row["tenant_ref"] == tenant_audit_ref(first) for row in read_events)
+    from hashlib import sha256
+    for pair, case_id in ((read_events[:2], foreign_case),
+                          (read_events[2:], unknown_case)):
+        expected_ref = sha256(f"{first}\\0{case_id}".encode()).hexdigest()
+        assert all(row["event_ref"] == expected_ref for row in pair)
+    redacted = str(added)
+    for secret in (
+        first, second, str(foreign_case), str(refs[second].source_event_id),
+        SOURCE_CONTEXT, "test-only-not-a-bank-credential",
+    ):
+        assert secret not in redacted
