@@ -168,8 +168,11 @@ def _inspect(scope: DataQualityScope, observation: _OwnedObservation) -> _Result
     if observation.alerted is not None and type(observation.alerted) is not bool:
         codes.add("invalid.alerted")
     confirmed_at = observation.confirmed_at
+    # The detached snapshot may retain a malformed non-datetime value to
+    # report its quality code. Avoid isinstance here: a forged __class__ getter
+    # can claim datetime and execute callbacks before the row is quarantined.
     if confirmed_at is not None and (
-        not isinstance(confirmed_at, datetime) or confirmed_at.utcoffset() is None
+        type(confirmed_at) is not datetime or confirmed_at.tzinfo is None
     ):
         codes.add("invalid.confirmed_at")
     # Normal construction validates a mapping, but Pydantic model_copy(update=...)
@@ -211,7 +214,7 @@ def _inspect(scope: DataQualityScope, observation: _OwnedObservation) -> _Result
     # InboundBankEvent normally validates this field, but Pydantic model_copy
     # can carry an unvalidated runtime value from a synthetic adapter. Treat
     # it as a quarantined bad clock rather than aborting the entire report.
-    if not isinstance(received, datetime) or received.utcoffset() is None:
+    if type(received) is not datetime or received.tzinfo is None:
         codes.add("invalid.received_at")
     elif occurred is not None:
         at = _utc(received)

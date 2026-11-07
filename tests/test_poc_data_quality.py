@@ -1525,3 +1525,60 @@ def test_scope_and_label_clocks_keep_builtin_timezone_and_dst_support() -> None:
     dst_scope = scope(window_start=dst_start, window_end=dst_end,
                       label_cutoff=dst_end + timedelta(days=1))
     assert dst_scope.window_start.utcoffset() != dst_scope.window_end.utcoffset()
+
+
+@pytest.mark.parametrize("clock_field", ["confirmed_at", "received_at"])
+def test_forged_clock_class_never_executes_getter_or_utcoffset(
+    clock_field: str,
+) -> None:
+    """A model-copy bypass must not run a fake datetime's __class__ getter.
+
+    Python's isinstance(instance, datetime) may query a forged __class__
+    descriptor even when the concrete class is unrelated to datetime.
+    """
+    valid = candidate(
+        "clock-class-forgery", label=True, confirmed_at=AT + timedelta(hours=2),
+        alerted=True,
+    )
+    damaged = candidate(
+        "clock-class-forgery", label=True, confirmed_at=AT + timedelta(hours=2),
+        alerted=True,
+    )
+    callbacks: list[str] = []
+
+    class ForgedClock:
+        @property
+        def __class__(self) -> type[object]:
+            callbacks.append("__class__")
+            object.__setattr__(damaged, "use_case", UseCase.UC02)
+            raise RuntimeError("forged class getter invoked")
+
+        def utcoffset(self) -> timedelta:
+            callbacks.append("utcoffset")
+            raise RuntimeError("forged clock method invoked")
+
+    fake = ForgedClock()
+    if clock_field == "confirmed_at":
+        object.__setattr__(damaged, "confirmed_at", fake)
+        code = "invalid.confirmed_at"
+    else:
+        object.__setattr__(
+            damaged, "event", damaged.event.model_copy(update={"received_at": fake})
+        )
+        code = "invalid.received_at"
+
+    baseline = result_for(valid)
+    for rows in ((damaged, valid), (valid, damaged)):
+        report = inspect_reference_quality(scope(), rows).to_dict()
+        uc01, uc02, uc03 = report["use_cases"]
+        assert (uc01["total"], uc01["accepted"], uc01["rejected"]) == (2, 1, 1)
+        assert uc01["checks"] == {code: 1}
+        assert uc01["labels"] == baseline["labels"]
+        assert uc01["alerts"] == baseline["alerts"]
+        assert uc01["optional_signals"] == baseline["optional_signals"]
+        assert uc02["total"] == uc03["total"] == 0
+        assert callbacks == []
+        assert report["bank_data_verified"] is False
+        assert report["readiness_authorized"] is False
+        assert report["enforcement_activated"] is False
+        assert "synthetic-customer-secret" not in json.dumps(report, allow_nan=False)
