@@ -14,7 +14,6 @@ from gasha.poc.scenario_coverage_batch import (
     ScenarioBatchScope,
     inspect_scenario_coverage_batch,
 )
-
 from gasha.poc.scenario_observations import (
     SCENARIO_FIELDS,
     SCENARIO_MAPPING_VERSION,
