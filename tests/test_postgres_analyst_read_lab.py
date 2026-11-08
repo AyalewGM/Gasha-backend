@@ -351,3 +351,106 @@ def test_authorized_tenant_history_foreign_case_is_not_found_and_redacted(lab):
         SOURCE_CONTEXT, "test-only-not-a-bank-credential",
     ):
         assert secret not in redacted
+
+
+def test_rotated_credential_epoch_and_changed_grants_reauthorize_both_readers(lab):
+    """A reused HTTP client does not preserve the previous verifier's grants.
+
+    Test-only stand-in for the host/session contract under #45. This exercises
+    the protected HTTP readers on real PostgreSQL; it cannot establish browser
+    DOM invalidation, Bank credential epochs, IdP setup, or proxy acceptance.
+    """
+    schema, refs, _, ranking, factory, _, client = lab
+    first, second = TENANTS
+    old_token = "fictional-epoch-one"
+    new_token = "fictional-epoch-two"
+
+    class RotatingVerifier:
+        def __init__(self) -> None:
+            self.active = old_token
+            self.scope = first
+            self.can_read = True
+            self.outage = False
+            self.calls = 0
+
+        def verify(self, bearer: str) -> TrustedPrincipal:
+            self.calls += 1
+            if self.outage:
+                raise RuntimeError("test-only verifier outage")
+            if bearer != self.active:
+                raise CredentialRejected("test-only epoch revoked")
+            return TrustedPrincipal(
+                issuer="test-only-provider",
+                subject="fictional-stable-session-analyst",
+                credential_ref=self.active,
+                tenant_ids=frozenset({self.scope}),
+                capabilities=frozenset({
+                    Capability.CASE_READ if self.can_read else Capability.CASE_TRIAGE
+                }),
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+
+    verifier = RotatingVerifier()
+    app.state.identity_verifier = verifier
+
+    def request(path: str, token: str, status: int):
+        response = client.get(path, headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == status, response.text
+        if status != 200:
+            assert "items" not in response.text
+            assert "events" not in response.text
+        return response
+
+    # Both reads initially work with the first session credential.
+    queue_a = request(queue(first), old_token, 200).json()
+    assert queue_a["items"][0]["case_id"] == str(refs[first].case_id)
+    history_a = request(history(first, refs[first].case_id), old_token, 200).json()
+    assert history_a["case_id"] == queue_a["items"][0]["case_id"]
+
+    # A credential rotation revokes old bearer authority on *each* HTTP call,
+    # even though the TestClient, API and installed reader objects are reused.
+    verifier.active = new_token
+    request(queue(first), old_token, 401)
+    request(history(first, refs[first].case_id), old_token, 401)
+    request(history(first, refs[first].case_id), new_token, 200)
+
+    # Grant loss is evaluated afresh by the server, not a stale UI role flag.
+    verifier.can_read = False
+    request(queue(first), new_token, 403)
+    request(history(first, refs[first].case_id), new_token, 403)
+
+    # Tenant scope change prevents old-tenant queue/history disclosure, while
+    # separately authorized fresh reads can access only the new tenant.
+    verifier.can_read = True
+    verifier.scope = second
+    request(queue(first), new_token, 404)
+    request(history(first, refs[first].case_id), new_token, 404)
+    queue_b = request(queue(second), new_token, 200).json()
+    assert queue_b["items"][0]["case_id"] == str(refs[second].case_id)
+    request(history(second, refs[second].case_id), new_token, 200)
+
+    verifier.outage = True
+    request(queue(second), new_token, 503)
+    request(history(second, refs[second].case_id), new_token, 503)
+
+    # Exactly the five successful reads may reach PostgreSQL; denials never
+    # run the ranking selector or the case DB connection factory.
+    assert verifier.calls == 13
+    assert factory.calls == 5
+    assert ranking.calls == 2
+    rows = events(schema)
+    read_events = [row for row in rows if row["action"] == "case.read"]
+    assert [row["result"] for row in read_events].count("succeeded") == 5
+    assert [row["result"] for row in read_events].count("authorized") == 5
+    assert len({
+        row["actor_ref"] for row in read_events if row["result"] == "succeeded"
+    }) == 1  # Subject attribution survives credential rotation.
+    assert not any(
+        token in str(rows) for token in (old_token, new_token, first, second)
+    )
+    assert not any(
+        row["result"] == "succeeded" and row["tenant_ref"] not in {
+            tenant_audit_ref(first), tenant_audit_ref(second),
+        }
+        for row in read_events
+    )
