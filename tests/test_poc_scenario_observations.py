@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import pytest
+
+from gasha.poc.scenario_coverage_batch import (
+    ScenarioBatchScope,
+    inspect_scenario_coverage_batch,
+)
 
 from gasha.poc.scenario_observations import (
     SCENARIO_FIELDS,
@@ -364,3 +369,124 @@ def test_mm01_optional_relationship_survives_reconciliation_and_digest_checks() 
         with_relationship.fingerprint()
     with pytest.raises(ScenarioContractError, match="post-cutoff"):
         inspect(with_relationship)
+
+
+def _clock_with_hostile_callback(
+    kind: str, callbacks: list[str],
+) -> object:
+    """Construct clocks without invoking their callbacks during setup."""
+    if kind == "forged_class":
+        class ForgedClock:
+            @property
+            def __class__(self) -> type[datetime]:
+                callbacks.append("class_getter")
+                return datetime
+
+            def utcoffset(self) -> timedelta:
+                callbacks.append("offset")
+                return timedelta(0)
+
+        return ForgedClock()
+    if kind == "custom_timezone":
+        class HostileTimezone(tzinfo):
+            def utcoffset(self, dt: datetime | None) -> timedelta:
+                callbacks.append("offset")
+                return timedelta(0)
+
+            def dst(self, dt: datetime | None) -> timedelta:
+                return timedelta(0)
+
+            def tzname(self, dt: datetime | None) -> str:
+                return "hostile"
+
+        return datetime(2026, 11, 7, 12, tzinfo=HostileTimezone())
+    if kind == "datetime_subclass":
+        class HostileDatetime(datetime):
+            def utcoffset(self) -> timedelta:
+                callbacks.append("offset")
+                return timedelta(0)
+
+        return HostileDatetime(2026, 11, 7, 12, tzinfo=UTC)
+    raise AssertionError(kind)
+
+
+def _scenario_batch_scope() -> ScenarioBatchScope:
+    return ScenarioBatchScope(
+        installation_ref="synthetic-install", tenant_ref="synthetic-tenant",
+        dataset_digest=DIGEST, source_schema_version="1", mapping_version="1",
+        configuration_version="1", window_start=AT, window_end=AT,
+        report_as_of=AT,
+    )
+
+
+@pytest.mark.parametrize("kind", [
+    "forged_class", "custom_timezone", "datetime_subclass",
+])
+@pytest.mark.parametrize("boundary", [
+    "field.observed_at", "field.available_at",
+    "packet.occurred_at", "packet.received_at", "packet.decision_cutoff",
+    "batch.window_start", "batch.window_end", "batch.report_as_of",
+])
+def test_synthetic_scenario_clocks_reject_callbacks_before_invocation(
+    kind: str, boundary: str,
+) -> None:
+    """All eight timestamp inputs fail closed without running hostile code."""
+    callbacks: list[str] = []
+    hostile = _clock_with_hostile_callback(kind, callbacks)
+    target, attribute = boundary.split(".")
+    with pytest.raises(ScenarioContractError, match="timezone-aware"):
+        if target == "field":
+            replace(measured("payment_amount"), **{attribute: hostile})
+        elif target == "packet":
+            replace(observation(ScenarioId.APP_01), **{attribute: hostile})
+        else:
+            replace(_scenario_batch_scope(), **{attribute: hostile})
+    assert callbacks == []
+
+
+@pytest.mark.parametrize("kind", [
+    "forged_class", "custom_timezone", "datetime_subclass",
+])
+@pytest.mark.parametrize("consumer", [
+    "fingerprint", "single_coverage", "batch_coverage",
+])
+def test_mutated_synthetic_field_revalidation_runs_no_clock_callbacks(
+    kind: str, consumer: str,
+) -> None:
+    """An unchecked frozen-dataclass mutation must not trigger a clock hook."""
+    callbacks: list[str] = []
+    row = observation(ScenarioId.MM_02)
+    object.__setattr__(
+        row.fields[0], "available_at", _clock_with_hostile_callback(kind, callbacks),
+    )
+    with pytest.raises(ScenarioContractError, match="timezone-aware"):
+        if consumer == "fingerprint":
+            row.fingerprint()
+        elif consumer == "single_coverage":
+            inspect(row)
+        else:
+            inspect_scenario_coverage_batch(_scenario_batch_scope(), (row,))
+    assert callbacks == []
+
+
+def test_synthetic_clock_guard_retains_utc_fixed_offset_and_zoneinfo() -> None:
+    """Clock hardening does not change canonical timestamps or evidence digests."""
+    original = observation(ScenarioId.ATO_02)
+    offset = timezone(timedelta(hours=-5))
+    ny = ZoneInfo("America/New_York")
+    for zone in (UTC, offset, ny):
+        changed = replace(
+            original,
+            occurred_at=AT.astimezone(zone),
+            received_at=AT.astimezone(zone),
+            decision_cutoff=AT.astimezone(zone),
+            fields=tuple(replace(
+                field, observed_at=AT.astimezone(zone),
+                available_at=AT.astimezone(zone),
+            ) for field in original.fields),
+        )
+        assert changed.fingerprint() == original.fingerprint()
+        assert inspect(changed)["status"] == "synthetic_coverage_only"
+        assert inspect_scenario_coverage_batch(
+            _scenario_batch_scope(), (changed,),
+        ).to_dict()["unique_scenario_events"] == 1
