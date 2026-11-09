@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from datetime import UTC, datetime, timezone
 from enum import StrEnum
 from uuid import UUID
@@ -19,6 +19,8 @@ _VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _SCENARIOS = frozenset({"ATO-02", "MM-01", "MM-02"})
 _CURRENCY = re.compile(r"[A-Z]{3}\Z")
+_BUNDLE_FACTORY_KEY = object()  # In-process constructor guard, not Bank attestation.
+_MAX_CANONICAL_CHARS = 1_000_000
 
 
 class DeviceFlowRejected(ValueError):
@@ -82,14 +84,20 @@ class DeviceFlowEvidenceBundleV1:
 
     _canonical_json: str
     digest: str
+    _construction_key: InitVar[object | None] = None
 
-    def __post_init__(self) -> None:
-        # A frozen dataclass still has a public constructor and replace() path.
-        # Validate both before allowing any purported evidence to be consumed.
+    def __post_init__(self, _construction_key: object | None) -> None:
+        # A digest proves deterministic identity, not trusted provenance.
+        # Normal construction and dataclasses.replace() cannot turn caller-
+        # selected JSON (even correctly hashed) into a synthetic bundle.
+        if _construction_key is not _BUNDLE_FACTORY_KEY:
+            raise DeviceFlowRejected("synthetic bundle requires module-controlled builder")
         if type(self._canonical_json) is not str or type(self.digest) is not str:
             raise DeviceFlowRejected("typed canonical bundle and fingerprint required")
         if _DIGEST.fullmatch(self.digest) is None:
             raise DeviceFlowRejected("invalid bundle fingerprint")
+        if len(self._canonical_json) > _MAX_CANONICAL_CHARS:
+            raise DeviceFlowRejected("oversized canonical bundle JSON")
         try:
             payload: dict[str, object] = json.loads(self._canonical_json)
             if type(payload) is not dict:
@@ -97,7 +105,7 @@ class DeviceFlowEvidenceBundleV1:
             canonical = json.dumps(
                 payload, sort_keys=True, separators=(",", ":"), allow_nan=False
             )
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, RecursionError) as exc:
             raise DeviceFlowRejected("invalid canonical bundle JSON") from exc
         if canonical != self._canonical_json or "digest" in payload:
             raise DeviceFlowRejected("noncanonical bundle JSON")
@@ -286,5 +294,7 @@ def build_device_flow_bundle_v1(
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return DeviceFlowEvidenceBundleV1(
-        _canonical_json=serialized, digest=hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        _canonical_json=serialized,
+        digest=hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        _construction_key=_BUNDLE_FACTORY_KEY,
     )

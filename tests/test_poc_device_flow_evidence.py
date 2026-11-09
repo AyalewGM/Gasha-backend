@@ -241,11 +241,11 @@ def test_bundle_constructor_and_replace_reject_mismatched_fingerprint() -> None:
     altered.pop("digest")
     altered["enforcement_activated"] = True
     forged_json = json.dumps(altered, sort_keys=True, separators=(",", ":"))
-    with pytest.raises(DeviceFlowRejected, match="fingerprint mismatch"):
+    with pytest.raises(DeviceFlowRejected, match="module-controlled builder"):
         replace(original, _canonical_json=forged_json)
-    with pytest.raises(DeviceFlowRejected, match="fingerprint mismatch"):
+    with pytest.raises(DeviceFlowRejected, match="module-controlled builder"):
         DeviceFlowEvidenceBundleV1(forged_json, original.digest)
-    with pytest.raises(DeviceFlowRejected, match="invalid bundle fingerprint"):
+    with pytest.raises(DeviceFlowRejected, match="module-controlled builder"):
         replace(original, digest="not-a-digest")
 
 
@@ -268,9 +268,9 @@ def test_bundle_rejects_forged_safety_claim_even_with_matching_digest(
     altered[field] = forged_value
     forged_json = json.dumps(altered, sort_keys=True, separators=(",", ":"))
     forged_digest = hashlib.sha256(forged_json.encode("utf-8")).hexdigest()
-    with pytest.raises(DeviceFlowRejected, match="non-authoritative bundle claims"):
+    with pytest.raises(DeviceFlowRejected, match="module-controlled builder"):
         DeviceFlowEvidenceBundleV1(forged_json, forged_digest)
-    with pytest.raises(DeviceFlowRejected, match="non-authoritative bundle claims"):
+    with pytest.raises(DeviceFlowRejected, match="module-controlled builder"):
         replace(original, _canonical_json=forged_json, digest=forged_digest)
 
 
@@ -289,14 +289,14 @@ def test_noncanonical_or_reserved_digest_field_rejected() -> None:
     payload = original.to_dict()
     payload.pop("digest")
     noncanonical = json.dumps(payload, sort_keys=True, indent=2)
-    with pytest.raises(DeviceFlowRejected, match="noncanonical"):
+    with pytest.raises(DeviceFlowRejected, match="module-controlled builder"):
         replace(
             original, _canonical_json=noncanonical,
             digest=hashlib.sha256(noncanonical.encode("utf-8")).hexdigest(),
         )
     payload["digest"] = original.digest
     reserved = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    with pytest.raises(DeviceFlowRejected, match="noncanonical"):
+    with pytest.raises(DeviceFlowRejected, match="module-controlled builder"):
         DeviceFlowEvidenceBundleV1(
             reserved, hashlib.sha256(reserved.encode("utf-8")).hexdigest()
         )
@@ -306,10 +306,68 @@ def test_valid_fixed_canonical_bundle_replay_remains_identical() -> None:
     credit = obs(11, ObservationKind.CREDIT, 10)
     debit = obs(12, ObservationKind.DEBIT, 12)
     original = build(credit, debit)
-    recreated = DeviceFlowEvidenceBundleV1(original._canonical_json, original.digest)
-    assert replace(original) == original == recreated
-    assert recreated.to_dict() == original.to_dict()
-    assert build(debit, credit).digest == recreated.digest
-    altered_copy = recreated.to_dict()
+    replayed = build(debit, credit)
+    assert replayed == original
+    assert replayed.to_dict() == original.to_dict()
+    with pytest.raises(DeviceFlowRejected, match="module-controlled builder"):
+        DeviceFlowEvidenceBundleV1(original._canonical_json, original.digest)
+    with pytest.raises(DeviceFlowRejected, match="module-controlled builder"):
+        replace(original)
+    altered_copy = replayed.to_dict()
     altered_copy["enforcement_activated"] = True
-    assert recreated.to_dict()["enforcement_activated"] is False
+    assert replayed.to_dict()["enforcement_activated"] is False
+
+
+@pytest.mark.parametrize("attack", [
+    "bank_approved", "authority", "risk_score", "missing_tenant",
+    "missing_provenance", "missing_events", "changed_tenant",
+    "false_settled_count", "contradictory_events", "missing_signals",
+])
+def test_public_constructor_and_replace_reject_rehashed_forgery(attack: str) -> None:
+    """Even a rehashed invented payload cannot be a builder artifact."""
+    original = build(
+        obs(11, ObservationKind.CREDIT, 10),
+        obs(12, ObservationKind.DEBIT, 12),
+    )
+    payload = original.to_dict()
+    payload.pop("digest")
+    if attack == "bank_approved":
+        payload["bank_approved"] = True
+    elif attack == "authority":
+        payload["authority"] = "Bank"
+    elif attack == "risk_score":
+        payload["risk_score"] = 0.99
+    elif attack == "missing_tenant":
+        payload.pop("tenant_id")
+    elif attack == "missing_provenance":
+        payload.pop("dataset_digest")
+    elif attack == "missing_events":
+        payload.pop("events")
+    elif attack == "changed_tenant":
+        payload["tenant_id"] = "fictional-tenant-b"
+    elif attack == "false_settled_count":
+        payload["settled_inbound_count"] = 999
+    elif attack == "contradictory_events":
+        payload["events"] = []
+    elif attack == "missing_signals":
+        payload["missing_signals"] = []
+    forged_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    forged_digest = hashlib.sha256(forged_json.encode("utf-8")).hexdigest()
+    with pytest.raises(DeviceFlowRejected, match="module-controlled builder"):
+        DeviceFlowEvidenceBundleV1(forged_json, forged_digest)
+    with pytest.raises(DeviceFlowRejected, match="module-controlled builder"):
+        replace(original, _canonical_json=forged_json, digest=forged_digest)
+
+
+@pytest.mark.parametrize("payload", [
+    "[" * 3000 + "]" * 3000,
+    "[" * 1_000_001,
+])
+def test_untrusted_nested_or_oversized_bundle_cannot_escape_error_contract(
+    payload: str,
+) -> None:
+    fingerprint = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    with pytest.raises(DeviceFlowRejected):
+        DeviceFlowEvidenceBundleV1(payload, fingerprint)
+    with pytest.raises(DeviceFlowRejected):
+        replace(build(), _canonical_json=payload, digest=fingerprint)
