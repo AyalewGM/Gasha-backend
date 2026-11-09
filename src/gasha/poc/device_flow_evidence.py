@@ -80,12 +80,14 @@ class DeviceFlowObservationV1:
 class DeviceFlowEvidenceBundleV1:
     """Safe JSON projection with digest over the complete versioned payload."""
 
-    payload: dict[str, object]
+    _canonical_json: str
     digest: str
 
     def to_dict(self) -> dict[str, object]:
-        # Return a detached copy. No caller can mutate the retained result.
-        return json.loads(json.dumps({**self.payload, "digest": self.digest}))
+        # The retained artifact is immutable even when callers mutate a copy.
+        result: dict[str, object] = json.loads(self._canonical_json)
+        result["digest"] = self.digest
+        return result
 
 
 def _time(value: object) -> datetime:
@@ -136,8 +138,8 @@ def _row(
     if type(obs) is not DeviceFlowObservationV1:
         raise DeviceFlowRejected("typed observation required")
     if (
-        obs.tenant_id != scope.tenant_id
-        or not _token(obs.tenant_id)
+        not _token(obs.tenant_id)
+        or obs.tenant_id != scope.tenant_id
         or not _uuid(obs.account_ref) or obs.account_ref != scope.account_ref
         or not _uuid(obs.journey_ref) or obs.journey_ref != scope.journey_ref
         or not _uuid(obs.event_ref)
@@ -249,5 +251,5 @@ def build_device_flow_bundle_v1(
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return DeviceFlowEvidenceBundleV1(
-        payload=payload, digest=hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        _canonical_json=serialized, digest=hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     )
