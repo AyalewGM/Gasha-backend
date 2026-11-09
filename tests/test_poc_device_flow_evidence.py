@@ -1,6 +1,8 @@
 """Synthetic-only Issue #48 device-flow contract / point-in-time negatives."""
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from typing import Any
@@ -231,3 +233,83 @@ def test_malformed_scope_rejected_before_reading_events() -> None:
         build(s=scope(correlation_seconds=True))
     with pytest.raises(DeviceFlowRejected):
         build(s=scope(window_start=T + timedelta(days=2)))
+
+
+def test_bundle_constructor_and_replace_reject_mismatched_fingerprint() -> None:
+    original = build(obs(11, ObservationKind.CREDIT, 10))
+    altered = original.to_dict()
+    altered.pop("digest")
+    altered["enforcement_activated"] = True
+    forged_json = json.dumps(altered, sort_keys=True, separators=(",", ":"))
+    with pytest.raises(DeviceFlowRejected, match="fingerprint mismatch"):
+        replace(original, _canonical_json=forged_json)
+    with pytest.raises(DeviceFlowRejected, match="fingerprint mismatch"):
+        DeviceFlowEvidenceBundleV1(forged_json, original.digest)
+    with pytest.raises(DeviceFlowRejected, match="invalid bundle fingerprint"):
+        replace(original, digest="not-a-digest")
+
+
+@pytest.mark.parametrize(("field", "forged_value"), [
+    ("rank_change_authorized", True),
+    ("fraud_confirmed", "confirmed"),
+    ("enforcement_activated", True),
+    ("deception_inferred", True),
+    ("bank_execution", "executed"),
+    ("rank_components", ["fraud"]),
+    ("source", "bank_verified"),
+    ("schema_version", "DeviceFlowEvidenceBundleV2"),
+])
+def test_bundle_rejects_forged_safety_claim_even_with_matching_digest(
+    field: str, forged_value: object,
+) -> None:
+    original = build(obs(11, ObservationKind.CREDIT, 10))
+    altered = original.to_dict()
+    altered.pop("digest")
+    altered[field] = forged_value
+    forged_json = json.dumps(altered, sort_keys=True, separators=(",", ":"))
+    forged_digest = hashlib.sha256(forged_json.encode("utf-8")).hexdigest()
+    with pytest.raises(DeviceFlowRejected, match="non-authoritative bundle claims"):
+        DeviceFlowEvidenceBundleV1(forged_json, forged_digest)
+    with pytest.raises(DeviceFlowRejected, match="non-authoritative bundle claims"):
+        replace(original, _canonical_json=forged_json, digest=forged_digest)
+
+
+@pytest.mark.parametrize("bad_json", [
+    "", "[]", "{}", '{"test": NaN}', '{"test": Infinity}',
+    '{"schema_version": "DeviceFlowEvidenceBundleV1"}',
+])
+def test_malformed_or_incomplete_canonical_bundle_rejected(bad_json: str) -> None:
+    claimed_digest = hashlib.sha256(bad_json.encode("utf-8")).hexdigest()
+    with pytest.raises(DeviceFlowRejected):
+        DeviceFlowEvidenceBundleV1(bad_json, claimed_digest)
+
+
+def test_noncanonical_or_reserved_digest_field_rejected() -> None:
+    original = build(obs(11, ObservationKind.CREDIT, 10))
+    payload = original.to_dict()
+    payload.pop("digest")
+    noncanonical = json.dumps(payload, sort_keys=True, indent=2)
+    with pytest.raises(DeviceFlowRejected, match="noncanonical"):
+        replace(
+            original, _canonical_json=noncanonical,
+            digest=hashlib.sha256(noncanonical.encode("utf-8")).hexdigest(),
+        )
+    payload["digest"] = original.digest
+    reserved = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    with pytest.raises(DeviceFlowRejected, match="noncanonical"):
+        DeviceFlowEvidenceBundleV1(
+            reserved, hashlib.sha256(reserved.encode("utf-8")).hexdigest()
+        )
+
+
+def test_valid_fixed_canonical_bundle_replay_remains_identical() -> None:
+    credit = obs(11, ObservationKind.CREDIT, 10)
+    debit = obs(12, ObservationKind.DEBIT, 12)
+    original = build(credit, debit)
+    recreated = DeviceFlowEvidenceBundleV1(original._canonical_json, original.digest)
+    assert replace(original) == original == recreated
+    assert recreated.to_dict() == original.to_dict()
+    assert build(debit, credit).digest == recreated.digest
+    altered_copy = recreated.to_dict()
+    altered_copy["enforcement_activated"] = True
+    assert recreated.to_dict()["enforcement_activated"] is False

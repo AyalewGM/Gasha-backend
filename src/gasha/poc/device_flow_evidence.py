@@ -78,10 +78,45 @@ class DeviceFlowObservationV1:
 
 @dataclass(frozen=True, slots=True)
 class DeviceFlowEvidenceBundleV1:
-    """Safe JSON projection with digest over the complete versioned payload."""
+    """Deterministic synthetic fingerprint, never authenticated Bank attestation."""
 
     _canonical_json: str
     digest: str
+
+    def __post_init__(self) -> None:
+        # A frozen dataclass still has a public constructor and replace() path.
+        # Validate both before allowing any purported evidence to be consumed.
+        if type(self._canonical_json) is not str or type(self.digest) is not str:
+            raise DeviceFlowRejected("typed canonical bundle and fingerprint required")
+        if _DIGEST.fullmatch(self.digest) is None:
+            raise DeviceFlowRejected("invalid bundle fingerprint")
+        try:
+            payload: dict[str, object] = json.loads(self._canonical_json)
+            if type(payload) is not dict:
+                raise DeviceFlowRejected("canonical bundle must be an object")
+            canonical = json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
+        except (ValueError, TypeError) as exc:
+            raise DeviceFlowRejected("invalid canonical bundle JSON") from exc
+        if canonical != self._canonical_json or "digest" in payload:
+            raise DeviceFlowRejected("noncanonical bundle JSON")
+        actual_digest = hashlib.sha256(self._canonical_json.encode("utf-8")).hexdigest()
+        if actual_digest != self.digest:
+            raise DeviceFlowRejected("bundle fingerprint mismatch")
+        # These are mandatory non-authoritative labels, not caller-settable
+        # approval, fraud, ranking or execution claims.
+        if (
+            payload.get("schema_version") != "DeviceFlowEvidenceBundleV1"
+            or payload.get("source") != "synthetic_unverified"
+            or payload.get("rank_components") != []
+            or payload.get("rank_change_authorized") is not False
+            or payload.get("fraud_confirmed") != "unknown"
+            or payload.get("deception_inferred") is not False
+            or payload.get("bank_execution") != "unknown"
+            or payload.get("enforcement_activated") is not False
+        ):
+            raise DeviceFlowRejected("invalid non-authoritative bundle claims")
 
     def to_dict(self) -> dict[str, object]:
         # The retained artifact is immutable even when callers mutate a copy.
