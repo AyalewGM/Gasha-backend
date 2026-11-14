@@ -8,7 +8,7 @@ from gasha.intelligence.feature_set_v1 import FEATURE_VERSION, ObservedTransfer,
 T = datetime(2026, 11, 14, 12, tzinfo=UTC)
 
 
-def event(event_id, *, tenant="synthetic-a", account="acct-a", beneficiary="ben-a", device="dev-a", time=T):
+def event(\n    event_id, *, tenant="synthetic-a", account="acct-a",\n    beneficiary="ben-a", device="dev-a", time=T,\n):
     return ObservedTransfer(tenant, event_id, account, beneficiary, device, time)
 
 
