@@ -49,7 +49,9 @@ class FeatureSetV1:
     missing: tuple[str, ...]
 
 
-def compute_feature_set(\n    target: ObservedTransfer, history: tuple[ObservedTransfer, ...]\n) -> FeatureSetV1:
+def compute_feature_set(
+    target: ObservedTransfer, history: tuple[ObservedTransfer, ...]
+) -> FeatureSetV1:
     """Compute features only from events strictly BEFORE target's event time.
 
     Boundary at exactly one hour is included; same-timestamp records are
