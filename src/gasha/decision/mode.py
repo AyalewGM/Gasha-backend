@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from typing import Protocol
 
 from pydantic import BaseModel
 
@@ -31,6 +32,17 @@ class DecisionEnvelope(BaseModel):
     evaluation_latency_ms: float
 
 
+class _DecisionBackend(Protocol):
+    """Anything with the ``DecisionService.decide`` contract can be wrapped."""
+
+    def decide(
+        self,
+        transaction: CanonicalTransaction,
+        intelligence: IntelligenceSnapshot,
+        evidence_reason_codes: Sequence[str] = (),
+    ) -> FraudDecision: ...
+
+
 class ModeAwareDecisionService:
     """Wraps the deterministic DecisionService with an explicit operating mode.
 
@@ -45,8 +57,9 @@ class ModeAwareDecisionService:
         *,
         operating_mode: OperatingMode = OperatingMode.ENFORCING,
         clock: Callable[[], datetime] | None = None,
+        service: _DecisionBackend | None = None,
     ) -> None:
-        self.service = DecisionService(policy)
+        self.service = service if service is not None else DecisionService(policy)
         self.operating_mode = operating_mode
         self._clock = clock or (lambda: datetime.now(UTC))
 
