@@ -396,7 +396,8 @@ def resolve_active(
         raise TenantConfigRejected("stored rows required")
     covering: list[TenantConfigEntry] = []
     for raw in cast("list[object] | tuple[object, ...]", rows):
-        entry = decode_row(raw)
+        # Raw store rows are re-validated; typed entries are already trusted.
+        entry = raw if type(raw) is TenantConfigEntry else decode_row(raw)
         if entry.tenant_id != tenant_id or entry.config_kind is not config_kind:
             continue
         activated = entry.activated_at
@@ -410,3 +411,7 @@ def resolve_active(
     if len(covering) != 1:
         raise TenantConfigRejected("exactly one active configuration must cover the instant")
     return covering[0]
+
+
+class TenantConfigConflict(TenantConfigRejected):
+    """Optimistic uniqueness/lifecycle conflict; no write was committed."""
