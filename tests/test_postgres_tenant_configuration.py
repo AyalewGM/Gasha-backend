@@ -295,3 +295,111 @@ def test_write_once_trigger_and_invalid_inputs(schema):
                 version=1,
                 at=AT,
             )
+
+
+
+def test_autocommit_connection_is_rejected_before_any_write(schema):
+    import psycopg
+
+    with psycopg.connect(DSN, autocommit=True) as connection:
+        with pytest.raises(TenantConfigRejected, match="autocommit"):
+            PostgresTenantConfigurationService(connection)
+
+
+def test_failed_activation_audit_rolls_back_incumbent_retirement(schema):
+    import psycopg
+
+    with connect(schema) as connection:
+        service = PostgresTenantConfigurationService(connection)
+        first = draft(service)
+        service.activate(
+            provisioner_ref=PROVISIONER,
+            tenant_id="tenant-a",
+            config_kind=ConfigKind.DECISION_POLICY,
+            version=first.version,
+            at=AT + timedelta(hours=1),
+        )
+        second = draft(service, version_payload=POLICY_V2)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE FUNCTION reject_config_activation_audit()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF NEW.action = 'tenant_config.activate' THEN
+                        RAISE EXCEPTION 'simulated audit write failure';
+                    END IF;
+                    RETURN NEW;
+                END $$
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TRIGGER reject_config_activation_audit_trigger
+                BEFORE INSERT ON security_audit_events
+                FOR EACH ROW EXECUTE FUNCTION reject_config_activation_audit()
+                """
+            )
+        connection.commit()
+
+        with pytest.raises(psycopg.errors.RaiseException):
+            service.activate(
+                provisioner_ref=PROVISIONER,
+                tenant_id="tenant-a",
+                config_kind=ConfigKind.DECISION_POLICY,
+                version=second.version,
+                at=AT + timedelta(hours=2),
+            )
+        entries = service.entries(
+            tenant_id="tenant-a", config_kind=ConfigKind.DECISION_POLICY
+        )
+        assert [entry.lifecycle for entry in entries] == [
+            ConfigLifecycle.ACTIVE, ConfigLifecycle.DRAFT
+        ]
+        assert counts(connection) == (2, 3)  # No orphan lifecycle or audit.
+
+
+def test_two_schemas_each_install_content_immutability_trigger(schema):
+    import psycopg
+    from psycopg import sql
+
+    second_schema = "gasha_config_" + uuid4().hex[:14]
+    with psycopg.connect(DSN, autocommit=True) as admin:
+        admin.execute(
+            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(second_schema))
+        )
+        try:
+            with connect(second_schema) as connection:
+                for migration in (
+                    "010_security_audit_events.sql",
+                    "016_tenant_configurations.sql",
+                ):
+                    connection.execute((MIGRATIONS / migration).read_text())
+                connection.commit()
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT n.nspname, count(*) AS n
+                        FROM pg_trigger AS t
+                        JOIN pg_class AS c ON c.oid = t.tgrelid
+                        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                        WHERE t.tgname = 'tenant_configurations_content_immutable'
+                          AND n.nspname IN (%s, %s)
+                        GROUP BY n.nspname
+                        """,
+                        (schema, second_schema),
+                    )
+                    found = {row["nspname"]: row["n"] for row in cursor.fetchall()}
+                assert found == {schema: 1, second_schema: 1}
+                service = PostgresTenantConfigurationService(connection)
+                draft(service)
+                with pytest.raises(psycopg.errors.RaiseException):
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "UPDATE tenant_configurations SET content_json = '{}'::jsonb"
+                        )
+                connection.rollback()
+        finally:
+            admin.execute(
+                sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(second_schema))
+            )
