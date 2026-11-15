@@ -11,12 +11,13 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from enum import StrEnum
 from hashlib import sha256
 from json import dumps
 from types import MappingProxyType
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _FIELD = re.compile(r"[a-z][a-z0-9_]{0,79}\Z")
@@ -112,7 +113,11 @@ def _digest(name: str, value: object) -> str:
 
 
 def _instant(name: str, value: object) -> datetime:
-    if not isinstance(value, datetime) or value.utcoffset() is None:
+    # Reject forged __class__, datetime subclasses and custom tzinfo before any
+    # caller-controlled method can run. Keep UTC, fixed-offset and IANA zones.
+    if type(value) is not datetime or type(value.tzinfo) not in (timezone, ZoneInfo):
+        raise ScenarioContractError(f"{name}: timezone-aware datetime required")
+    if value.utcoffset() is None:
         raise ScenarioContractError(f"{name}: timezone-aware datetime required")
     return value.astimezone(UTC)
 
