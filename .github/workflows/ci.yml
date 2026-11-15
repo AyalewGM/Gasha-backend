@@ -42,6 +42,7 @@ jobs:
             tests/test_api_case_history.py \
             tests/test_api_case_queue.py \
             tests/test_api_case_transitions.py \
+            tests/test_api_model_serving_containment.py \
             tests/test_security_access.py \
             tests/test_audit_actor_identity.py
       - name: Require executed negative tests without skipped cases
@@ -68,6 +69,8 @@ jobs:
               "invalid_subsequent_case_lifecycle_is_denied",
               "cross_tenant_denial",
               "missing_context_or_audit_fails_closed",
+              "model_activation_denied_even_with_registry",
+              "rules_only_remain_deterministic_with_registry_installed",
               "root_path_tenant_role_and_body_spoofing",
               "root_path_concurrent_outcome_attempts_never_mutate",
               "audit_actor_distinguishes_delimiter_shifted_identities",
