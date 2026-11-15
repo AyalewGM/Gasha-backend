@@ -1,15 +1,31 @@
-"""Offline, synthetic-only point-in-time behavior features for Gasha #145.
+"""Offline, synthetic-only point-in-time behavioral features for Gasha #145.
 
-No network, storage, ML inference, decisioning or bank-data access.
-Input references MUST be bank-approved pseudonyms before this boundary.
+No network, storage, ML inference, decisioning or Bank-data access.
+Input identifiers must already be approved pseudonyms. Feature counts exclude
+the target event; historical events with the target timestamp are excluded.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
+from hashlib import sha256
+from json import dumps
 
 FEATURE_VERSION = "gasha-feature-set-v1"
 _WINDOW = timedelta(hours=1)
+
+
+def _utc(name: str, value: object) -> datetime:
+    # Never invoke a caller-defined datetime/tzinfo callback.
+    if type(value) is not datetime or type(value.tzinfo) is not timezone:
+        raise ValueError(f"{name} must be an ordinary timezone-aware datetime")
+    return value.astimezone(UTC)
+
+
+def _digest(value: object) -> str:
+    return sha256(
+        dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,7 +35,8 @@ class ObservedTransfer:
     account_ref: str
     beneficiary_ref: str | None
     device_ref: str | None
-    observed_at: datetime
+    occurred_at: datetime
+    available_at: datetime
 
     def __post_init__(self) -> None:
         for name in ("tenant_id", "event_id", "account_ref"):
@@ -30,10 +47,12 @@ class ObservedTransfer:
             v = object.__getattribute__(self, name)
             if v is not None and (type(v) is not str or not v or len(v) > 128):
                 raise ValueError(f"invalid {name}")
-        v = object.__getattribute__(self, "observed_at")
-        if type(v) is not datetime or v.tzinfo is None or v.utcoffset() is None:
-            raise ValueError("observed_at must be an ordinary timezone-aware datetime")
-        object.__setattr__(self, "observed_at", v.astimezone(UTC))
+        occurred = _utc("occurred_at", object.__getattribute__(self, "occurred_at"))
+        available = _utc("available_at", object.__getattribute__(self, "available_at"))
+        if available < occurred:
+            raise ValueError("availability cannot precede event occurrence")
+        object.__setattr__(self, "occurred_at", occurred)
+        object.__setattr__(self, "available_at", available)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,25 +60,42 @@ class FeatureSetV1:
     version: str
     tenant_id: str
     event_id: str
-    as_of: datetime
+    decision_as_of: datetime
     account_transfers_1h: int
     beneficiary_unique_senders_1h: int | None
     distinct_accounts_on_device_1h: int | None
-    beneficiary_seen_before: bool | None
+    sender_beneficiary_seen_before: bool | None
     missing: tuple[str, ...]
+    source_fingerprint: str
+    computation_fingerprint: str
+
+
+def _row(e: ObservedTransfer) -> tuple[str, ...]:
+    return (
+        e.event_id, e.account_ref, e.beneficiary_ref or "",
+        e.device_ref or "", e.occurred_at.isoformat(), e.available_at.isoformat(),
+    )
 
 
 def compute_feature_set(
-    target: ObservedTransfer, history: tuple[ObservedTransfer, ...]
+    target: ObservedTransfer,
+    history: tuple[ObservedTransfer, ...],
+    *,
+    decision_as_of: datetime,
 ) -> FeatureSetV1:
-    """Compute features only from events strictly BEFORE target's event time.
+    """Calculate prior-only features from data available at the decision cutoff.
 
-    Boundary at exactly one hour is included; same-timestamp records are
-    excluded to avoid indeterminate ordering. Conflicting IDs fail closed.
-    Cross-tenant input fails rather than being quietly filtered.
+    An event must occur strictly before the target event and be available no
+    later than decision_as_of. Exactly 1h before target is included; events
+    at target's timestamp are excluded. The target account counts towards
+    distinct_accounts_on_device_1h only if it appeared on that device in a
+    *prior eligible* observation. Missing optional references remain None.
     """
     if type(target) is not ObservedTransfer or type(history) is not tuple:
         raise ValueError("invalid feature inputs")
+    cutoff = _utc("decision_as_of", decision_as_of)
+    if not target.occurred_at <= target.available_at <= cutoff:
+        raise ValueError("target was not available by decision cutoff")
     seen = {target.event_id}
     previous: list[ObservedTransfer] = []
     for event in history:
@@ -70,38 +106,54 @@ def compute_feature_set(
         if event.event_id in seen:
             raise ValueError("duplicate event identifier")
         seen.add(event.event_id)
-        if event.observed_at < target.observed_at:
+        if event.occurred_at < target.occurred_at and event.available_at <= cutoff:
             previous.append(event)
-    window = [e for e in previous if target.observed_at - e.observed_at <= _WINDOW]
+    window = [e for e in previous if target.occurred_at - e.occurred_at <= _WINDOW]
     missing: list[str] = []
     if target.beneficiary_ref is None:
-        beneficiary_unique_senders = None
-        beneficiary_seen = None
+        senders = None
+        prior_relation = None
         missing.append("beneficiary_ref")
     else:
-        beneficiary_unique_senders = len({
+        senders = len({
             e.account_ref for e in window if e.beneficiary_ref == target.beneficiary_ref
         })
-        beneficiary_seen = any(
+        prior_relation = any(
             e.account_ref == target.account_ref
             and e.beneficiary_ref == target.beneficiary_ref
             for e in previous
         )
     if target.device_ref is None:
-        device_accounts = None
+        accounts = None
         missing.append("device_ref")
     else:
-        device_accounts = len({
+        accounts = len({
             e.account_ref for e in window if e.device_ref == target.device_ref
         })
+    # No raw account, device or beneficiary identifiers leave the feature output.
+    # The fingerprint binds the permitted cohort and availability timestamps.
+    source = _digest({
+        "version": FEATURE_VERSION, "tenant": target.tenant_id,
+        "target": _row(target), "cutoff": cutoff.isoformat(),
+        "eligible": sorted(_row(e) for e in previous),
+    })
+    fields = {
+        "version": FEATURE_VERSION, "tenant": target.tenant_id,
+        "event": target.event_id, "cutoff": cutoff.isoformat(),
+        "source": source, "account_transfers_1h": sum(
+            e.account_ref == target.account_ref for e in window
+        ),
+        "beneficiary_unique_senders_1h": senders,
+        "distinct_accounts_on_device_1h": accounts,
+        "sender_beneficiary_seen_before": prior_relation,
+        "missing": missing,
+    }
     return FeatureSetV1(
-        version=FEATURE_VERSION,
-        tenant_id=target.tenant_id,
-        event_id=target.event_id,
-        as_of=target.observed_at,
-        account_transfers_1h=sum(e.account_ref == target.account_ref for e in window),
-        beneficiary_unique_senders_1h=beneficiary_unique_senders,
-        distinct_accounts_on_device_1h=device_accounts,
-        beneficiary_seen_before=beneficiary_seen,
-        missing=tuple(missing),
+        version=FEATURE_VERSION, tenant_id=target.tenant_id,
+        event_id=target.event_id, decision_as_of=cutoff,
+        account_transfers_1h=fields["account_transfers_1h"],
+        beneficiary_unique_senders_1h=senders,
+        distinct_accounts_on_device_1h=accounts,
+        sender_beneficiary_seen_before=prior_relation, missing=tuple(missing),
+        source_fingerprint=source, computation_fingerprint=_digest(fields),
     )
