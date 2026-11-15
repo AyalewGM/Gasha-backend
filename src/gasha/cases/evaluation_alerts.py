@@ -9,6 +9,8 @@ from json import dumps
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
+from pydantic_core import TzInfo
+
 from gasha.cases.postgres_timeline import PostgresCaseTimelineService, lock_case_history
 from gasha.cases.queue import valid_scenario_ids
 from gasha.cases.timeline import (
@@ -25,7 +27,7 @@ from gasha.security.access import Capability, TrustedPrincipal, authorize, tenan
 
 
 def _utc(value: datetime) -> datetime:
-    if type(value) is not datetime or type(value.tzinfo) not in (timezone, ZoneInfo):
+    if type(value) is not datetime or type(value.tzinfo) not in (timezone, ZoneInfo, TzInfo):
         raise ValueError("alert generation requires a timezone-aware clock")
     return value.astimezone(UTC)
 
@@ -73,7 +75,7 @@ class PostgresEvaluationAlertWriter:
     principal: TrustedPrincipal
 
     def append(
-        self, connection: Connection, record: ShadowEvaluationRecord, *, at: datetime,
+        self, connection: Connection, record: ShadowEvaluationRecord,
     ) -> None:
         if getattr(connection, "autocommit", None) is not False:
             raise ValueError("alert creation requires autocommit=False")
@@ -99,8 +101,8 @@ class PostgresEvaluationAlertWriter:
         if priority is None or decision.risk_score < self.policy.minimum_score or not scenarios:
             return
         authorize(self.principal, tenant_id=self.tenant_id, capability=Capability.CASE_CREATE)
-        at = _utc(at)
-        if at >= _utc(self.principal.expires_at):
+        expiry = _utc(self.principal.expires_at)
+        if datetime.now(UTC) >= expiry:
             raise ValueError("alert writer requires a current service credential")
 
         bucket = _utc(transaction.occurred_at).replace(minute=0, second=0, microsecond=0)
@@ -125,6 +127,10 @@ class PostgresEvaluationAlertWriter:
                 """
                 SELECT DISTINCT a.case_id
                 FROM evaluation_alerts a
+                JOIN analyst_case_events initial
+                  ON initial.tenant_id = a.tenant_id AND initial.case_id = a.case_id
+                 AND initial.revision = 1 AND initial.source_event_id = a.event_id
+                 AND initial.source_context_ref = a.context_ref
                 JOIN LATERAL (
                     SELECT event_json->>'operation' AS operation
                     FROM analyst_case_events c
@@ -145,6 +151,10 @@ class PostgresEvaluationAlertWriter:
                 history = lock_case_history(cursor, self.tenant_id, candidate)
                 if history and history[-1].operation in _OPEN:
                     case_id = candidate
+        # Group and case locks may have blocked past the credential's expiry.
+        at = datetime.now(UTC)
+        if at >= expiry:
+            raise ValueError("alert writer requires a current service credential")
         if case_id is None:
             case_id = uuid4()
             PostgresCaseTimelineService(connection).append_in_transaction(

@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from time import monotonic, sleep
 from uuid import uuid4
 
 import pytest
@@ -198,3 +199,56 @@ def test_alert_audit_failure_rolls_back_evaluation_alert_and_any_new_case(
     with connect(installation) as connection:
         assert len(connection.execute("SELECT * FROM evaluation_alerts").fetchall()) == 1 + existing_case
         assert len(connection.execute("SELECT * FROM analyst_case_events").fetchall()) == 1
+
+
+def test_grouping_rejects_transaction_snapshot_isolation(installation):
+    from psycopg import IsolationLevel
+
+    sample = event()
+    with connect(installation) as connection:
+        connection.isolation_level = IsolationLevel.REPEATABLE_READ
+        persistence = PostgresEvaluationPersistence(
+            connection, alerts=PostgresEvaluationAlertWriter("tenant-a", ALERT_POLICY, principal()),
+        )
+        with pytest.raises(ValueError, match="read committed"):
+            ShadowOrchestrator({"tenant-a": POLICY}, persistence=persistence).evaluate(sample)
+        assert connection.execute("SELECT * FROM shadow_evaluations").fetchall() == []
+
+
+def test_expired_credential_cannot_attach_after_waiting_for_group_lock(installation):
+    evaluate(installation, event())
+    sample = event()
+    with ThreadPoolExecutor(max_workers=1) as workers, connect(installation) as locker:
+        row = locker.execute("SELECT group_ref FROM evaluation_alerts").fetchone()
+        locker.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (row["group_ref"],))
+        expiry = datetime.now(UTC) + timedelta(seconds=1)
+        writer = PostgresEvaluationAlertWriter(
+            "tenant-a", ALERT_POLICY, replace(principal(), expires_at=expiry),
+        )
+        future = workers.submit(evaluate, installation, sample, writer=writer)
+        try:
+            deadline = monotonic() + 3
+            while not locker.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)"
+                " AS waiting"
+            ).fetchone()["waiting"]:
+                if monotonic() > deadline:
+                    pytest.fail("alert worker did not wait on the held group lock")
+                sleep(0.01)
+            sleep(max(0, (expiry - datetime.now(UTC)).total_seconds()) + 0.02)
+        finally:
+            locker.rollback()
+        with pytest.raises(ValueError, match="current service credential"):
+            future.result(timeout=4)
+    with connect(installation) as connection:
+        assert connection.execute("SELECT count(*) AS n FROM evaluation_alerts").fetchone()["n"] == 1
+        assert connection.execute("SELECT count(*) AS n FROM shadow_evaluations").fetchone()["n"] == 1
+
+
+def test_evaluation_retry_returns_the_original_alert_decision(installation):
+    sample = event(score=0.91)
+    original = evaluate(installation, sample)
+    sample.intelligence = IntelligenceSnapshot(device_session_risk=0.1)
+    assert evaluate(installation, sample) == original
+    with connect(installation) as connection:
+        assert connection.execute("SELECT risk_score FROM evaluation_alerts").fetchone()["risk_score"] == 0.91

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
 from uuid import UUID
 
 from gasha.cases.evaluation_alerts import PostgresEvaluationAlertWriter
 from gasha.decision.audit import DecisionAuditRecord
-from gasha.ingestion.lease import LeaseLostError, current_evaluation_lease
+from gasha.ingestion.lease import EvaluationLease, LeaseLostError, current_evaluation_lease
 from gasha.orchestration import ShadowEvaluationRecord
-from gasha.postgres import Connection
+from gasha.postgres import Connection, Cursor
 from gasha.tenant_scope import require_tenant
 
 
@@ -74,6 +73,17 @@ class PostgresShadowEvaluationRepository:
         return persisted
 
 
+def _require_live_lease(cursor: Cursor, lease: EvaluationLease) -> None:
+    cursor.execute(
+        """SELECT lease_token FROM pending_evaluations
+        WHERE tenant_id = %s AND event_id = %s
+          AND lease_token = %s AND leased_until > clock_timestamp()""",
+        (lease.tenant_id, str(lease.event_id), lease.token),
+    )
+    if cursor.fetchone() is None:
+        raise LeaseLostError("evaluation claim expired")
+
+
 class PostgresEvaluationPersistence:
     """Atomic persistence boundary for one evaluation's two artifacts.
 
@@ -113,6 +123,10 @@ class PostgresEvaluationPersistence:
             raise ValueError("alert persistence requires a matching tenant-bound transaction")
         try:
             with self._connection.cursor() as cursor:
+                if self._alerts is not None:
+                    cursor.execute("SHOW transaction_isolation", ())
+                    if cursor.fetchone() != {"transaction_isolation": "read committed"}:
+                        raise ValueError("alert grouping requires read committed isolation")
                 lease = current_evaluation_lease.get()
                 if self._require_lease:
                     if lease is None or (lease.tenant_id, lease.event_id) != (
@@ -130,14 +144,7 @@ class PostgresEvaluationPersistence:
                         raise LeaseLostError("evaluation claim superseded")
                     # Check database time after acquiring the lock: a lock wait
                     # may itself have outlived the lease window.
-                    cursor.execute(
-                        """SELECT lease_token FROM pending_evaluations
-                        WHERE tenant_id = %s AND event_id = %s
-                          AND lease_token = %s AND leased_until > clock_timestamp()""",
-                        (lease.tenant_id, str(lease.event_id), lease.token),
-                    )
-                    if cursor.fetchone() is None:
-                        raise LeaseLostError("evaluation claim expired")
+                    _require_live_lease(cursor, lease)
                 cursor.execute(
                     """
                     INSERT INTO fraud_decision_audit (
@@ -182,7 +189,10 @@ class PostgresEvaluationPersistence:
             if self._alerts is not None and inserted != audit_inserted:
                 raise ValueError("alert persistence found incomplete decision evidence")
             if self._alerts is not None and inserted:
-                self._alerts.append(self._connection, record, at=datetime.now(UTC))
+                self._alerts.append(self._connection, record)
+                if self._require_lease and lease is not None:
+                    with self._connection.cursor() as cursor:
+                        _require_live_lease(cursor, lease)
             self._connection.commit()
         except Exception:
             self._connection.rollback()
