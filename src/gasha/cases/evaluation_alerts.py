@@ -56,6 +56,52 @@ class AlertPolicy:
                 raise ValueError("invalid alert scenario mapping")
 
 
+def evaluation_context_ref(record: ShadowEvaluationRecord) -> str:
+    return _digest(["gasha-shadow-evaluation-v1", record.model_dump(mode="json")])
+
+
+def alert_group_ref(record: ShadowEvaluationRecord, policy_version: str) -> str:
+    event = record.event
+    transaction = event.canonical_transaction
+    bucket = _utc(transaction.occurred_at).replace(minute=0, second=0, microsecond=0)
+    grouping = [
+        "gasha-alert-group-v1", event.tenant_id, policy_version, bucket.isoformat(),
+        transaction.sender_customer_id, transaction.beneficiary_type.value,
+        transaction.destination_institution_id, transaction.beneficiary_id,
+        transaction.device_id,
+    ]
+    # Incomplete entity identifiers must never coalesce unrelated alerts.
+    if not all((transaction.sender_customer_id, transaction.beneficiary_id, transaction.device_id)):
+        grouping.append(str(event.event_id))
+    return _digest(grouping)
+
+
+def alert_evidence(
+    tenant_id: str, record: ShadowEvaluationRecord, policy: AlertPolicy,
+) -> tuple[int, tuple[str, ...]] | None:
+    event = record.event
+    decision = record.evaluation.decision
+    transaction = event.canonical_transaction
+    identity = (tenant_id, event.event_id)
+    if (
+        (event.tenant_id, event.event_id) != identity
+        or (decision.tenant_id, decision.event_id) != identity
+        or (transaction.tenant_id, transaction.event_id) != identity
+        or event.operating_mode is not OperatingMode.SHADOW
+        or record.evaluation.operating_mode is not OperatingMode.SHADOW
+        or record.evaluation.effective_action is not DecisionAction.NO_ACTION_SHADOW
+    ):
+        raise ValueError("alert writer requires a tenant-bound shadow evaluation")
+    priority = _PRIORITY_V1.get(decision.action)
+    scenarios = tuple(sorted({
+        scenario for reason, scenario in policy.scenario_by_reason
+        if reason in decision.reason_codes
+    }))
+    if priority is None or decision.risk_score < policy.minimum_score or not scenarios:
+        return None
+    return priority, scenarios
+
+
 @dataclass(frozen=True, slots=True)
 class _EvaluationSource:
     reference: VerifiedEvaluation
@@ -79,44 +125,19 @@ class PostgresEvaluationAlertWriter:
     ) -> None:
         if getattr(connection, "autocommit", None) is not False:
             raise ValueError("alert creation requires autocommit=False")
+        evidence = alert_evidence(self.tenant_id, record, self.policy)
+        if evidence is None:
+            return
+        priority, scenarios = evidence
         event = record.event
         decision = record.evaluation.decision
-        transaction = event.canonical_transaction
-        identity = (self.tenant_id, event.event_id)
-        if (
-            (event.tenant_id, event.event_id) != identity
-            or (decision.tenant_id, decision.event_id) != identity
-            or (transaction.tenant_id, transaction.event_id) != identity
-            or event.operating_mode is not OperatingMode.SHADOW
-            or record.evaluation.operating_mode is not OperatingMode.SHADOW
-            or record.evaluation.effective_action is not DecisionAction.NO_ACTION_SHADOW
-        ):
-            raise ValueError("alert writer requires a tenant-bound shadow evaluation")
-
-        priority = _PRIORITY_V1.get(decision.action)
-        scenarios = tuple(sorted({
-            scenario for reason, scenario in self.policy.scenario_by_reason
-            if reason in decision.reason_codes
-        }))
-        if priority is None or decision.risk_score < self.policy.minimum_score or not scenarios:
-            return
         authorize(self.principal, tenant_id=self.tenant_id, capability=Capability.CASE_CREATE)
         expiry = _utc(self.principal.expires_at)
         if datetime.now(UTC) >= expiry:
             raise ValueError("alert writer requires a current service credential")
 
-        bucket = _utc(transaction.occurred_at).replace(minute=0, second=0, microsecond=0)
-        grouping = [
-            "gasha-alert-group-v1", self.tenant_id, self.policy.version, bucket.isoformat(),
-            transaction.sender_customer_id, transaction.beneficiary_type.value,
-            transaction.destination_institution_id, transaction.beneficiary_id,
-            transaction.device_id,
-        ]
-        # Incomplete entity identifiers must never coalesce unrelated alerts.
-        if not all((transaction.sender_customer_id, transaction.beneficiary_id, transaction.device_id)):
-            grouping.append(str(event.event_id))
-        group_ref = _digest(grouping)
-        context_ref = _digest(["gasha-shadow-evaluation-v1", record.model_dump(mode="json")])
+        group_ref = alert_group_ref(record, self.policy.version)
+        context_ref = evaluation_context_ref(record)
 
         with connection.cursor() as cursor:
             cursor.execute(
