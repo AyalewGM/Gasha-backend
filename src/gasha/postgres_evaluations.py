@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from uuid import UUID
 
+from gasha.cases.evaluation_alerts import PostgresEvaluationAlertWriter
 from gasha.decision.audit import DecisionAuditRecord
 from gasha.ingestion.lease import LeaseLostError, current_evaluation_lease
 from gasha.orchestration import ShadowEvaluationRecord
@@ -86,7 +88,9 @@ class PostgresEvaluationPersistence:
     def __init__(
         self, connection: Connection, *, tenant_ids: tuple[str, ...] | None = None,
         require_lease: bool = False,
+        alerts: PostgresEvaluationAlertWriter | None = None,
     ) -> None:
+        self._alerts = alerts
         self._require_lease = require_lease
         self._tenant_ids = tenant_ids
         self._connection = connection
@@ -101,6 +105,12 @@ class PostgresEvaluationPersistence:
         require_tenant(decision.tenant_id, self._tenant_ids)
         if (decision.tenant_id, decision.event_id) != (record.event.tenant_id, record.event.event_id):
             raise ValueError("audit and evaluation identity mismatch")
+        if self._alerts is not None and (
+            getattr(self._connection, "autocommit", None) is not False
+            or decision != record.evaluation.decision
+            or record.event.tenant_id != self._alerts.tenant_id
+        ):
+            raise ValueError("alert persistence requires a matching tenant-bound transaction")
         try:
             with self._connection.cursor() as cursor:
                 lease = current_evaluation_lease.get()
@@ -152,6 +162,7 @@ class PostgresEvaluationPersistence:
                         decision.decided_at,
                     ),
                 )
+                audit_inserted = cursor.rowcount == 1
                 cursor.execute(
                     """
                     INSERT INTO shadow_evaluations (
@@ -167,6 +178,11 @@ class PostgresEvaluationPersistence:
                         record.persisted_at,
                     ),
                 )
+                inserted = cursor.rowcount == 1
+            if self._alerts is not None and inserted != audit_inserted:
+                raise ValueError("alert persistence found incomplete decision evidence")
+            if self._alerts is not None and inserted:
+                self._alerts.append(self._connection, record, at=datetime.now(UTC))
             self._connection.commit()
         except Exception:
             self._connection.rollback()

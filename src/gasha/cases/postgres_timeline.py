@@ -27,7 +27,7 @@ from gasha.cases.timeline import (
     advance_case,
     validate_case_history,
 )
-from gasha.postgres import Connection
+from gasha.postgres import Connection, Cursor
 from gasha.security.access import (
     AuthorizationRejected,
     Capability,
@@ -156,6 +156,16 @@ def _verified_history(
     return verified
 
 
+def lock_case_history(cursor: Cursor, tenant_id: str, case_id: UUID) -> tuple[CaseEvent, ...]:
+    """Serialize case writes and return the validated history on the caller's transaction."""
+    cursor.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (dumps(["gasha-case-v1", tenant_id, str(case_id)], separators=(",", ":")),),
+    )
+    cursor.execute(_HISTORY_SQL, (tenant_id, case_id))
+    return _verified_history(cursor.fetchall(), tenant_id=tenant_id, case_id=case_id)
+
+
 class PostgresCaseTimelineService:
     """Transactional synthetic case timeline, deliberately not API-connected.
 
@@ -205,6 +215,26 @@ class PostgresCaseTimelineService:
         Source/assignee authority is the *caller's* trusted composition concern.
         This inert adapter must never accept request JSON as principal/source.
         """
+        try:
+            event, appended = self.append_in_transaction(
+                command, principal=principal, source=source, at=at,
+            )
+            if appended:
+                self._connection.commit()
+            else:
+                self._connection.rollback()
+            return event
+        except Exception as exc:
+            self._connection.rollback()
+            if getattr(exc, "sqlstate", None) == "23505":
+                raise CaseConflict("case revision or idempotency key conflict") from exc
+            raise
+
+    def append_in_transaction(
+        self, command: CaseCommand, *, principal: TrustedPrincipal,
+        source: EvaluationLookup, at: datetime,
+    ) -> tuple[CaseEvent, bool]:
+        """Append case and audit on the caller's connection. The caller owns rollback."""
         if not isinstance(command, CaseCommand) or not isinstance(
             command.operation, CaseOperation
         ):
@@ -221,71 +251,49 @@ class PostgresCaseTimelineService:
             principal, tenant_id=command.tenant_id,
             capability=_CAPABILITY[command.operation],
         )
-        try:
-            with self._connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                    (dumps(
-                        ["gasha-case-v1", command.tenant_id, str(command.case_id)],
+        with self._connection.cursor() as cursor:
+            history = lock_case_history(cursor, command.tenant_id, command.case_id)
+            proposed, event = advance_case(
+                history, command, principal=principal, source=source, at=at,
+            )
+            if len(proposed) == len(history):
+                # Identical replay: no duplicate event and no second audit.
+                return event, False
+            cursor.execute(
+                """INSERT INTO analyst_case_events (
+                    tenant_id, case_id, revision, previous_revision,
+                    source_event_id, source_context_ref, actor_ref, occurred_at,
+                    idempotency_ref, command_ref, event_json, bank_execution
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+                )""",
+                (
+                    event.tenant_id, event.case_id, event.revision,
+                    event.previous_revision, event.source_event_id,
+                    event.source_context_ref, event.actor_ref,
+                    event.recorded_at, event.idempotency_ref,
+                    event.command_ref, _serialize(event),
+                    BankExecution.UNKNOWN.value,
+                ),
+            )
+            # Audit is in the SAME SQL transaction; a separate sink which
+            # auto-commits would violate the #45 Security contract.
+            cursor.execute(
+                """INSERT INTO security_audit_events (
+                    occurred_at, action, result, actor_ref, tenant_ref,
+                    reason, attempt_ref, event_ref, context_ref
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    event.recorded_at, "case." + event.operation.value,
+                    "allowed", event.actor_ref,
+                    tenant_audit_ref(event.tenant_id),
+                    "case_transition_committed", uuid4().hex,
+                    sha256(dumps(
+                        ["gasha-case-event-v1", event.tenant_id,
+                         str(event.case_id), event.revision],
                         separators=(",", ":"),
-                    ),),
-                )
-                cursor.execute(
-                    _HISTORY_SQL,
-                    (command.tenant_id, command.case_id),
-                )
-                history = _verified_history(
-                    cursor.fetchall(), tenant_id=command.tenant_id,
-                    case_id=command.case_id,
-                )
-                proposed, event = advance_case(
-                    history, command, principal=principal, source=source, at=at,
-                )
-                if len(proposed) == len(history):
-                    # Identical replay: no duplicate event and no second audit.
-                    self._connection.rollback()
-                    return event
-                cursor.execute(
-                    """INSERT INTO analyst_case_events (
-                        tenant_id, case_id, revision, previous_revision,
-                        source_event_id, source_context_ref, actor_ref, occurred_at,
-                        idempotency_ref, command_ref, event_json, bank_execution
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
-                    )""",
-                    (
-                        event.tenant_id, event.case_id, event.revision,
-                        event.previous_revision, event.source_event_id,
-                        event.source_context_ref, event.actor_ref,
-                        event.recorded_at, event.idempotency_ref,
-                        event.command_ref, _serialize(event),
-                        BankExecution.UNKNOWN.value,
-                    ),
-                )
-                # Audit is in the SAME SQL transaction; a separate sink which
-                # auto-commits would violate the #45 Security contract.
-                cursor.execute(
-                    """INSERT INTO security_audit_events (
-                        occurred_at, action, result, actor_ref, tenant_ref,
-                        reason, attempt_ref, event_ref, context_ref
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (
-                        event.recorded_at, "case." + event.operation.value,
-                        "allowed", event.actor_ref,
-                        tenant_audit_ref(event.tenant_id),
-                        "case_transition_committed", uuid4().hex,
-                        sha256(dumps(
-                            ["gasha-case-event-v1", event.tenant_id,
-                             str(event.case_id), event.revision],
-                            separators=(",", ":"),
-                        ).encode()).hexdigest(),
-                        event.source_context_ref,
-                    ),
-                )
-            self._connection.commit()
-            return event
-        except Exception as exc:
-            self._connection.rollback()
-            if getattr(exc, "sqlstate", None) == "23505":
-                raise CaseConflict("case revision or idempotency key conflict") from exc
-            raise
+                    ).encode()).hexdigest(),
+                    event.source_context_ref,
+                ),
+            )
+        return event, True
