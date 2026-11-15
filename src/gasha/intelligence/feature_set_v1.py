@@ -137,12 +137,11 @@ def compute_feature_set(
         "target": _row(target), "cutoff": cutoff.isoformat(),
         "eligible": sorted(_row(e) for e in previous),
     })
+    transfer_count = sum(e.account_ref == target.account_ref for e in window)
     fields = {
         "version": FEATURE_VERSION, "tenant": target.tenant_id,
         "event": target.event_id, "cutoff": cutoff.isoformat(),
-        "source": source, "account_transfers_1h": sum(
-            e.account_ref == target.account_ref for e in window
-        ),
+        "source": source, "account_transfers_1h": transfer_count,
         "beneficiary_unique_senders_1h": senders,
         "distinct_accounts_on_device_1h": accounts,
         "sender_beneficiary_seen_before": prior_relation,
@@ -151,7 +150,7 @@ def compute_feature_set(
     return FeatureSetV1(
         version=FEATURE_VERSION, tenant_id=target.tenant_id,
         event_id=target.event_id, decision_as_of=cutoff,
-        account_transfers_1h=fields["account_transfers_1h"],
+        account_transfers_1h=transfer_count,
         beneficiary_unique_senders_1h=senders,
         distinct_accounts_on_device_1h=accounts,
         sender_beneficiary_seen_before=prior_relation, missing=tuple(missing),
