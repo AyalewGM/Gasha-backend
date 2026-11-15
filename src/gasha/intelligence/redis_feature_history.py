@@ -148,9 +148,15 @@ class RedisFeatureHistory:
         self._write("open", _instant(covered_from), str(ttl_seconds))
 
     def _event(self, event: ObservedTransfer) -> ObservedTransfer:
-        if type(event) is not ObservedTransfer or event.tenant_id != self._tenant_id:
+        if type(event) is not ObservedTransfer:
+            raise FeatureHistoryUnavailable("invalid feature observation")
+        try:
+            snapshot = replace(event)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise FeatureHistoryUnavailable("invalid feature observation") from exc
+        if snapshot.tenant_id != self._tenant_id:
             raise FeatureHistoryUnavailable("feature observation outside tenant scope")
-        return replace(event)
+        return snapshot
 
     def append(self, event: ObservedTransfer) -> bool:
         """Return whether an immutable event was inserted."""

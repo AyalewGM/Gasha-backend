@@ -139,3 +139,21 @@ def test_corrupt_epoch_and_missing_expiry_are_rejected(redis_client):
         history.compute(observation("target"), decision_as_of=NOW)
     with pytest.raises(FeatureHistoryUnavailable, match="epoch state"):
         history.append(observation("target"))
+
+
+def test_revalidates_typed_observations_before_accessing_store_or_comparing_tenant():
+    class CorruptTenant:
+        def __ne__(self, _other):
+            pytest.fail("untrusted tenant comparison")
+
+    class UnusedStore:
+        def eval(self, *_args):
+            pytest.fail("invalid observation reached store")
+
+    history = RedisFeatureHistory(UnusedStore(), tenant_id="synthetic-a", epoch=uuid4().hex)
+    target = observation("target")
+    object.__setattr__(target, "tenant_id", CorruptTenant())
+    with pytest.raises(FeatureHistoryUnavailable, match="invalid feature observation"):
+        history.append(target)
+    with pytest.raises(FeatureHistoryUnavailable, match="invalid feature observation"):
+        history.compute(target, decision_as_of=NOW)
