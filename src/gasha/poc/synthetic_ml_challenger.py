@@ -21,8 +21,8 @@ from gasha.ml.manifest import MODEL_FILENAME
 from gasha.ml.metrics import auc
 from gasha.ml.scorer import ArtifactRegistry
 from gasha.ml.train import TrainingParams, train_model
+from gasha.poc.alert_budget import measure_same_budget
 from gasha.poc.historical import ConfirmedOutcomeLabel, HistoricalTransactionEvent
-from gasha.poc.synthetic_rules_comparison import measure_same_budget
 
 _TENANT = "synthetic-ml-challenger"
 _TRAIN_START = datetime(2026, 1, 10, 9, tzinfo=UTC)
