@@ -5,8 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from gasha.cases.evaluation_alerts import (
     AlertPolicy,
@@ -39,9 +40,10 @@ class _RankedEvidence:
 
     def sort_key(self, at: datetime) -> tuple[int, float, datetime, UUID]:
         # Escalate a tier per day of waiting, capped at the highest severity.
-        wait_days = (at - self.opened_at) // timedelta(days=1)
+        opened_utc = self.opened_at.astimezone(UTC)
+        wait_days = (at.astimezone(UTC) - opened_utc) // timedelta(days=1)
         effective_priority = min(3, self.priority + wait_days)
-        return (-effective_priority, -self.score, self.opened_at, self.case_id)
+        return (-effective_priority, -self.score, opened_utc, self.case_id)
 
 
 class SyntheticPostgresRankingSource:
@@ -128,8 +130,12 @@ class SyntheticPostgresRankingSource:
             or type(opened_at) is not datetime
             or type(generated_at) is not datetime
             or type(last_transition_at) is not datetime
-            or not opened_at <= generated_at <= at
-            or not opened_at <= last_transition_at <= at
+            or any(
+                type(clock.tzinfo) not in (timezone, ZoneInfo) or clock.utcoffset() is None
+                for clock in (opened_at, generated_at, last_transition_at)
+            )
+            or not opened_at.astimezone(UTC) <= generated_at.astimezone(UTC) <= at
+            or not opened_at.astimezone(UTC) <= last_transition_at.astimezone(UTC) <= at
         ):
             raise CaseQueueRejected("invalid or future-dated alert evidence")
         policy = self._policies.get(str(row["policy_version"]))
@@ -152,7 +158,8 @@ class SyntheticPostgresRankingSource:
             or row["priority_seed"] != priority
             or row["scenario_ids"] != list(scenarios)
             or (event_id == source_event_id and (
-                row["source_context_ref"] != context_ref or opened_at != generated_at
+                row["source_context_ref"] != context_ref
+                or opened_at.astimezone(UTC) != generated_at.astimezone(UTC)
             ))
         ):
             raise CaseQueueRejected("alert and persisted evaluation disagree")
