@@ -11,6 +11,7 @@ from typing import Protocol
 from gasha.intelligence.feature_set_v1 import FeatureSetV1, ObservedTransfer, compute_feature_set
 
 _MAX_EVENTS = 4096
+_HEADER_FIELDS = 4
 _MAX_TTL_SECONDS = 30 * 86400
 
 # One key keeps each operation atomic and Redis Cluster slot local. Expiry is
@@ -19,7 +20,12 @@ _WRITE = f"""
 local op, first, second, third, fourth = unpack(ARGV)
 local key = KEYS[1]
 local start = redis.call('HGET', key, 'covered_from')
-if start and redis.call('PTTL', key) <= 0 then return 'invalid' end
+if start then
+    if redis.call('PTTL', key) <= 0 then return 'invalid' end
+    local status = redis.call('HGET', key, 'status')
+    if status == 'poisoned' then return 'poisoned' end
+    if status ~= 'ready' then return 'invalid' end
+end
 if op == 'open' then
     if start then
         if start == first and redis.call('HGET', key, 'ttl_seconds') == second then
@@ -28,7 +34,8 @@ if op == 'open' then
         return 'conflict'
     end
     if redis.call('EXISTS', key) == 1 then return 'invalid' end
-    redis.call('HSET', key, 'covered_from', first, 'sealed_through', '', 'ttl_seconds', second)
+    redis.call('HSET', key, 'covered_from', first, 'sealed_through', '',
+               'ttl_seconds', second, 'status', 'ready')
     redis.call('EXPIRE', key, tonumber(second))
     return 'created'
 end
@@ -44,14 +51,18 @@ if prior then
     if prior == second then return 'existing' end
     return 'conflict'
 end
-if third < start or fourth <= sealed then return 'coverage' end
-if redis.call('HLEN', key) >= {_MAX_EVENTS + 3} then return 'capacity' end
+if third < start then return 'coverage' end
+if fourth <= sealed then
+    redis.call('HSET', key, 'status', 'poisoned')
+    return 'coverage_contradiction'
+end
+if redis.call('HLEN', key) >= {_MAX_EVENTS + _HEADER_FIELDS} then return 'capacity' end
 redis.call('HSET', key, first, second)
 return 'created'
 """
 _READ = f"""
 if redis.call('PTTL', KEYS[1]) <= 0 then return false end
-if redis.call('HLEN', KEYS[1]) > {_MAX_EVENTS + 3} then return false end
+if redis.call('HLEN', KEYS[1]) > {_MAX_EVENTS + _HEADER_FIELDS} then return false end
 return redis.call('HGETALL', KEYS[1])
 """
 
@@ -136,6 +147,8 @@ class RedisFeatureHistory:
                 "missing": "feature history epoch missing or expired",
                 "capacity": "feature history epoch exceeds capacity",
                 "coverage": "operation conflicts with feature history coverage",
+                "coverage_contradiction": "new observation contradicts sealed coverage",
+                "poisoned": "sealed coverage was contradicted; rebuild with a fresh epoch",
                 "conflict": "feature history identity conflicts with immutable state",
                 "invalid": "invalid feature history epoch state",
             }.get(result, "invalid feature history write response"))
@@ -175,12 +188,14 @@ class RedisFeatureHistory:
         target = self._event(target)
         cutoff = _parse_instant(_instant(decision_as_of))
         raw = self._eval(_READ)
-        if type(raw) is not list or len(raw) % 2 or len(raw) > 2 * (_MAX_EVENTS + 3):
+        if type(raw) is not list or len(raw) % 2 or len(raw) > 2 * (_MAX_EVENTS + _HEADER_FIELDS):
             raise FeatureHistoryUnavailable("invalid feature history snapshot")
         try:
             rows = {_text(key): _text(value) for key, value in zip(raw[::2], raw[1::2], strict=True)}
             if len(rows) * 2 != len(raw):
                 raise FeatureHistoryUnavailable("duplicate fields in feature history snapshot")
+            if rows.pop("status") != "ready":
+                raise FeatureHistoryUnavailable("feature history epoch unavailable after coverage loss")
             covered_from = _parse_instant(rows.pop("covered_from"))
             sealed = _parse_instant(rows.pop("sealed_through"))
             ttl = int(rows.pop("ttl_seconds"))

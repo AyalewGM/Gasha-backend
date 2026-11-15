@@ -49,7 +49,7 @@ def test_watermark_preserves_point_in_time_replay_and_immutable_dedup(redis_clie
     with pytest.raises(FeatureHistoryUnavailable, match="immutable"):
         history.append(replace(boundary, account_ref="forged"))
     with pytest.raises(FeatureHistoryUnavailable, match="coverage"):
-        history.append(observation("late-backfill", time=NOW - timedelta(minutes=3)))
+        history.append(observation("before-coverage", time=NOW - timedelta(hours=2)))
     with pytest.raises(FeatureHistoryUnavailable, match="coverage"):
         history.seal(available_through=NOW - timedelta(seconds=1))
     with pytest.raises(FeatureHistoryUnavailable, match="target conflicts"):
@@ -157,3 +157,34 @@ def test_revalidates_typed_observations_before_accessing_store_or_comparing_tena
         history.append(target)
     with pytest.raises(FeatureHistoryUnavailable, match="invalid feature observation"):
         history.compute(target, decision_as_of=NOW)
+
+
+def test_contradicted_seal_invalidates_entire_epoch_until_fresh_rebuild(redis_client):
+    history = RedisFeatureHistory(redis_client, tenant_id="synthetic-a", epoch=uuid4().hex)
+    boundary = NOW - timedelta(hours=1)
+    history.open_epoch(covered_from=boundary, ttl_seconds=10)
+    known = observation("known", time=NOW - timedelta(minutes=3))
+    history.append(known)
+    history.seal(available_through=NOW)
+    target = observation("target")
+    assert history.compute(target, decision_as_of=NOW).account_transfers_1h == 1
+    contradiction = observation(
+        "late-backfill", time=NOW - timedelta(minutes=4), availability=NOW,
+    )
+    with pytest.raises(FeatureHistoryUnavailable, match="contradicts sealed coverage"):
+        history.append(contradiction)
+    with pytest.raises(FeatureHistoryUnavailable, match="coverage loss"):
+        history.compute(target, decision_as_of=NOW)
+    for operation in (
+        lambda: history.open_epoch(covered_from=boundary, ttl_seconds=10),
+        lambda: history.append(known),
+        lambda: history.seal(available_through=NOW + timedelta(minutes=1)),
+    ):
+        with pytest.raises(FeatureHistoryUnavailable, match="fresh epoch"):
+            operation()
+    rebuilt = RedisFeatureHistory(redis_client, tenant_id="synthetic-a", epoch=uuid4().hex)
+    rebuilt.open_epoch(covered_from=boundary, ttl_seconds=10)
+    rebuilt.append(known)
+    rebuilt.append(contradiction)
+    rebuilt.seal(available_through=NOW)
+    assert rebuilt.compute(target, decision_as_of=NOW).account_transfers_1h == 2

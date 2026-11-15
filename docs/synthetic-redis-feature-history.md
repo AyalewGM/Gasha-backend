@@ -9,9 +9,11 @@ timeouts on that client.
 A server-owned producer creates a unique tenant/epoch, declares the covered
 event-time start, appends observations, then seals the latest availability
 cutoff for which it has complete upstream coverage. An exact duplicate can
-replay after sealing. Conflicting duplicates and previously unseen events at
-or before the sealed availability cutoff fail closed. The producer owns the
-truth of its coverage claim.
+replay after sealing. Conflicting duplicates fail closed.
+A previously unseen in-range event at or before the sealed availability cutoff
+invalidates the whole epoch atomically. Its reads and writes remain unavailable
+until the producer rebuilds the history under a fresh epoch identifier. The
+producer owns the truth of its coverage claim.
 
 Reads require a complete one-hour window and a sealed cutoff. A prior
 relationship observed within the retained evidence is returned as known.
