@@ -50,8 +50,9 @@ class _Context:
     def __init__(self, policy: DecisionPolicy) -> None:
         self.policy = policy
 
-    def resolve(self, transaction: CanonicalTransaction, principal: TrustedPrincipal
-                ) -> TrustedDecisionContext:
+    def resolve(
+        self, transaction: CanonicalTransaction, principal: TrustedPrincipal
+    ) -> TrustedDecisionContext:
         assert transaction.tenant_id in principal.tenant_ids
         now = datetime.now(UTC)
         return TrustedDecisionContext(
