@@ -241,6 +241,8 @@ def test_lineage_helper_is_not_imported_or_consulted_by_live_paths() -> None:
     offline = root / "poc" / "matured_lineage_replay.py"
     assert helper.is_file()
     assert offline.is_file()
+    synthetic_cli = root / "poc" / "synthetic_rules_comparison.py"
+    assert synthetic_cli.is_file()
     forbidden = ("temporal_lineage", "HistoricalFeatureEnvelope", "assert_historical_snapshot_bound")
     consumers = []
     wired_offline = []
@@ -254,9 +256,16 @@ def test_lineage_helper_is_not_imported_or_consulted_by_live_paths() -> None:
             assert "from gasha.poc.temporal_lineage import" in source
             assert "from gasha.poc.historical import" in source
             continue
+        if candidate == synthetic_cli:
+            assert "from gasha.poc.matured_lineage_replay import" in source
+            assert 'if __name__ == "__main__":' in source
+            continue
         if any(marker in source for marker in forbidden):
             consumers.append(candidate.relative_to(root).as_posix())
-        if "matured_lineage_replay" in source or "replay_offline_matured_lineage" in source:
+        if any(marker in source for marker in (
+            "matured_lineage_replay", "replay_offline_matured_lineage",
+            "synthetic_rules_comparison", "compare_synthetic_rules",
+        )):
             wired_offline.append(candidate.relative_to(root).as_posix())
     assert consumers == [], f"Unreviewed production lineage integration: {consumers}"
     assert wired_offline == [], f"Offline helper wired into production path: {wired_offline}"
