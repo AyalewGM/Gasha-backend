@@ -299,7 +299,7 @@ def test_hostile_clocks_rejected_before_callbacks() -> None:
         plan_retirement(entry=active, at=datetime(2026, 11, 15, tzinfo=CallbackTZ()))
     # Naive datetime is not a trusted clock either.
     with pytest.raises(TenantConfigRejected):
-        draft(created_at=datetime(2026, 11, 14, 12, 0))  # noqa: DTZ001
+        draft(created_at=datetime(2026, 11, 14, 12, 0))
 
 
 def test_entry_coherence_rules() -> None:
