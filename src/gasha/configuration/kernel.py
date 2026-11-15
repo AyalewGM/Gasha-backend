@@ -11,13 +11,13 @@ before any decision path resolves configuration through it.
 from __future__ import annotations
 
 import re
-from math import isfinite
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timezone
 from enum import StrEnum
 from hashlib import sha256
 from json import JSONDecodeError, dumps, loads
+from math import isfinite
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
