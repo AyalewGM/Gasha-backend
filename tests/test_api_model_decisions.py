@@ -1,9 +1,7 @@
-"""Protected-API model wiring: a policy model_version selects the fused path.
+"""#144: protected routes reject model serving even with a trained registry.
 
-These tests install a real ArtifactRegistry trained on synthetic matured
-labels, plus the same synthetic identity/context providers used by the
-security suite. They cover model decisions, fail-closed behavior when the
-registry or artifact is missing, and shadow-mode evaluation of a model.
+The offline research artifact can exist but has no protected API activation
+authority. Deterministic decisions remain available for model-free policies.
 """
 
 from __future__ import annotations
@@ -194,7 +192,7 @@ def model_policy() -> DecisionPolicy:
     )
 
 
-def test_model_policy_decides_through_trained_scorer(wired) -> None:
+def test_trained_registry_cannot_activate_model_in_protected_decision(wired) -> None:
     client, audit = wired
     app.state.decision_context_provider = ContextProvider(model_policy())
 
@@ -204,18 +202,14 @@ def test_model_policy_decides_through_trained_scorer(wired) -> None:
         headers={"Authorization": "Bearer valid"},
     )
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["model_version"] == "model-v1"
-    # The provider's snapshot scores are high; the model should alert.
-    assert body["action"] in ("review", "hold", "block")
-    assert any(code.startswith("MODEL_") for code in body["reason_codes"])
-    assert any(code == "HIGH_VELOCITY_RISK" for code in body["reason_codes"])
-    assert any(e.result == "succeeded" for e in audit.events)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "decision unavailable"}
+    assert any(e.result == "failed" for e in audit.events)
+    assert not any(e.result == "succeeded" for e in audit.events)
 
 
-def test_shadow_evaluation_uses_model_without_enforcing(wired) -> None:
-    client, _ = wired
+def test_trained_registry_cannot_activate_model_in_protected_evaluation(wired) -> None:
+    client, audit = wired
     app.state.decision_context_provider = ContextProvider(model_policy())
 
     response = client.post(
@@ -224,11 +218,10 @@ def test_shadow_evaluation_uses_model_without_enforcing(wired) -> None:
         headers={"Authorization": "Bearer valid"},
     )
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["operating_mode"] == "shadow"
-    assert body["effective_action"] == "no_action_shadow"
-    assert body["decision"]["model_version"] == "model-v1"
+    assert response.status_code == 503
+    assert response.json() == {"detail": "evaluation unavailable"}
+    assert any(e.result == "failed" for e in audit.events)
+    assert not any(e.result == "succeeded" for e in audit.events)
 
 
 def test_model_policy_without_registry_fails_closed(wired) -> None:
