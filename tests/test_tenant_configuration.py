@@ -315,3 +315,42 @@ def test_entry_coherence_rules() -> None:
     # Draft pretending history fields is rejected.
     with pytest.raises(TenantConfigRejected):
         replace(base, activated_at=NOW)
+
+
+
+def test_stored_rows_revalidate_kind_schema_even_with_valid_digest() -> None:
+    base = draft()
+    for kind, content in (
+        (ConfigKind.DECISION_POLICY, "{}"),
+        (ConfigKind.DETECTOR_POLICY_BUNDLE, base.content_json),
+    ):
+        digest = content_digest(kind, content)
+        with pytest.raises(TenantConfigRejected):
+            replace(base, config_kind=kind, content_json=content, content_digest=digest)
+        row = row_of(base)
+        row["config_kind"] = kind.value
+        row["content_json"] = content
+        row["content_digest"] = digest
+        with pytest.raises(TenantConfigRejected):
+            decode_row(row)
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_detector_parameters_rejected_before_digest_or_storage(invalid: float) -> None:
+    payload = {"journey": {"policy_version": "j-1", "window_minutes": invalid}}
+    with pytest.raises(TenantConfigRejected):
+        canonical_content(ConfigKind.DETECTOR_POLICY_BUNDLE, payload)
+    with pytest.raises(TenantConfigRejected):
+        draft(kind=ConfigKind.DETECTOR_POLICY_BUNDLE, payload=payload)
+
+
+def test_nonfinite_stored_json_rejected_even_with_matching_digest() -> None:
+    entry = draft()
+    # Python's JSON parser accepts nonstandard NaN, but durable configuration
+    # and canonical digests must never accept it.
+    content = '{"block_threshold":NaN,"configuration_version":"cfg-1","hold_threshold":0.85,"model_version":null,"monitor_threshold":0.5,"policy_version":"policy-1","review_threshold":0.7,"rule_version":"rules-1"}'
+    row = row_of(entry)
+    row["content_json"] = content
+    row["content_digest"] = content_digest(ConfigKind.DECISION_POLICY, content)
+    with pytest.raises(TenantConfigRejected):
+        decode_row(row)

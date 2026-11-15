@@ -11,6 +11,7 @@ before any decision path resolves configuration through it.
 from __future__ import annotations
 
 import re
+from math import isfinite
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timezone
@@ -99,7 +100,13 @@ def _optional_time(name: str, value: object) -> datetime | None:
 
 
 def _canonical(payload: object) -> str:
-    return dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    try:
+        return dumps(
+            payload, sort_keys=True, ensure_ascii=True,
+            separators=(",", ":"), allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TenantConfigRejected("configuration content must be finite JSON") from exc
 
 
 def _number(name: str, value: object) -> float:
@@ -107,8 +114,11 @@ def _number(name: str, value: object) -> float:
     # booleans and hostile numeric subclasses.
     if type(value) not in (int, float):
         raise TenantConfigRejected(f"{name} must be a numeric risk score")
-    numeric = float(cast("int | float", value))
-    if not 0.0 <= numeric <= 1.0:
+    try:
+        numeric = float(cast("int | float", value))
+    except OverflowError as exc:
+        raise TenantConfigRejected(f"{name} exceeds a finite risk score") from exc
+    if not isfinite(numeric) or not 0.0 <= numeric <= 1.0:
         raise TenantConfigRejected(f"{name} must be within [0, 1]")
     return numeric
 
@@ -133,6 +143,8 @@ def _scalar(name: str, value: object) -> None:
     # require a later contract revision, not silent acceptance.
     if type(value) not in (str, int, float, bool, type(None)):
         raise TenantConfigRejected(f"{name} must be a scalar parameter")
+    if type(value) is float and not isfinite(value):
+        raise TenantConfigRejected(f"{name} must be a finite JSON number")
 
 
 def _validate_detector_bundle(payload: object) -> None:
@@ -217,8 +229,10 @@ class TenantConfigEntry:
             decoded = loads(self.content_json)
         except JSONDecodeError as exc:
             raise TenantConfigRejected("content must be JSON") from exc
-        if _canonical(decoded) != self.content_json:
-            raise TenantConfigRejected("content must be canonical JSON")
+        # A matching digest binds bytes, not policy semantics. Validate schema
+        # on every stored-row read and on dataclasses.replace() construction.
+        if canonical_content(self.config_kind, decoded) != self.content_json:
+            raise TenantConfigRejected("content must be canonical and match its kind")
         _ref("content_digest", self.content_digest)
         if self.content_digest != content_digest(self.config_kind, self.content_json):
             raise TenantConfigRejected("content digest does not bind this content")

@@ -46,6 +46,8 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_trigger
         WHERE tgname = 'tenant_configurations_content_immutable'
+          AND tgrelid = 'tenant_configurations'::regclass
+          AND NOT tgisinternal
     ) THEN
         CREATE TRIGGER tenant_configurations_content_immutable
         BEFORE UPDATE OF tenant_id, config_kind, version, content_json,

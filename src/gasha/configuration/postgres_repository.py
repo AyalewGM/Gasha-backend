@@ -104,6 +104,12 @@ def _kind(config_kind: object) -> ConfigKind:
     return config_kind
 
 
+def _require_transaction(connection: Connection) -> None:
+    """Reject a connection switched to autocommit after service construction."""
+    if getattr(connection, "autocommit", None) is not False:
+        raise TenantConfigRejected("tenant configuration requires autocommit=False")
+
+
 def _read_scope(
     cursor: Cursor, *, tenant_id: str, config_kind: ConfigKind
 ) -> tuple[TenantConfigEntry, ...]:
@@ -125,6 +131,11 @@ class PostgresTenantConfigurationService:
     """Tenant-scoped configuration store; no API, identity or authority source."""
 
     def __init__(self, connection: Connection) -> None:
+        # Advisory transaction locks, lifecycle writes and audit inserts must
+        # share ONE transaction. Autocommit would release the lock at each SQL
+        # statement and could leave a retired incumbent after audit failure.
+        # Unknown connection modes are rejected instead of assumed safe.
+        _require_transaction(connection)
         self._connection = connection
 
     def _lock_scope(self, cursor: Cursor, tenant_id: str, kind: ConfigKind) -> None:
@@ -160,6 +171,7 @@ class PostgresTenantConfigurationService:
 
     def entries(self, *, tenant_id: str, config_kind: ConfigKind) -> tuple[TenantConfigEntry, ...]:
         """Read a scope's full version history; every row is re-validated."""
+        _require_transaction(self._connection)
         _tenant(tenant_id)
         _kind(config_kind)
         try:
@@ -198,6 +210,7 @@ class PostgresTenantConfigurationService:
         at: datetime,
     ) -> TenantConfigEntry:
         """Mint the next DRAFT version; identical-content replay returns existing."""
+        _require_transaction(self._connection)
         actor = _actor_ref(provisioner_ref)
         tenant = _tenant(tenant_id)
         kind = _kind(config_kind)
@@ -266,6 +279,7 @@ class PostgresTenantConfigurationService:
         at: datetime,
     ) -> TenantConfigEntry:
         """Atomically retire the incumbent and activate a draft version."""
+        _require_transaction(self._connection)
         actor = _actor_ref(provisioner_ref)
         tenant = _tenant(tenant_id)
         kind = _kind(config_kind)
@@ -331,6 +345,7 @@ class PostgresTenantConfigurationService:
         at: datetime,
     ) -> TenantConfigEntry:
         """Retire an ACTIVE version (e.g. decommissioning a kind for a tenant)."""
+        _require_transaction(self._connection)
         actor = _actor_ref(provisioner_ref)
         tenant = _tenant(tenant_id)
         kind = _kind(config_kind)
