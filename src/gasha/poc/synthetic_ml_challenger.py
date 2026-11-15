@@ -85,6 +85,10 @@ def compare_synthetic_challenger(
     train = _cohort(start=_TRAIN_START, count=120, offset=0)
     holdout = _cohort(start=_HOLDOUT_START, count=_HOLDOUT_SIZE, offset=120)
     artifact_path = artifact_root / _MODEL_VERSION
+    try:
+        artifact_path.mkdir(mode=0o700, parents=True, exist_ok=False)
+    except FileExistsError:
+        raise ValueError("synthetic artifact destination already exists") from None
     manifest = train_model(
         train, label_cutoff=_TRAIN_CUTOFF, model_version=_MODEL_VERSION, artifact_dir=artifact_path,
         tenant_id=_TENANT, params=TrainingParams(num_boost_round=60, early_stopping_rounds=10),

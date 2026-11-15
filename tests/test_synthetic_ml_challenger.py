@@ -42,3 +42,22 @@ def test_budget_validation_precedes_artifact_creation(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="budget"):
         compare_synthetic_challenger(artifact_root=tmp_path, alert_budget=41)
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("occupied_by", ["directory", "dangling_symlink"])
+def test_artifact_destination_must_be_new(tmp_path: Path, occupied_by: str) -> None:
+    destination = tmp_path / "synthetic-xgboost-challenger-v1"
+    redirected = tmp_path / "outside-artifact-destination"
+    if occupied_by == "directory":
+        destination.mkdir()
+    else:
+        destination.symlink_to(redirected, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="destination already exists"):
+        compare_synthetic_challenger(artifact_root=tmp_path)
+
+    assert not redirected.exists()
+    if occupied_by == "directory":
+        assert list(destination.iterdir()) == []
+    else:
+        assert destination.readlink() == redirected
