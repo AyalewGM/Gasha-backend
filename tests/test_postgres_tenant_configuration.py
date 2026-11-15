@@ -301,9 +301,11 @@ def test_write_once_trigger_and_invalid_inputs(schema):
 def test_autocommit_connection_is_rejected_before_any_write(schema):
     import psycopg
 
-    with psycopg.connect(DSN, autocommit=True) as connection:
-        with pytest.raises(TenantConfigRejected, match="autocommit"):
-            PostgresTenantConfigurationService(connection)
+    with (
+        psycopg.connect(DSN, autocommit=True) as connection,
+        pytest.raises(TenantConfigRejected, match="autocommit"),
+    ):
+        PostgresTenantConfigurationService(connection)
 
 
 @pytest.mark.parametrize("operation", ["draft", "activate", "retire", "entries"])
@@ -429,11 +431,13 @@ def test_two_schemas_each_install_content_immutability_trigger(schema):
                 assert found == {schema: 1, second_schema: 1}
                 service = PostgresTenantConfigurationService(connection)
                 draft(service)
-                with pytest.raises(psycopg.errors.RaiseException):
-                    with connection.cursor() as cursor:
-                        cursor.execute(
-                            "UPDATE tenant_configurations SET content_json = '{}'::jsonb"
-                        )
+                with (
+                    pytest.raises(psycopg.errors.RaiseException),
+                    connection.cursor() as cursor,
+                ):
+                    cursor.execute(
+                        "UPDATE tenant_configurations SET content_json = '{}'::jsonb"
+                    )
                 connection.rollback()
         finally:
             admin.execute(
