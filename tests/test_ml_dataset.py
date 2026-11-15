@@ -130,7 +130,7 @@ def test_tenant_scope_is_enforced_when_declared() -> None:
 def test_naive_cutoff_and_untyped_events_are_rejected() -> None:
     with pytest.raises(DatasetRejected, match="timezone-aware"):
         build_training_dataset(
-            [event(1)], label_cutoff=datetime(2026, 1, 20, 9)  # noqa: DTZ001
+            [event(1)], label_cutoff=datetime(2026, 1, 20, 9)
         )
     with pytest.raises(DatasetRejected, match="typed historical event"):
         build_training_dataset([object()], label_cutoff=CUTOFF)  # type: ignore[list-item]
