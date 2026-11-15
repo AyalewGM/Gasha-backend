@@ -34,7 +34,6 @@ from gasha.cases.timeline import (
     case_command_fingerprints,
     validate_case_history,
 )
-from gasha.decision.fused import FusedDecisionService
 from gasha.decision.mode import DecisionEnvelope, ModeAwareDecisionService
 from gasha.decision.service import DecisionService
 from gasha.domain.models import (
@@ -48,7 +47,6 @@ from gasha.ingestion.outcome_ingestion import (
     IncumbentOutcomeRecord,
     OutcomeSubmission,
 )
-from gasha.ml.scorer import ArtifactRegistry
 from gasha.poc.outcomes import OutcomeRecord
 from gasha.security.access import (
     AuthorizationRejected,
@@ -317,8 +315,8 @@ app.state.case_history_reader = None
 app.state.case_queue_reader = None
 # No case mutation can be enabled by request flags or a frontend role.
 app.state.case_transition_writer = None
-# No model artifact registry is installed by default; a policy carrying
-# model_version without an installed registry fails closed with 503.
+# The optional offline experiment registry cannot authorize protected model serving.
+# Keep the injection slot inert for explicit fail-closed regression testing.
 app.state.model_registry = None
 
 
@@ -509,25 +507,17 @@ def _trusted_context(
     return context
 
 
-def _decision_service(
-    request: Request, policy: DecisionPolicy
-) -> DecisionService | FusedDecisionService:
-    """Selects the decision backend for the server-resolved policy.
+def _decision_service(policy: DecisionPolicy) -> DecisionService:
+    """Use only the authorized deterministic scorer on protected routes.
 
-    A policy without ``model_version`` uses the deterministic rules fusion.
-    A policy carrying one resolves the matching artifact through the
-    installed registry and decides through the calibrated model scorer.
-    Either way the same thresholds, actions and audit fields apply; a
-    missing registry or untrusted artifact raises so the caller fails
-    closed rather than silently substituting rules for a model policy.
+    #144 model experiments are offline and not an activation contract.
+    A server-supplied policy with a model_version is rejected even when a
+    registry is installed. Never silently replace the requested model with
+    rules while retaining misleading policy/model provenance.
     """
-    if policy.model_version is None:
-        return DecisionService(policy)
-    registry = getattr(request.app.state, "model_registry", None)
-    if type(registry) is not ArtifactRegistry:
-        raise ValueError("model artifact registry is not installed")
-    scorer = registry.resolve(policy.model_version)
-    return FusedDecisionService(policy, scorer)
+    if type(policy) is not DecisionPolicy or policy.model_version is not None:
+        raise ValueError("model serving is not authorized on protected routes")
+    return DecisionService(policy)
 
 
 
@@ -933,7 +923,7 @@ def create_decision(
     _require_action(request, principal, tx.tenant_id, action, event_id=tx.event_id)
     try:
         context = _trusted_context(request, tx, principal)
-        decision = _decision_service(request, context.policy).decide(
+        decision = _decision_service(context.policy).decide(
             tx, context.intelligence
         )
     except Exception as exc:
@@ -968,7 +958,7 @@ def create_evaluation(
         result = ModeAwareDecisionService(
             context.policy,
             operating_mode=OperatingMode.SHADOW,
-            service=_decision_service(request, context.policy),
+            service=_decision_service(context.policy),
         ).decide(tx, context.intelligence)
     except Exception as exc:
         _operation_audit(
