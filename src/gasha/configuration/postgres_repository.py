@@ -125,6 +125,12 @@ class PostgresTenantConfigurationService:
     """Tenant-scoped configuration store; no API, identity or authority source."""
 
     def __init__(self, connection: Connection) -> None:
+        # Advisory transaction locks, lifecycle writes and audit inserts must
+        # share ONE transaction. Autocommit would release the lock at each SQL
+        # statement and could leave a retired incumbent after audit failure.
+        # Unknown connection modes are rejected instead of assumed safe.
+        if getattr(connection, "autocommit", None) is not False:
+            raise TenantConfigRejected("tenant configuration requires autocommit=False")
         self._connection = connection
 
     def _lock_scope(self, cursor: Cursor, tenant_id: str, kind: ConfigKind) -> None:
