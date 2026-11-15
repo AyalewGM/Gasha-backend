@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import pytest
 import test_postgres_evaluation_alerts as alert_tests
@@ -13,7 +15,7 @@ from test_postgres_evaluation_alerts import ALERT_POLICY, evaluate, event
 from gasha.api.main import app
 from gasha.cases.postgres_queue_reader import ExplicitPostgresCaseQueueReader
 from gasha.cases.queue import CaseQueueRejected
-from gasha.cases.synthetic_ranking import SyntheticPostgresRankingSource
+from gasha.cases.synthetic_ranking import SyntheticPostgresRankingSource, _RankedEvidence
 from gasha.security.access import AuthorizationRejected, Capability, CredentialRejected
 
 installation = alert_tests.installation
@@ -107,3 +109,46 @@ def test_grouped_alert_cannot_be_reassigned_to_an_unrelated_case(installation):
     analyst = principal(caps=frozenset({Capability.CASE_READ}))
     with pytest.raises(CaseQueueRejected, match="unrelated"):
         source.select(principal=analyst, tenant_id="tenant-a", limit=2, at=datetime.now(UTC))
+
+
+def test_dst_fallback_ranks_and_validates_by_utc_instant(installation):
+    """The second 1 AM hour is later, despite its smaller New York wall time."""
+    sample = event()
+    evaluate(installation, sample)
+    with connect(installation) as connection:
+        row = connection.execute("""
+            SELECT a.*, e.record_json, initial.source_event_id,
+                   initial.source_context_ref, initial.occurred_at AS opened_at,
+                   initial.occurred_at AS last_transition_at
+            FROM evaluation_alerts a
+            JOIN shadow_evaluations e USING (tenant_id, event_id)
+            JOIN analyst_case_events initial
+              ON initial.tenant_id = a.tenant_id
+             AND initial.case_id = a.case_id AND initial.revision = 1
+        """).fetchone()
+    assert row is not None
+    zone = ZoneInfo("America/New_York")
+    opened = datetime(2026, 11, 1, 1, 50, tzinfo=zone, fold=0)
+    later = datetime(2026, 11, 1, 1, 10, tzinfo=zone, fold=1)
+    as_of = datetime(2026, 11, 1, 7, tzinfo=UTC)
+    assert opened.astimezone(UTC) < later.astimezone(UTC)
+    assert not opened <= later  # Regression: Python compares same-zone wall time.
+
+    source = SyntheticPostgresRankingSource(
+        connections=lambda: connect(installation), tenant_id="tenant-a",
+        alert_policies=(ALERT_POLICY,),
+    )
+    evidence = dict(row, opened_at=opened, generated_at=opened, last_transition_at=later)
+    assert source._verify(evidence, at=as_of).case_id == row["case_id"]
+
+    # Same wall-time with a different DST fold is not the same evidence instant.
+    altered = dict(evidence, generated_at=opened.replace(fold=1))
+    with pytest.raises(CaseQueueRejected, match="disagree"):
+        source._verify(altered, at=as_of)
+
+    first = _RankedEvidence(
+        UUID(int=2), sample.event_id, sample.event_id, "0" * 64,
+        "1" * 64, ("ATO-02",), opened, 2, 0.91,
+    )
+    second = replace(first, case_id=UUID(int=1), opened_at=later)
+    assert first.sort_key(as_of) < second.sort_key(as_of)
