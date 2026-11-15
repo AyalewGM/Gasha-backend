@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from argparse import ArgumentParser
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
@@ -18,7 +19,6 @@ from gasha.domain.models import (
 from gasha.poc.historical import (
     ConfirmedOutcomeLabel,
     HistoricalTransactionEvent,
-    ReplayedEventResult,
 )
 from gasha.poc.matured_lineage_replay import OfflineCohortScope, replay_offline_matured_lineage
 from gasha.poc.temporal_lineage import HistoricalFeatureEnvelope, SignalLineage
@@ -81,18 +81,19 @@ def _rate(numerator: int, denominator: int, reason: str) -> dict[str, object]:
     }
 
 
-def _measure(
-    results: tuple[ReplayedEventResult, ...], *, alert_budget: int,
+def measure_same_budget(
+    results: Sequence[tuple[HistoricalTransactionEvent, float]], *, alert_budget: int,
 ) -> dict[str, object]:
+    """Score a labeled cohort whose unreconciled labels have already been removed."""
     # Budget consumes all selected events, including those whose labels are unavailable.
     ordered = sorted(results, key=lambda row: (
-        -row.decision.risk_score, row.event.transaction.occurred_at, row.event.transaction.event_id,
+        -row[1], row[0].transaction.occurred_at, row[0].transaction.event_id,
     ))
-    alerted_ids = {row.decision.event_id for row in ordered[:alert_budget]}
+    alerted_ids = {event.transaction.event_id for event, _ in ordered[:alert_budget]}
     tp = fp = tn = fn = unlabeled = alerted_unlabeled = 0
-    for row in results:
-        alerted = row.decision.event_id in alerted_ids
-        label = row.event.label
+    for event, _ in results:
+        alerted = event.transaction.event_id in alerted_ids
+        label = event.label
         if label is None:
             unlabeled += 1
             alerted_unlabeled += int(alerted)
@@ -165,7 +166,10 @@ def compare_synthetic_rules(*, alert_budget: int = 4) -> dict[str, object]:
             "policy_version": scope.policy_version,
             "evaluation_digest": result.evaluation_digest,
             "maturity": result.to_dict()["maturity"],
-            **_measure(tuple(result.replay.results), alert_budget=alert_budget),
+            **measure_same_budget(
+                [(row.event, row.decision.risk_score) for row in result.replay.results],
+                alert_budget=alert_budget,
+            ),
         }
 
     report: dict[str, object] = {
