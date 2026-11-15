@@ -306,6 +306,42 @@ def test_autocommit_connection_is_rejected_before_any_write(schema):
             PostgresTenantConfigurationService(connection)
 
 
+@pytest.mark.parametrize("operation", ["draft", "activate", "retire", "entries"])
+def test_connection_mode_flip_after_service_construction_fails_closed(schema, operation):
+    """Constructor-only checking is unsafe: psycopg autocommit is mutable."""
+    with connect(schema) as connection:
+        service = PostgresTenantConfigurationService(connection)
+        # Connection is idle after connect() commits its search-path SET.
+        # A pool/operator may change its mode after the service was created.
+        connection.autocommit = True
+        with pytest.raises(TenantConfigRejected, match="autocommit"):
+            if operation == "draft":
+                draft(service)
+            elif operation == "activate":
+                service.activate(
+                    provisioner_ref=PROVISIONER,
+                    tenant_id="tenant-a",
+                    config_kind=ConfigKind.DECISION_POLICY,
+                    version=1,
+                    at=AT,
+                )
+            elif operation == "retire":
+                service.retire(
+                    provisioner_ref=PROVISIONER,
+                    tenant_id="tenant-a",
+                    config_kind=ConfigKind.DECISION_POLICY,
+                    version=1,
+                    at=AT,
+                )
+            else:
+                assert operation == "entries"
+                service.entries(
+                    tenant_id="tenant-a",
+                    config_kind=ConfigKind.DECISION_POLICY,
+                )
+        assert counts(connection) == (0, 0)
+
+
 def test_failed_activation_audit_rolls_back_incumbent_retirement(schema):
     import psycopg
 
