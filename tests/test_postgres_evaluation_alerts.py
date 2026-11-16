@@ -599,3 +599,105 @@ def test_concurrent_exact_retry_and_changed_installed_policy_never_mutate_origin
         assert connection.execute(
             "SELECT count(*) AS n FROM security_audit_events"
         ).fetchone()["n"] == 0
+
+
+def test_installed_policy_separate_runtime_login_denied_mutations(installation):
+    """#148 synthetic DB role negative: installations need a distinct owner.
+
+    The PostgreSQL service user in this fixture provisions the role and grants.
+    This does NOT certify a Bank deployment, Bank identity, or tenant-level RLS.
+    """
+    import psycopg
+    from psycopg import sql
+
+    name = "gasha_alert_runtime_" + uuid4().hex[:14]
+    password = uuid4().hex + uuid4().hex
+    ident = sql.Identifier(name)
+    namespace = sql.Identifier(installation)
+    installed_table = sql.SQL("{}.tenant_alert_policy_installations").format(namespace)
+    provenance_table = sql.SQL("{}.evaluation_alert_policy_provenance").format(namespace)
+    with psycopg.connect(DSN, autocommit=True) as owner:
+        owner.execute(
+            sql.SQL(
+                "CREATE ROLE {} LOGIN PASSWORD {} "
+                "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
+            ).format(ident, sql.Literal(password))
+        )
+        try:
+            owner.execute(
+                sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(namespace, ident)
+            )
+            owner.execute(
+                sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(installed_table, ident)
+            )
+            owner.execute(
+                sql.SQL("GRANT SELECT, INSERT ON TABLE {} TO {}").format(
+                    provenance_table, ident,
+                )
+            )
+            # Connect as a distinct LOGIN. SET ROLE from the superuser is
+            # insufficient to exercise privilege-escalation denial.
+            with psycopg.connect(
+                DSN, user=name, password=password, autocommit=True,
+            ) as runtime:
+                runtime.execute(
+                    sql.SQL("SET search_path TO {}").format(namespace)
+                )
+                assert runtime.execute("SELECT current_user").fetchone()[0] == name
+                assert runtime.execute(
+                    "SELECT count(*) FROM tenant_alert_policy_installations "
+                    "WHERE tenant_id = 'tenant-a'"
+                ).fetchone()[0] == 1
+                assert runtime.execute(
+                    "SELECT has_table_privilege(current_user, "
+                    "'evaluation_alert_policy_provenance', 'INSERT')"
+                ).fetchone()[0] is True
+                forbidden = (
+                    "INSERT INTO tenant_alert_policy_installations (tenant_id) "
+                    "VALUES ('tenant-a')",
+                    "UPDATE tenant_alert_policy_installations SET policy_version = 'forged'",
+                    "DELETE FROM tenant_alert_policy_installations",
+                    "TRUNCATE tenant_alert_policy_installations",
+                    "UPDATE evaluation_alert_policy_provenance "
+                    "SET policy_version = 'forged'",
+                    "DELETE FROM evaluation_alert_policy_provenance",
+                    "ALTER TABLE tenant_alert_policy_installations "
+                    "DISABLE TRIGGER tenant_alert_policy_installations_immutable",
+                    "CREATE OR REPLACE FUNCTION reject_alert_policy_provenance_mutation() "
+                    "RETURNS trigger LANGUAGE plpgsql AS $$ "
+                    "BEGIN RETURN NULL; END; $$",
+                )
+                for statement in forbidden:
+                    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                        runtime.execute(statement)
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    runtime.execute("SET ROLE gasha_test")
+            assert owner.execute(
+                sql.SQL("SELECT count(*) FROM {} WHERE tenant_id = 'tenant-a'").format(
+                    installed_table,
+                )
+            ).fetchone()[0] == 1
+            assert owner.execute(
+                sql.SQL(
+                    "SELECT tgenabled FROM pg_trigger "
+                    "WHERE tgrelid = {}::regclass AND "
+                    "tgname = 'tenant_alert_policy_installations_immutable'"
+                ).format(sql.Literal(f"{installation}.tenant_alert_policy_installations"))
+            ).fetchone()[0] == "O"
+        finally:
+            owner.execute(
+                sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(
+                    provenance_table, ident,
+                )
+            )
+            owner.execute(
+                sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(
+                    installed_table, ident,
+                )
+            )
+            owner.execute(
+                sql.SQL("REVOKE ALL ON SCHEMA {} FROM {}").format(
+                    namespace, ident,
+                )
+            )
+            owner.execute(sql.SQL("DROP ROLE {}").format(ident))
