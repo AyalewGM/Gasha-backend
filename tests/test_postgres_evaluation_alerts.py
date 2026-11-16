@@ -664,8 +664,8 @@ def test_installed_policy_separate_runtime_login_denied_mutations(installation):
                     ("ALTER TABLE tenant_alert_policy_installations "
                      "DISABLE TRIGGER tenant_alert_policy_installations_immutable"),
                     ("CREATE OR REPLACE FUNCTION reject_alert_policy_provenance_mutation() "
-                     "RETURNS trigger LANGUAGE plpgsql AS $ "
-                     "BEGIN RETURN NULL; END; $"),
+                     "RETURNS trigger LANGUAGE plpgsql AS $$ "
+                     "BEGIN RETURN NULL; END; $$"),
                 )
                 for statement in forbidden:
                     with pytest.raises(psycopg.errors.InsufficientPrivilege):
