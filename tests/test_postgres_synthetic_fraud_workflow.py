@@ -92,6 +92,9 @@ def test_computed_graph_detection_to_authenticated_investigation_and_kpis(
     installation, monkeypatch,
 ):
     sample = computed_fan_in()
+    # Installation is a separate privileged synthetic setup step, not an
+    # event claim or an implicit policy-registration side effect.
+    alert_tests.install_policy(installation, ALERT_POLICY)
     decision = alert_tests.evaluate(
         installation, sample, writer=PostgresEvaluationAlertWriter(
             TENANT, ALERT_POLICY, principal(caps=frozenset({Capability.CASE_CREATE})),
