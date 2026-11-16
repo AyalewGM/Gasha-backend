@@ -156,8 +156,8 @@ def test_unresolvable_model_version_fails_closed() -> None:
 
 def test_candidate_evaluation_reports_fpr_reduction() -> None:
     evaluation = evaluate_candidate_model(
-        label_cutoff=CUTOFF,
         cohort(),
+        label_cutoff=CUTOFF,
         incumbent_policies=incumbent(),
         candidate_policies=policies(),
         resolve=resolver,
@@ -180,8 +180,8 @@ def test_no_promotion_when_model_regresses_recall() -> None:
             return 0.0  # suppresses every alert: no FPs but no TPs either
 
     evaluation = evaluate_candidate_model(
-        label_cutoff=CUTOFF,
         cohort(),
+        label_cutoff=CUTOFF,
         incumbent_policies=incumbent(),
         candidate_policies=policies(),
         resolve=lambda _v: BlindScorer(model_version="model-1"),
@@ -196,8 +196,8 @@ def test_no_promotion_without_labeled_cases() -> None:
         item.model_copy(update={"label": None}) for item in cohort()
     ]
     evaluation = evaluate_candidate_model(
-        label_cutoff=CUTOFF,
         unlabeled,
+        label_cutoff=CUTOFF,
         incumbent_policies=incumbent(),
         candidate_policies=policies(),
         resolve=resolver,
