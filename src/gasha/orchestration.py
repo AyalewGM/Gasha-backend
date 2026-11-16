@@ -186,7 +186,7 @@ class ShadowOrchestrator:
         )
         try:
             if self._persistence is not None:
-                self._persistence.save(record, audit)
+                return self._persistence.save(record, audit).evaluation
             else:
                 self._audit.save(audit)
                 self._evaluations.save(record)
