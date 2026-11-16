@@ -81,7 +81,7 @@ RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
-AS $
+AS $$
 DECLARE
     is_new_evaluation BOOLEAN;
 BEGIN
@@ -101,9 +101,9 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$;
+$$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_trigger
@@ -115,7 +115,7 @@ BEGIN
             BEFORE INSERT ON evaluation_alert_policy_provenance
             FOR EACH ROW EXECUTE FUNCTION enforce_initial_alert_policy_provenance();
     END IF;
-END $;
+END $$;
 
 -- Legacy evaluations have no provenance row. Their duplicate replay MUST
 -- fail closed, not be inferred from a version label. A controlled migration
