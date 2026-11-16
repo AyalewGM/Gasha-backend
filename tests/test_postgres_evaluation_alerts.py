@@ -78,6 +78,7 @@ def installation(schema):
             "003_create_shadow_evaluations.sql",
             "017_evaluation_alerts.sql",
             "018_alert_policy_provenance.sql",
+            "019_shadow_evaluation_immutability.sql",
         ):
             connection.execute((MIGRATIONS / migration).read_text())
     for tenant in ("tenant-a", "tenant-b"):
@@ -637,6 +638,7 @@ def test_installed_policy_separate_runtime_login_denied_mutations(installation):
     namespace = sql.Identifier(installation)
     installed_table = sql.SQL("{}.tenant_alert_policy_installations").format(namespace)
     provenance_table = sql.SQL("{}.evaluation_alert_policy_provenance").format(namespace)
+    shadow_table = sql.SQL("{}.shadow_evaluations").format(namespace)
     with psycopg.connect(DSN, autocommit=True) as owner:
         owner.execute(
             sql.SQL(
@@ -656,6 +658,14 @@ def test_installed_policy_separate_runtime_login_denied_mutations(installation):
                     provenance_table, ident,
                 )
             )
+            # SELECT FOR UPDATE needs an UPDATE privilege on PostgreSQL.
+            # Deliberately grant it to reproduce the realistic privilege
+            # combination that could refresh xmin on a committed legacy row.
+            owner.execute(
+                sql.SQL("GRANT SELECT, UPDATE ON TABLE {} TO {}").format(
+                    shadow_table, ident,
+                )
+            )
             # Connect as a distinct LOGIN. SET ROLE from the superuser is
             # insufficient to exercise privilege-escalation denial.
             with psycopg.connect(
@@ -673,6 +683,48 @@ def test_installed_policy_separate_runtime_login_denied_mutations(installation):
                     "SELECT has_table_privilege(current_user, "
                     "'evaluation_alert_policy_provenance', 'INSERT')"
                 ).fetchone()[0] is True
+                assert runtime.execute(
+                    "SELECT has_table_privilege(current_user, "
+                    "'shadow_evaluations', 'UPDATE')"
+                ).fetchone()[0] is True
+                # Realistic read-side lock remains usable even though actual
+                # row mutations are forbidden by migration 019.
+                legacy_identity = (legacy.tenant_id, legacy.event_id)
+                prior_shadow = runtime.execute(
+                    "SELECT record_json, persisted_at FROM shadow_evaluations "
+                    "WHERE tenant_id = %s AND event_id = %s FOR UPDATE",
+                    legacy_identity,
+                ).fetchone()
+                assert prior_shadow is not None
+                for assignment in (
+                    "persisted_at = persisted_at",  # no-op also refreshes xmin
+                    "persisted_at = TIMESTAMPTZ '2000-01-01 00:00:00+00'",
+                ):
+                    with pytest.raises(
+                        psycopg.errors.CheckViolation,
+                        match="shadow evaluations are immutable",
+                    ):
+                        runtime.execute(
+                            "UPDATE shadow_evaluations SET " + assignment +
+                            " WHERE tenant_id = %s AND event_id = %s",
+                            legacy_identity,
+                        )
+                with pytest.raises(
+                    psycopg.errors.CheckViolation,
+                    match="shadow evaluations are immutable",
+                ):
+                    runtime.execute(
+                        "DELETE FROM shadow_evaluations "
+                        "WHERE tenant_id = %s AND event_id = %s",
+                        legacy_identity,
+                    )
+                assert runtime.execute(
+                    "SELECT record_json, persisted_at FROM shadow_evaluations "
+                    "WHERE tenant_id = %s AND event_id = %s",
+                    legacy_identity,
+                ).fetchone() == prior_shadow
+                # Both UPDATE-to-xmin-refresh paths failed BEFORE a forged
+                # provenance INSERT could be attempted.
                 # This role HAS INSERT on provenance. The DB trigger, not a
                 # missing grant or application check, must reject backfill.
                 with pytest.raises(
@@ -709,6 +761,11 @@ def test_installed_policy_separate_runtime_login_denied_mutations(installation):
                      "DISABLE TRIGGER tenant_alert_policy_installations_immutable"),
                     ("ALTER TABLE evaluation_alert_policy_provenance "
                      "DISABLE TRIGGER evaluation_alert_policy_provenance_initial_only"),
+                    ("ALTER TABLE shadow_evaluations "
+                     "DISABLE TRIGGER shadow_evaluations_immutable"),
+                    ("CREATE OR REPLACE FUNCTION reject_shadow_evaluation_mutation() "
+                     "RETURNS trigger LANGUAGE plpgsql AS $ "
+                     "BEGIN RETURN NULL; END; $"),
                     ("CREATE OR REPLACE FUNCTION reject_alert_policy_provenance_mutation() "
                      "RETURNS trigger LANGUAGE plpgsql AS $$ "
                      "BEGIN RETURN NULL; END; $$"),
@@ -730,7 +787,19 @@ def test_installed_policy_separate_runtime_login_denied_mutations(installation):
                     "tgname = 'tenant_alert_policy_installations_immutable'"
                 ).format(sql.Literal(f"{installation}.tenant_alert_policy_installations"))
             ).fetchone()[0] == "O"
+            assert owner.execute(
+                sql.SQL(
+                    "SELECT tgenabled FROM pg_trigger "
+                    "WHERE tgrelid = {}::regclass AND "
+                    "tgname = 'shadow_evaluations_immutable'"
+                ).format(sql.Literal(f"{installation}.shadow_evaluations"))
+            ).fetchone()[0] == "O"
         finally:
+            owner.execute(
+                sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(
+                    shadow_table, ident,
+                )
+            )
             owner.execute(
                 sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(
                     provenance_table, ident,
