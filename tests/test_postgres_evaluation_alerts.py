@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from hashlib import sha256
+from json import dumps
 from datetime import UTC, datetime, timedelta
 from time import monotonic, sleep
 from uuid import uuid4
@@ -18,7 +20,13 @@ from test_postgres_case_writer_bridge import (
 )
 from test_postgres_evaluations import POLICY, envelope, inbound_for
 
-from gasha.cases.evaluation_alerts import AlertPolicy, PostgresEvaluationAlertWriter
+from gasha.cases.evaluation_alerts import (
+    ALERT_POLICY_DIGEST_SCHEMA,
+    AlertPolicy,
+    PostgresEvaluationAlertWriter,
+    alert_policy_content,
+    alert_policy_digest,
+)
 from gasha.cases.metrics import SyntheticAlertClock, summarize_synthetic_case_metrics
 from gasha.cases.postgres_timeline import PostgresCaseTimelineService
 from gasha.cases.timeline import (
@@ -41,6 +49,27 @@ schema = bridge.schema
 ALERT_POLICY = AlertPolicy("synthetic-alerts-v1", 0.7, (("HIGH_DEVICE_SESSION_RISK", "ATO-02"),))
 
 
+def install_policy(installation, policy: AlertPolicy, tenant: str = "tenant-a") -> None:
+    """Synthetic privileged test provisioning; never an application request path."""
+    installation_ref = sha256(dumps(
+        ["synthetic-test-install", tenant, policy.policy_id, policy.version],
+        separators=(",", ":"), sort_keys=True,
+    ).encode()).hexdigest()
+    with connect(installation) as connection:
+        connection.execute(
+            """INSERT INTO tenant_alert_policy_installations (
+                 tenant_id, policy_id, policy_version, digest_schema, content_digest,
+                 content_json, installation_ref, installed_at
+               ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+               ON CONFLICT (tenant_id, policy_id, policy_version) DO NOTHING""",
+            (
+                tenant, policy.policy_id, policy.version, ALERT_POLICY_DIGEST_SCHEMA,
+                alert_policy_digest(policy), dumps(alert_policy_content(policy)),
+                installation_ref, datetime.now(UTC),
+            ),
+        )
+
+
 @pytest.fixture
 def installation(schema):
     with connect(schema) as connection:
@@ -48,8 +77,11 @@ def installation(schema):
             "001_create_fraud_decision_audit.sql",
             "003_create_shadow_evaluations.sql",
             "017_evaluation_alerts.sql",
+            "018_alert_policy_provenance.sql",
         ):
             connection.execute((MIGRATIONS / migration).read_text())
+    for tenant in ("tenant-a", "tenant-b"):
+        install_policy(schema, ALERT_POLICY, tenant)
     return schema
 
 
@@ -370,3 +402,163 @@ def test_concurrent_conflicting_replays_choose_one_canonical_winner(installation
         assert connection.execute("SELECT count(*) AS n FROM evaluation_alerts").fetchone()["n"] in (0, 1)
         assert connection.execute("SELECT count(*) AS n FROM analyst_case_events").fetchone()["n"] in (0, 1)
 
+
+
+def test_allow_monitor_policy_provenance_is_durable_and_v2_replay_fails(installation):
+    for score in (0.1, 0.6):
+        sample = event(score=score)
+        original = evaluate(installation, sample)
+        with connect(installation) as connection:
+            provenance = connection.execute(
+                """SELECT * FROM evaluation_alert_policy_provenance
+                   WHERE tenant_id = %s AND event_id = %s""",
+                (sample.tenant_id, sample.event_id),
+            ).fetchone()
+            assert provenance["policy_id"] == ALERT_POLICY.policy_id
+            assert provenance["policy_version"] == ALERT_POLICY.version
+            assert provenance["digest_schema"] == ALERT_POLICY_DIGEST_SCHEMA
+            assert provenance["content_digest"] == alert_policy_digest(ALERT_POLICY)
+            assert connection.execute(
+                "SELECT count(*) AS n FROM evaluation_alerts"
+            ).fetchone()["n"] == 0
+        new_policy = AlertPolicy(
+            "synthetic-alerts-v2", 0.95, ALERT_POLICY.scenario_by_reason,
+        )
+        install_policy(installation, new_policy)
+        writer = PostgresEvaluationAlertWriter(
+            sample.tenant_id, new_policy, principal(tenant=sample.tenant_id),
+        )
+        with pytest.raises(ValueError, match="conflicting evaluation replay"):
+            evaluate(installation, sample, writer=writer)
+        assert evaluate(installation, sample) == original
+    with connect(installation) as connection:
+        assert connection.execute(
+            "SELECT count(*) AS n FROM evaluation_alert_policy_provenance"
+        ).fetchone()["n"] == 2
+
+
+def test_same_version_changed_mapping_denied_without_qualified_alert(installation):
+    sample = event(score=0.1)
+    evaluate(installation, sample)
+    altered = AlertPolicy(
+        ALERT_POLICY.version, ALERT_POLICY.minimum_score,
+        ALERT_POLICY.scenario_by_reason + (("UNUSED_REASON", "ATO-06"),),
+    )
+    with pytest.raises(ValueError, match="untrusted alert policy installation"):
+        evaluate(
+            installation, sample,
+            writer=PostgresEvaluationAlertWriter(
+                sample.tenant_id, altered, principal(tenant=sample.tenant_id),
+            ),
+        )
+    with connect(installation) as connection:
+        assert connection.execute(
+            "SELECT count(*) AS n FROM evaluation_alerts"
+        ).fetchone()["n"] == 0
+
+
+def test_changed_unused_policy_content_cannot_inherit_existing_alert(installation):
+    sample = event()
+    evaluate(installation, sample)
+    altered = AlertPolicy(
+        ALERT_POLICY.version, ALERT_POLICY.minimum_score,
+        ALERT_POLICY.scenario_by_reason + (("UNUSED_REASON", "APP-01"),),
+    )
+    with pytest.raises(ValueError, match="untrusted alert policy installation"):
+        evaluate(
+            installation, sample,
+            writer=PostgresEvaluationAlertWriter(
+                sample.tenant_id, altered, principal(tenant=sample.tenant_id),
+            ),
+        )
+    with connect(installation) as connection:
+        assert connection.execute(
+            "SELECT count(*) AS n FROM evaluation_alerts"
+        ).fetchone()["n"] == 1
+
+
+@pytest.mark.parametrize("tamper", ["missing", "unknown_schema", "wrong_digest"])
+def test_legacy_or_corrupt_provenance_replay_fails_closed(installation, tamper):
+    sample = event(score=0.1)
+    evaluate(installation, sample)
+    with connect(installation) as connection:
+        if tamper == "missing":
+            connection.execute("DELETE FROM evaluation_alert_policy_provenance")
+        else:
+            # Only the isolated test schema allows disabling the immutability
+            # trigger to simulate a corrupted/legacy database row.
+            connection.execute(
+                "ALTER TABLE evaluation_alert_policy_provenance DISABLE TRIGGER USER"
+            )
+            if tamper == "unknown_schema":
+                connection.execute(
+                    "UPDATE evaluation_alert_policy_provenance "
+                    "SET digest_schema = 'obsolete-alert-digest-v0'"
+                )
+            else:
+                connection.execute(
+                    "UPDATE evaluation_alert_policy_provenance "
+                    "SET content_digest = %s", ("0" * 64,),
+                )
+            connection.execute(
+                "ALTER TABLE evaluation_alert_policy_provenance ENABLE TRIGGER USER"
+            )
+    with pytest.raises(ValueError, match="alert policy provenance changed"):
+        evaluate(installation, sample)
+    with connect(installation) as connection:
+        assert connection.execute(
+            "SELECT count(*) AS n FROM evaluation_alerts"
+        ).fetchone()["n"] == 0
+        assert connection.execute(
+            "SELECT count(*) AS n FROM shadow_evaluations"
+        ).fetchone()["n"] == 1
+
+
+def test_same_event_id_in_distinct_tenants_has_distinct_provenance(installation):
+    first = event()
+    second = event(tenant="tenant-b")
+    second.event_id = first.event_id
+    second.canonical_transaction.event_id = first.event_id
+    evaluate(installation, first)
+    evaluate(installation, second)
+    with connect(installation) as connection:
+        provenance = connection.execute(
+            "SELECT tenant_id, installation_ref FROM evaluation_alert_policy_provenance "
+            "WHERE event_id = %s ORDER BY tenant_id", (first.event_id,),
+        ).fetchall()
+        assert len(provenance) == 2
+        assert [row["tenant_id"] for row in provenance] == ["tenant-a", "tenant-b"]
+        assert provenance[0]["installation_ref"] != provenance[1]["installation_ref"]
+
+
+def test_concurrent_two_installed_alert_policies_choose_one_winner(installation):
+    original = event(score=0.1)
+    alternative = AlertPolicy(
+        "synthetic-alerts-v2", 0.9, ALERT_POLICY.scenario_by_reason,
+    )
+    install_policy(installation, alternative)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(evaluate, installation, original),
+            pool.submit(
+                evaluate, installation, original,
+                writer=PostgresEvaluationAlertWriter(
+                    original.tenant_id, alternative, principal(),
+                ),
+            ),
+        ]
+        results = []
+        for future in futures:
+            try:
+                results.append(future.result(timeout=15))
+            except ValueError as exc:
+                assert "conflicting evaluation replay" in str(exc)
+                results.append(exc)
+    assert sum(not isinstance(item, Exception) for item in results) == 1
+    with connect(installation) as connection:
+        assert connection.execute(
+            "SELECT count(*) AS n FROM evaluation_alert_policy_provenance"
+        ).fetchone()["n"] == 1
+        assert connection.execute(
+            "SELECT count(*) AS n FROM shadow_evaluations"
+        ).fetchone()["n"] == 1
