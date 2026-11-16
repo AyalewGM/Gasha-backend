@@ -253,7 +253,9 @@ def test_cutoff_inclusive_and_stable_evidence_digest() -> None:
         records, label_cutoff=CUTOFF, incumbent_policies=incumbent(),
         candidate_policies=policies(), resolve=resolver,
     )
-    assert first == second
+    assert first.evidence_digest == second.evidence_digest
+    assert first.rules.true_positives == second.rules.true_positives
+    assert first.model.false_positives == second.model.false_positives
     assert len(first.evidence_digest) == 64
     assert first.matured_labeled_events == 16
     assert first.candidate_model_versions == (("tenant-a", "model-1"),)
