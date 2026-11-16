@@ -120,6 +120,14 @@ class PostgresEvaluationAlertWriter:
     policy: AlertPolicy
     principal: TrustedPrincipal
 
+    def require_current_principal(self) -> datetime:
+        """Check tenant-bound create authority even on an idempotent retry."""
+        authorize(self.principal, tenant_id=self.tenant_id, capability=Capability.CASE_CREATE)
+        expiry = _utc(self.principal.expires_at)
+        if datetime.now(UTC) >= expiry:
+            raise ValueError("alert writer requires a current service credential")
+        return expiry
+
     def append(
         self, connection: Connection, record: ShadowEvaluationRecord,
     ) -> None:
@@ -131,10 +139,7 @@ class PostgresEvaluationAlertWriter:
         priority, scenarios = evidence
         event = record.event
         decision = record.evaluation.decision
-        authorize(self.principal, tenant_id=self.tenant_id, capability=Capability.CASE_CREATE)
-        expiry = _utc(self.principal.expires_at)
-        if datetime.now(UTC) >= expiry:
-            raise ValueError("alert writer requires a current service credential")
+        expiry = self.require_current_principal()
 
         group_ref = alert_group_ref(record, self.policy.version)
         context_ref = evaluation_context_ref(record)
