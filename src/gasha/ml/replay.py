@@ -10,13 +10,13 @@ protected route, matching the #144 containment boundary.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
 import hashlib
 import json
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
-from datetime import UTC, datetime
 
 from gasha.decision.fused import FusedDecisionService
 from gasha.decision.service import DecisionService
