@@ -477,32 +477,39 @@ def test_changed_unused_policy_content_cannot_inherit_existing_alert(installatio
         ).fetchone()["n"] == 1
 
 
-@pytest.mark.parametrize("tamper", ["missing", "unknown_schema", "wrong_digest"])
+@pytest.mark.parametrize("tamper", ["missing", "null", "unknown_schema", "wrong_digest"])
 def test_legacy_or_corrupt_provenance_replay_fails_closed(installation, tamper):
     sample = event(score=0.1)
     evaluate(installation, sample)
     with connect(installation) as connection:
+        # Only the isolated test schema allows disabling the immutability
+        # trigger to simulate corrupted or pre-migration rows.
+        connection.execute(
+            "ALTER TABLE evaluation_alert_policy_provenance DISABLE TRIGGER USER"
+        )
         if tamper == "missing":
             connection.execute("DELETE FROM evaluation_alert_policy_provenance")
+        elif tamper == "null":
+            connection.execute(
+                "ALTER TABLE evaluation_alert_policy_provenance "
+                "ALTER COLUMN content_digest DROP NOT NULL"
+            )
+            connection.execute(
+                "UPDATE evaluation_alert_policy_provenance SET content_digest = NULL"
+            )
+        elif tamper == "unknown_schema":
+            connection.execute(
+                "UPDATE evaluation_alert_policy_provenance "
+                "SET digest_schema = 'obsolete-alert-digest-v0'"
+            )
         else:
-            # Only the isolated test schema allows disabling the immutability
-            # trigger to simulate a corrupted/legacy database row.
             connection.execute(
-                "ALTER TABLE evaluation_alert_policy_provenance DISABLE TRIGGER USER"
+                "UPDATE evaluation_alert_policy_provenance "
+                "SET content_digest = %s", ("0" * 64,),
             )
-            if tamper == "unknown_schema":
-                connection.execute(
-                    "UPDATE evaluation_alert_policy_provenance "
-                    "SET digest_schema = 'obsolete-alert-digest-v0'"
-                )
-            else:
-                connection.execute(
-                    "UPDATE evaluation_alert_policy_provenance "
-                    "SET content_digest = %s", ("0" * 64,),
-                )
-            connection.execute(
-                "ALTER TABLE evaluation_alert_policy_provenance ENABLE TRIGGER USER"
-            )
+        connection.execute(
+            "ALTER TABLE evaluation_alert_policy_provenance ENABLE TRIGGER USER"
+        )
     with pytest.raises(ValueError, match="alert policy provenance changed"):
         evaluate(installation, sample)
     with connect(installation) as connection:
@@ -562,3 +569,33 @@ def test_concurrent_two_installed_alert_policies_choose_one_winner(installation)
         assert connection.execute(
             "SELECT count(*) AS n FROM shadow_evaluations"
         ).fetchone()["n"] == 1
+
+
+def test_concurrent_exact_retry_and_changed_installed_policy_never_mutate_original(
+    installation,
+):
+    sample = event(score=0.6)
+    original = evaluate(installation, sample)
+    alternative = AlertPolicy(
+        "synthetic-alerts-v2", 0.9, ALERT_POLICY.scenario_by_reason,
+    )
+    install_policy(installation, alternative)
+    writer = PostgresEvaluationAlertWriter(
+        sample.tenant_id, alternative, principal(tenant=sample.tenant_id),
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        exact = pool.submit(evaluate, installation, sample)
+        altered = pool.submit(evaluate, installation, sample, writer=writer)
+        assert exact.result(timeout=15) == original
+        with pytest.raises(ValueError, match="conflicting evaluation replay"):
+            altered.result(timeout=15)
+    with connect(installation) as connection:
+        assert connection.execute(
+            "SELECT count(*) AS n FROM shadow_evaluations"
+        ).fetchone()["n"] == 1
+        assert connection.execute(
+            "SELECT count(*) AS n FROM evaluation_alert_policy_provenance"
+        ).fetchone()["n"] == 1
+        assert connection.execute(
+            "SELECT count(*) AS n FROM security_audit_events"
+        ).fetchone()["n"] == 0
