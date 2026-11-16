@@ -186,9 +186,9 @@ def _verify_canonical_replay(
             qualified is None
             or saved_alert["policy_version"] != alerts.policy.version
             or saved_alert["decision_action"] != canonical_decision.action.value
-            or float(saved_alert["risk_score"]) != canonical_decision.risk_score
+            or saved_alert["risk_score"] != canonical_decision.risk_score
             or saved_alert["priority_seed"] != qualified[0]
-            or tuple(saved_alert["scenario_ids"]) != qualified[1]
+            or saved_alert["scenario_ids"] != list(qualified[1])
             or saved_alert["group_ref"] != alert_group_ref(canonical, alerts.policy.version)
             or saved_alert["context_ref"] != evaluation_context_ref(canonical)
         ):
