@@ -60,7 +60,7 @@ BEGIN
           AND NOT tgisinternal
     ) THEN
         CREATE TRIGGER evaluation_alert_policy_provenance_immutable
-            BEFORE UPDATE ON evaluation_alert_policy_provenance
+            BEFORE UPDATE OR DELETE ON evaluation_alert_policy_provenance
             FOR EACH ROW EXECUTE FUNCTION reject_alert_policy_provenance_mutation();
     END IF;
 END $$;
