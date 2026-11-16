@@ -325,7 +325,7 @@ def test_naive_cutoff_and_missing_candidate_model_fail_closed() -> None:
         evaluate_candidate_model(
             cohort(), label_cutoff=CUTOFF,
             incumbent_policies=incumbent(),
-            candidate_policies={"wrong-tenant": list(policies().values())[0]},
+            candidate_policies={"wrong-tenant": next(iter(policies().values()))},
             resolve=resolver,
         )
 
