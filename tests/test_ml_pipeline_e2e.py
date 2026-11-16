@@ -286,8 +286,8 @@ def test_trained_model_reduces_false_positives_in_replay(tmp_path: Path) -> None
         rule_version="rules-1",
     )
     evaluation = evaluate_candidate_model(
-        label_cutoff=CUTOFF,
         cohort,
+        label_cutoff=CUTOFF,
         incumbent_policies={"tenant-a": incumbent_policy},
         candidate_policies={"tenant-a": candidate},
         resolve=registry.resolve,
