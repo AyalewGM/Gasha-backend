@@ -232,6 +232,8 @@ class PostgresEvaluationPersistence:
             or record.event.tenant_id != self._alerts.tenant_id
         ):
             raise ValueError("alert persistence requires a matching tenant-bound transaction")
+        if self._alerts is not None:
+            self._alerts.require_current_principal()
         try:
             with self._connection.cursor() as cursor:
                 if self._alerts is not None:
@@ -304,6 +306,9 @@ class PostgresEvaluationPersistence:
                     _verify_canonical_replay(
                         cursor, record, audit, alerts=self._alerts, inserted=inserted,
                     )
+                # Key-lock waits must not allow an expired credential to
+                # retrieve the previously persisted decision on replay.
+                self._alerts.require_current_principal()
             if self._alerts is not None and inserted:
                 self._alerts.append(self._connection, record)
                 if self._require_lease and lease is not None:
