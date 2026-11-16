@@ -172,6 +172,28 @@ def test_wrong_service_tenant_cannot_create_or_attach(installation):
         assert connection.execute("SELECT * FROM evaluation_alerts").fetchall() == []
 
 
+
+@pytest.mark.parametrize("denial", ["wrong_tenant", "missing_capability", "expired"])
+def test_exact_retry_cannot_bypass_writer_authorization(installation, denial):
+    sample = event()
+    evaluate(installation, sample)
+    candidate = principal()
+    if denial == "wrong_tenant":
+        candidate = principal(tenant="tenant-b")
+    elif denial == "missing_capability":
+        candidate = principal(caps=CAPABILITIES - {Capability.CASE_CREATE})
+    elif denial == "expired":
+        candidate = replace(candidate, expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    writer = PostgresEvaluationAlertWriter("tenant-a", ALERT_POLICY, candidate)
+    failure = ValueError if denial == "expired" else AuthorizationRejected
+    with pytest.raises(failure):
+        evaluate(installation, sample, writer=writer)
+    with connect(installation) as connection:
+        for table in ("fraud_decision_audit", "shadow_evaluations", "evaluation_alerts",
+                      "analyst_case_events", "security_audit_events"):
+            assert connection.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] == 1
+
+
 @pytest.mark.parametrize("existing_case", [False, True])
 def test_alert_audit_failure_rolls_back_evaluation_alert_and_any_new_case(
     installation, existing_case,
