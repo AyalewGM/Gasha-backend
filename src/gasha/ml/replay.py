@@ -284,6 +284,7 @@ def evaluate_candidate_model(
     # Return an auditable refusal instead of silently treating undefined
     # precision as zero. Even if FPR improves at unchanged zero recall, a
     # candidate that detects no matured fraud must not auto-promote.
+    non_promotion_reason: str | None
     if positives == 0 or negatives == 0 or matured == 0:
         non_promotion_reason = "insufficient_matured_classes"
     elif mm.true_positives == 0:
