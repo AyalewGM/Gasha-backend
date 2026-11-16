@@ -171,6 +171,7 @@ def test_candidate_evaluation_reports_fpr_reduction() -> None:
     assert evaluation.model.recall == 1.0
     assert evaluation.recall_delta == 0.0
     assert evaluation.precision_delta > 0.0
+    assert evaluation.non_promotion_reason is None
     assert evaluation.promotes is True
 
 
@@ -188,6 +189,40 @@ def test_no_promotion_when_model_regresses_recall() -> None:
     )
     assert evaluation.fpr_delta < 0.0
     assert evaluation.recall_delta == -1.0
+    assert evaluation.non_promotion_reason == "candidate_detects_no_fraud"
+    assert evaluation.promotes is False
+
+
+def test_silent_candidate_never_promotes_on_zero_recall_fpr_gain() -> None:
+    """Both arms miss the fraud; candidate's silence is not improvement."""
+
+    class SilentScorer(CorroborationScorer):
+        def score(self, transaction, intelligence) -> float:
+            return 0.0
+
+    hidden_fraud = event(20, fraud=False).model_copy(update={
+        "label": ConfirmedOutcomeLabel(
+            is_fraud=True, label_source="synthetic-analyst",
+            confirmed_at=AT + timedelta(days=5),
+        )
+    })
+    legitimate_false_positive = event(21, fraud=False, lone_spike=True)
+    evaluation = evaluate_candidate_model(
+        [hidden_fraud, legitimate_false_positive],
+        label_cutoff=CUTOFF,
+        incumbent_policies=incumbent(),
+        candidate_policies=policies(),
+        resolve=lambda _v: SilentScorer(model_version="model-1"),
+    )
+    assert evaluation.fraud_positive_denominator == 1
+    assert evaluation.legitimate_negative_denominator == 1
+    assert evaluation.rules.true_positives == evaluation.model.true_positives == 0
+    assert evaluation.rules.false_positives == 1
+    assert evaluation.model.false_positives == 0
+    assert evaluation.fpr_delta == -1.0
+    assert evaluation.recall_delta == 0.0
+    assert evaluation.model_precision is None
+    assert evaluation.non_promotion_reason == "candidate_detects_no_fraud"
     assert evaluation.promotes is False
 
 
