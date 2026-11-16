@@ -99,6 +99,7 @@ class PromotionEvaluation:
     fpr_delta: float | None
     recall_delta: float | None
     precision_delta: float | None
+    non_promotion_reason: str | None
     promotes: bool
 
 
@@ -280,12 +281,24 @@ def evaluate_candidate_model(
     precision_delta = _delta(model_precision, rules_precision)
     rates = (rules_fpr, model_fpr, rules_recall, model_recall,
              rules_precision, model_precision, fpr_delta, recall_delta, precision_delta)
-    promotes = (
-        matured > 0 and positives > 0 and negatives > 0
-        and all(value is not None and isfinite(value) for value in rates)
-        and fpr_delta is not None and fpr_delta < 0.0
-        and recall_delta is not None and recall_delta >= 0.0
-    )
+    # Return an auditable refusal instead of silently treating undefined
+    # precision as zero. Even if FPR improves at unchanged zero recall, a
+    # candidate that detects no matured fraud must not auto-promote.
+    if positives == 0 or negatives == 0 or matured == 0:
+        non_promotion_reason = "insufficient_matured_classes"
+    elif mm.true_positives == 0:
+        non_promotion_reason = "candidate_detects_no_fraud"
+    elif model_precision is None:
+        non_promotion_reason = "candidate_precision_undefined"
+    elif not all(value is not None and isfinite(value) for value in rates):
+        non_promotion_reason = "undefined_comparison_metrics"
+    elif recall_delta is None or recall_delta < 0.0:
+        non_promotion_reason = "recall_regressed"
+    elif fpr_delta is None or fpr_delta >= 0.0:
+        non_promotion_reason = "fpr_not_improved"
+    else:
+        non_promotion_reason = None
+    promotes = non_promotion_reason is None
     return PromotionEvaluation(
         rules=rm,
         model=mm,
@@ -307,5 +320,6 @@ def evaluate_candidate_model(
         fpr_delta=fpr_delta,
         recall_delta=recall_delta,
         precision_delta=precision_delta,
+        non_promotion_reason=non_promotion_reason,
         promotes=promotes,
     )
