@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
 from hashlib import sha256
 from json import dumps
+from math import isfinite
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
@@ -47,13 +48,62 @@ class AlertPolicy:
     version: str
     minimum_score: float
     scenario_by_reason: tuple[tuple[str, str], ...]
+    policy_id: str = "gasha-synthetic-alert-policy"
 
     def __post_init__(self) -> None:
-        if not self.version.strip() or not 0 <= self.minimum_score <= 1:
+        if (
+            type(self.policy_id) is not str or not self.policy_id.strip()
+            or type(self.version) is not str or not self.version.strip()
+            or type(self.minimum_score) not in (int, float)
+            or not isfinite(self.minimum_score)
+            or not 0 <= self.minimum_score <= 1
+            or type(self.scenario_by_reason) is not tuple
+        ):
             raise ValueError("invalid alert policy")
-        for reason, scenario in self.scenario_by_reason:
-            if not reason.strip() or not valid_scenario_ids((scenario,)):
+        for item in self.scenario_by_reason:
+            if type(item) is not tuple or len(item) != 2:
                 raise ValueError("invalid alert scenario mapping")
+            reason, scenario = item
+            if (
+                type(reason) is not str or not reason.strip()
+                or type(scenario) is not str
+                or not valid_scenario_ids((scenario,))
+            ):
+                raise ValueError("invalid alert scenario mapping")
+
+
+ALERT_POLICY_DIGEST_SCHEMA = "gasha-alert-policy-content-v1"
+
+
+def alert_policy_content(policy: AlertPolicy) -> dict[str, object]:
+    """Complete versioned alert decision policy, not just a selected alert.
+
+    This content is compared to a separate server-provisioned, tenant-scoped
+    installation record. A supplied policy version/label is never proof of
+    installation. Changes to any code-defined eligibility, grouping, priority,
+    or evidence rule require a new digest-schema version.
+    """
+    return {
+        "digest_schema": ALERT_POLICY_DIGEST_SCHEMA,
+        "policy_id": policy.policy_id,
+        "version": policy.version,
+        "minimum_score": float(policy.minimum_score),
+        "scenario_by_reason": [list(item) for item in sorted(policy.scenario_by_reason)],
+        "eligible_action_priority": [
+            [action.value, seed] for action, seed in
+            sorted(_PRIORITY_V1.items(), key=lambda item: item[0].value)
+        ],
+        "eligible_mode": OperatingMode.SHADOW.value,
+        "effective_action": DecisionAction.NO_ACTION_SHADOW.value,
+        "grouping_schema": "gasha-alert-group-v1",
+        "context_schema": "gasha-shadow-evaluation-v1",
+        "qualification_schema": "gasha-alert-qualification-v1",
+    }
+
+
+def alert_policy_digest(policy: AlertPolicy) -> str:
+    """Domain-separated digest of the complete canonical alert policy."""
+    return _digest(["gasha-alert-policy-installation", alert_policy_content(policy)])
 
 
 def evaluation_context_ref(record: ShadowEvaluationRecord) -> str:
