@@ -156,6 +156,7 @@ def test_unresolvable_model_version_fails_closed() -> None:
 
 def test_candidate_evaluation_reports_fpr_reduction() -> None:
     evaluation = evaluate_candidate_model(
+        label_cutoff=CUTOFF,
         cohort(),
         incumbent_policies=incumbent(),
         candidate_policies=policies(),
@@ -179,6 +180,7 @@ def test_no_promotion_when_model_regresses_recall() -> None:
             return 0.0  # suppresses every alert: no FPs but no TPs either
 
     evaluation = evaluate_candidate_model(
+        label_cutoff=CUTOFF,
         cohort(),
         incumbent_policies=incumbent(),
         candidate_policies=policies(),
@@ -194,10 +196,164 @@ def test_no_promotion_without_labeled_cases() -> None:
         item.model_copy(update={"label": None}) for item in cohort()
     ]
     evaluation = evaluate_candidate_model(
+        label_cutoff=CUTOFF,
         unlabeled,
         incumbent_policies=incumbent(),
         candidate_policies=policies(),
         resolve=resolver,
     )
     assert evaluation.model.labeled_cases == 0
+    assert evaluation.promotes is False
+
+
+def test_mixed_label_maturity_masks_only_confusion_denominators() -> None:
+    items = cohort()
+    # Two real mature classes remain; a later fraud and an unconfirmed
+    # legitimate outcome are still scored, but cannot enter confusion rates.
+    items[0] = items[0].model_copy(update={
+        "label": ConfirmedOutcomeLabel(
+            is_fraud=True, label_source="synthetic",
+            confirmed_at=CUTOFF + timedelta(seconds=1),
+        )
+    })
+    items[4] = items[4].model_copy(update={
+        "label": ConfirmedOutcomeLabel(
+            is_fraud=False, label_source="synthetic",
+            confirmed_at=None,
+        )
+    })
+    evaluation = evaluate_candidate_model(
+        items, label_cutoff=CUTOFF, incumbent_policies=incumbent(),
+        candidate_policies=policies(), resolve=resolver,
+    )
+    assert evaluation.total_events == 16
+    assert evaluation.matured_labeled_events == 14
+    assert evaluation.masked_late_count == 1
+    assert evaluation.masked_unconfirmed_count == 1
+    assert evaluation.fraud_positive_denominator == 3
+    assert evaluation.legitimate_negative_denominator == 11
+    assert evaluation.rules.cases == evaluation.model.cases == 16
+    assert evaluation.rules.unlabeled_cases == evaluation.model.unlabeled_cases == 2
+    assert evaluation.promotes
+
+
+def test_cutoff_inclusive_and_stable_evidence_digest() -> None:
+    records = cohort()
+    # Confirmed exactly at the cutoff must be eligible.
+    records[0] = records[0].model_copy(update={
+        "label": ConfirmedOutcomeLabel(
+            is_fraud=True, label_source="synthetic", confirmed_at=CUTOFF,
+        )
+    })
+    first = evaluate_candidate_model(
+        records, label_cutoff=CUTOFF, incumbent_policies=incumbent(),
+        candidate_policies=policies(), resolve=resolver,
+    )
+    second = evaluate_candidate_model(
+        records, label_cutoff=CUTOFF, incumbent_policies=incumbent(),
+        candidate_policies=policies(), resolve=resolver,
+    )
+    assert first == second
+    assert len(first.evidence_digest) == 64
+    assert first.matured_labeled_events == 16
+    assert first.candidate_model_versions == (("tenant-a", "model-1"),)
+
+
+@pytest.mark.parametrize("selection", ["none", "unconfirmed", "late", "legit", "fraud"])
+def test_missing_or_one_class_labels_never_promote(selection: str) -> None:
+    records = cohort()
+    if selection == "none":
+        records = []
+    elif selection == "unconfirmed":
+        records = [
+            record.model_copy(update={
+                "label": ConfirmedOutcomeLabel(
+                    is_fraud=record.label.is_fraud,
+                    label_source="synthetic", confirmed_at=None,
+                )
+            })
+            for record in records if record.label is not None
+        ]
+    elif selection == "late":
+        records = [
+            record.model_copy(update={
+                "label": ConfirmedOutcomeLabel(
+                    is_fraud=record.label.is_fraud,
+                    label_source="synthetic",
+                    confirmed_at=CUTOFF + timedelta(seconds=1),
+                )
+            })
+            for record in records if record.label is not None
+        ]
+    elif selection == "legit":
+        records = [record for record in records if not record.label.is_fraud]
+    else:
+        records = [record for record in records if record.label.is_fraud]
+    evaluation = evaluate_candidate_model(
+        records, label_cutoff=CUTOFF, incumbent_policies=incumbent(),
+        candidate_policies=policies(), resolve=resolver,
+    )
+    assert not evaluation.promotes
+    assert evaluation.matured_labeled_events == (
+        0 if selection in {"none", "unconfirmed", "late"} else len(records)
+    )
+    if selection == "legit":
+        assert evaluation.rules_recall is None
+        assert evaluation.recall_delta is None
+    if selection == "fraud":
+        assert evaluation.rules_fpr is None
+        assert evaluation.fpr_delta is None
+
+
+def test_naive_cutoff_and_missing_candidate_model_fail_closed() -> None:
+    with pytest.raises(ModelReplayRejected, match="cutoff"):
+        evaluate_candidate_model(
+            cohort(), label_cutoff=CUTOFF.replace(tzinfo=None),
+            incumbent_policies=incumbent(), candidate_policies=policies(),
+            resolve=resolver,
+        )
+    with pytest.raises(ModelReplayRejected, match="model"):
+        evaluate_candidate_model(
+            cohort(), label_cutoff=CUTOFF,
+            incumbent_policies=incumbent(),
+            candidate_policies=policies(model_version=None),
+            resolve=resolver,
+        )
+    with pytest.raises(ModelReplayRejected, match="tenant"):
+        evaluate_candidate_model(
+            cohort(), label_cutoff=CUTOFF,
+            incumbent_policies=incumbent(),
+            candidate_policies={"wrong-tenant": list(policies().values())[0]},
+            resolve=resolver,
+        )
+
+
+def test_mutating_input_during_replay_rejected() -> None:
+    records = cohort()
+
+    def changing_resolver(version: str) -> CorroborationScorer:
+        records.pop()
+        return resolver(version)
+
+    with pytest.raises(ModelReplayRejected, match="mutated"):
+        evaluate_candidate_model(
+            records, label_cutoff=CUTOFF,
+            incumbent_policies=incumbent(), candidate_policies=policies(),
+            resolve=changing_resolver,
+        )
+
+
+
+
+def test_equal_false_positive_rate_cannot_promote() -> None:
+    records = [
+        record for record in cohort()
+        if record.label.is_fraud or not record.intelligence.velocity_risk
+    ]
+    evaluation = evaluate_candidate_model(
+        records, label_cutoff=CUTOFF,
+        incumbent_policies=incumbent(), candidate_policies=policies(),
+        resolve=resolver,
+    )
+    assert evaluation.fpr_delta == 0.0
     assert evaluation.promotes is False
