@@ -767,8 +767,7 @@ def test_installed_policy_separate_runtime_login_denied_mutations(installation):
                     ("ALTER TABLE shadow_evaluations "
                      "DISABLE TRIGGER shadow_evaluations_immutable"),
                     ("CREATE OR REPLACE FUNCTION reject_shadow_evaluation_mutation() "
-                     "RETURNS trigger LANGUAGE plpgsql AS $ "
-                     "BEGIN RETURN NULL; END; $"),
+                     "RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END;'"),
                     ("CREATE OR REPLACE FUNCTION reject_alert_policy_provenance_mutation() "
                      "RETURNS trigger LANGUAGE plpgsql AS $$ "
                      "BEGIN RETURN NULL; END; $$"),
