@@ -610,6 +610,27 @@ def test_installed_policy_separate_runtime_login_denied_mutations(installation):
     import psycopg
     from psycopg import sql
 
+    # Reconstruct an already-committed legacy evaluation whose provenance was
+    # absent before migration. Only the privileged test owner may remove the
+    # initial row; the runtime login must not be allowed to backfill it.
+    legacy = event(score=0.1)
+    evaluate(installation, legacy)
+    with connect(installation) as db:
+        historical = db.execute(
+            "SELECT policy_id, policy_version, digest_schema, content_digest, "
+            "installation_ref FROM evaluation_alert_policy_provenance "
+            "WHERE tenant_id = %s AND event_id = %s",
+            (legacy.tenant_id, legacy.event_id),
+        ).fetchone()
+        assert historical is not None
+        db.execute("ALTER TABLE evaluation_alert_policy_provenance DISABLE TRIGGER USER")
+        db.execute(
+            "DELETE FROM evaluation_alert_policy_provenance "
+            "WHERE tenant_id = %s AND event_id = %s",
+            (legacy.tenant_id, legacy.event_id),
+        )
+        db.execute("ALTER TABLE evaluation_alert_policy_provenance ENABLE TRIGGER USER")
+
     name = "gasha_alert_runtime_" + uuid4().hex[:14]
     password = uuid4().hex + uuid4().hex
     ident = sql.Identifier(name)
@@ -652,6 +673,29 @@ def test_installed_policy_separate_runtime_login_denied_mutations(installation):
                     "SELECT has_table_privilege(current_user, "
                     "'evaluation_alert_policy_provenance', 'INSERT')"
                 ).fetchone()[0] is True
+                # This role HAS INSERT on provenance. The DB trigger, not a
+                # missing grant or application check, must reject backfill.
+                with pytest.raises(
+                    psycopg.errors.CheckViolation,
+                    match="same-transaction evaluation creation",
+                ):
+                    runtime.execute(
+                        "INSERT INTO evaluation_alert_policy_provenance "
+                        "(tenant_id, event_id, policy_id, policy_version, "
+                        "digest_schema, content_digest, installation_ref) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            legacy.tenant_id, legacy.event_id,
+                            historical["policy_id"], historical["policy_version"],
+                            historical["digest_schema"], historical["content_digest"],
+                            historical["installation_ref"],
+                        ),
+                    )
+                assert runtime.execute(
+                    "SELECT count(*) FROM evaluation_alert_policy_provenance "
+                    "WHERE tenant_id = %s AND event_id = %s",
+                    (legacy.tenant_id, legacy.event_id),
+                ).fetchone()[0] == 0
                 forbidden = (
                     ("INSERT INTO tenant_alert_policy_installations (tenant_id) "
                      "VALUES ('tenant-a')"),
@@ -663,6 +707,8 @@ def test_installed_policy_separate_runtime_login_denied_mutations(installation):
                     "DELETE FROM evaluation_alert_policy_provenance",
                     ("ALTER TABLE tenant_alert_policy_installations "
                      "DISABLE TRIGGER tenant_alert_policy_installations_immutable"),
+                    ("ALTER TABLE evaluation_alert_policy_provenance "
+                     "DISABLE TRIGGER evaluation_alert_policy_provenance_initial_only"),
                     ("CREATE OR REPLACE FUNCTION reject_alert_policy_provenance_mutation() "
                      "RETURNS trigger LANGUAGE plpgsql AS $$ "
                      "BEGIN RETURN NULL; END; $$"),
@@ -701,3 +747,19 @@ def test_installed_policy_separate_runtime_login_denied_mutations(installation):
                 )
             )
             owner.execute(sql.SQL("DROP ROLE {}").format(ident))
+
+    # An unsuccessful privileged-identity replay cannot make the old event
+    # canonical. All existing audit/evaluation evidence remains unmodified.
+    with pytest.raises(ValueError, match="alert policy provenance changed"):
+        evaluate(installation, legacy)
+    with connect(installation) as db:
+        assert db.execute(
+            "SELECT count(*) AS n FROM shadow_evaluations "
+            "WHERE tenant_id = %s AND event_id = %s",
+            (legacy.tenant_id, legacy.event_id),
+        ).fetchone()["n"] == 1
+        assert db.execute(
+            "SELECT count(*) AS n FROM evaluation_alert_policy_provenance "
+            "WHERE tenant_id = %s AND event_id = %s",
+            (legacy.tenant_id, legacy.event_id),
+        ).fetchone()["n"] == 0
