@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from math import ceil, floor
 from statistics import fmean
+from typing import Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
@@ -102,6 +103,17 @@ class MissingTenantPolicyError(ValueError):
     """Raised when a replay event has no policy for its tenant."""
 
 
+class DecisionBackend(Protocol):
+    """Anything with the ``DecisionService.decide`` contract can drive replay."""
+
+    def decide(
+        self,
+        transaction: CanonicalTransaction,
+        intelligence: IntelligenceSnapshot,
+        evidence_reason_codes: Sequence[str] = (),
+    ) -> FraudDecision: ...
+
+
 @dataclass(frozen=True)
 class ReplayedEventResult:
     """Full decision capture for one replayed historical event."""
@@ -169,16 +181,20 @@ def replay_historical(
     policies: Mapping[str, DecisionPolicy],
     *,
     clock: Callable[[], datetime] | None = None,
+    service_factory: Callable[[DecisionPolicy], DecisionBackend] | None = None,
 ) -> HistoricalReplayReport:
     """Replays historical events through the production decision path.
 
     Events are replayed chronologically by ``occurred_at`` and each is decided
     by a ``DecisionService`` configured with the policy registered for the
     event's own tenant. An event whose tenant has no policy raises
-    ``MissingTenantPolicyError``; there is no cross-tenant fallback.
+    ``MissingTenantPolicyError``; there is no cross-tenant fallback. When
+    ``service_factory`` is supplied it selects the per-tenant backend
+    (for example a model-backed scorer for offline candidate evaluation);
+    the default remains the deterministic ``DecisionService``.
     """
 
-    services: dict[str, DecisionService] = {}
+    services: dict[str, DecisionBackend] = {}
     results: list[ReplayedEventResult] = []
     now = clock or (lambda: datetime.now(UTC))
 
@@ -197,7 +213,11 @@ def replay_historical(
             )
         service = services.get(tenant_id)
         if service is None:
-            service = services[tenant_id] = DecisionService(policy)
+            service = services[tenant_id] = (
+                service_factory(policy)
+                if service_factory is not None
+                else DecisionService(policy)
+            )
 
         evaluation_started_at = now()
         decision = service.decide(
