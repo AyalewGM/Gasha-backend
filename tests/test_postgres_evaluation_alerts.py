@@ -709,10 +709,13 @@ def test_installed_policy_separate_runtime_login_denied_mutations(installation):
                             " WHERE tenant_id = %s AND event_id = %s",
                             legacy_identity,
                         )
-                with pytest.raises(
-                    psycopg.errors.CheckViolation,
-                    match="shadow evaluations are immutable",
-                ):
+                # DELETE is not a normal runtime privilege; it fails even
+                # before the defensive UPDATE/DELETE trigger is considered.
+                assert runtime.execute(
+                    "SELECT has_table_privilege(current_user, "
+                    "'shadow_evaluations', 'DELETE')"
+                ).fetchone()[0] is False
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
                     runtime.execute(
                         "DELETE FROM shadow_evaluations "
                         "WHERE tenant_id = %s AND event_id = %s",
