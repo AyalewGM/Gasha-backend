@@ -141,10 +141,12 @@ def _verify_canonical_replay(
     if saved_audit is None or saved_evaluation is None:
         raise ValueError("conflicting evaluation replay: incomplete canonical evidence")
 
-    from gasha.domain.models import FraudDecision
     from gasha.cases.evaluation_alerts import (
-        alert_evidence, alert_group_ref, evaluation_context_ref,
+        alert_evidence,
+        alert_group_ref,
+        evaluation_context_ref,
     )
+    from gasha.domain.models import FraudDecision
 
     canonical = ShadowEvaluationRecord.model_validate_json(str(saved_evaluation["record_json"]))
     canonical_decision = FraudDecision.model_validate_json(str(saved_audit["decision_json"]))
