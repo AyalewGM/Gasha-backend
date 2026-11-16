@@ -653,19 +653,19 @@ def test_installed_policy_separate_runtime_login_denied_mutations(installation):
                     "'evaluation_alert_policy_provenance', 'INSERT')"
                 ).fetchone()[0] is True
                 forbidden = (
-                    "INSERT INTO tenant_alert_policy_installations (tenant_id) "
-                    "VALUES ('tenant-a')",
+                    ("INSERT INTO tenant_alert_policy_installations (tenant_id) "
+                     "VALUES ('tenant-a')"),
                     "UPDATE tenant_alert_policy_installations SET policy_version = 'forged'",
                     "DELETE FROM tenant_alert_policy_installations",
                     "TRUNCATE tenant_alert_policy_installations",
-                    "UPDATE evaluation_alert_policy_provenance "
-                    "SET policy_version = 'forged'",
+                    ("UPDATE evaluation_alert_policy_provenance "
+                     "SET policy_version = 'forged'"),
                     "DELETE FROM evaluation_alert_policy_provenance",
-                    "ALTER TABLE tenant_alert_policy_installations "
-                    "DISABLE TRIGGER tenant_alert_policy_installations_immutable",
-                    "CREATE OR REPLACE FUNCTION reject_alert_policy_provenance_mutation() "
-                    "RETURNS trigger LANGUAGE plpgsql AS $$ "
-                    "BEGIN RETURN NULL; END; $$",
+                    ("ALTER TABLE tenant_alert_policy_installations "
+                     "DISABLE TRIGGER tenant_alert_policy_installations_immutable"),
+                    ("CREATE OR REPLACE FUNCTION reject_alert_policy_provenance_mutation() "
+                     "RETURNS trigger LANGUAGE plpgsql AS $ "
+                     "BEGIN RETURN NULL; END; $"),
                 )
                 for statement in forbidden:
                     with pytest.raises(psycopg.errors.InsufficientPrivilege):
