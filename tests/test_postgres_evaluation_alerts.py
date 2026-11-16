@@ -66,7 +66,7 @@ def event(tenant="tenant-a", score=0.91):
     return normalized.envelope
 
 
-def evaluate(installation, sample, *, writer=None):
+def evaluate(installation, sample, *, writer=None, policy=POLICY):
     if writer is None:
         writer = PostgresEvaluationAlertWriter(
             sample.tenant_id, ALERT_POLICY, principal(tenant=sample.tenant_id),
@@ -74,7 +74,7 @@ def evaluate(installation, sample, *, writer=None):
     with connect(installation) as connection:
         persistence = PostgresEvaluationPersistence(connection, alerts=writer)
         return ShadowOrchestrator(
-            {sample.tenant_id: POLICY}, persistence=persistence,
+            {sample.tenant_id: policy}, persistence=persistence,
         ).evaluate(sample)
 
 
@@ -245,10 +245,101 @@ def test_expired_credential_cannot_attach_after_waiting_for_group_lock(installat
         assert connection.execute("SELECT count(*) AS n FROM shadow_evaluations").fetchone()["n"] == 1
 
 
-def test_evaluation_retry_returns_the_original_alert_decision(installation):
+def test_exact_evaluation_retry_returns_original_without_revising_history(installation):
     sample = event(score=0.91)
     original = evaluate(installation, sample)
-    sample.intelligence = IntelligenceSnapshot(device_session_risk=0.1)
+    # Receipt/normalization timestamps and re-decision clocks may differ;
+    # immutable transaction, intelligence, mode and policy cannot.
+    sample.received_at = datetime.now(UTC)
+    sample.adapter.normalized_at = datetime.now(UTC)
     assert evaluate(installation, sample) == original
     with connect(installation) as connection:
+        for table in ("fraud_decision_audit", "shadow_evaluations", "evaluation_alerts",
+                      "analyst_case_events"):
+            assert connection.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] == 1
         assert connection.execute("SELECT risk_score FROM evaluation_alerts").fetchone()["risk_score"] == 0.91
+
+
+@pytest.mark.parametrize("difference", [
+    "risk", "reason", "transaction_time", "transaction_reference", "transaction_amount",
+    "adapter_version", "intelligence_evidence", "mode", "policy_version",
+    "configuration_version", "rule_version", "signal_policy_versions",
+    "alert_policy_version", "alert_policy_mapping",
+])
+def test_conflicting_replay_never_inherits_alert_or_changes_case(installation, difference):
+    original = event(score=0.91)
+    initial = evaluate(installation, original)
+    with connect(installation) as connection:
+        before = {
+            table: connection.execute(f"SELECT * FROM {table}").fetchall()
+            for table in ("fraud_decision_audit", "shadow_evaluations",
+                          "evaluation_alerts", "analyst_case_events", "security_audit_events")
+        }
+    incoming = original.model_copy(deep=True)
+    decision_policy = POLICY
+    writer = None
+    if difference == "risk":
+        incoming.intelligence = IntelligenceSnapshot(device_session_risk=0.1)
+    elif difference == "reason":
+        incoming.evidence_reason_codes = ("CHANGED_REASON",)
+    elif difference == "transaction_time":
+        incoming.canonical_transaction.occurred_at += timedelta(seconds=1)
+    elif difference == "transaction_reference":
+        incoming.canonical_transaction.correlation_id = "changed-reference"
+    elif difference == "transaction_amount":
+        incoming.canonical_transaction.amount += 1
+    elif difference == "adapter_version":
+        incoming.adapter.adapter_version = "changed-adapter"
+    elif difference == "intelligence_evidence":
+        incoming.intelligence = IntelligenceSnapshot(device_session_risk=0.87)
+    elif difference == "mode":
+        from gasha.domain.models import OperatingMode
+        incoming.operating_mode = OperatingMode.ENFORCING
+    elif difference == "signal_policy_versions":
+        incoming.signal_policy_versions = ("different-signal-policy",)
+    elif difference in {"policy_version", "configuration_version", "rule_version"}:
+        decision_policy = POLICY.model_copy(update={difference: "changed-version"})
+    elif difference == "alert_policy_version":
+        writer = PostgresEvaluationAlertWriter(
+            incoming.tenant_id,
+            AlertPolicy("different-alert-policy", 0.7,
+                        (("HIGH_DEVICE_SESSION_RISK", "ATO-02"),)),
+            principal(tenant=incoming.tenant_id),
+        )
+    elif difference == "alert_policy_mapping":
+        writer = PostgresEvaluationAlertWriter(
+            incoming.tenant_id,
+            AlertPolicy(ALERT_POLICY.version, 0.7,
+                        (("HIGH_DEVICE_SESSION_RISK", "ATO-06"),)),
+            principal(tenant=incoming.tenant_id),
+        )
+
+    with pytest.raises(ValueError, match="conflicting evaluation replay"):
+        evaluate(installation, incoming, writer=writer, policy=decision_policy)
+    with connect(installation) as connection:
+        for table, rows in before.items():
+            assert connection.execute(f"SELECT * FROM {table}").fetchall() == rows
+    assert initial.decision.action is DecisionAction.HOLD
+
+
+def test_concurrent_conflicting_replays_choose_one_canonical_winner(installation):
+    original = event(score=0.91)
+    incompatible = original.model_copy(deep=True)
+    incompatible.intelligence = IntelligenceSnapshot(device_session_risk=0.1)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(evaluate, installation, sample)
+                   for sample in (original, incompatible)]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result(timeout=15))
+            except ValueError as error:
+                assert "conflicting evaluation replay" in str(error)
+                outcomes.append(error)
+    assert sum(not isinstance(result, Exception) for result in outcomes) == 1
+    with connect(installation) as connection:
+        assert connection.execute("SELECT count(*) AS n FROM shadow_evaluations").fetchone()["n"] == 1
+        assert connection.execute("SELECT count(*) AS n FROM fraud_decision_audit").fetchone()["n"] == 1
+        assert connection.execute("SELECT count(*) AS n FROM evaluation_alerts").fetchone()["n"] in (0, 1)
+        assert connection.execute("SELECT count(*) AS n FROM analyst_case_events").fetchone()["n"] in (0, 1)
+
