@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 from uuid import UUID
 
-from gasha.cases.evaluation_alerts import PostgresEvaluationAlertWriter
+from gasha.cases.evaluation_alerts import (
+    ALERT_POLICY_DIGEST_SCHEMA,
+    PostgresEvaluationAlertWriter,
+    alert_policy_content,
+    alert_policy_digest,
+)
 from gasha.decision.audit import DecisionAuditRecord
 from gasha.ingestion.lease import EvaluationLease, LeaseLostError, current_evaluation_lease
 from gasha.orchestration import ShadowEvaluationRecord
@@ -108,6 +113,71 @@ def _immutable_replay_identity(record: ShadowEvaluationRecord) -> dict[str, obje
         if isinstance(decision, dict):
             decision.pop("decided_at", None)
     return value
+
+
+def _verify_alert_policy_provenance(
+    cursor: Cursor,
+    record: ShadowEvaluationRecord,
+    *,
+    alerts: PostgresEvaluationAlertWriter,
+    inserted: bool,
+) -> None:
+    """Bind EVERY event to separately installed, immutable policy content.
+
+    The runtime cannot create/repair the installation record. It must match
+    the full code-defined eligibility, mapping, priority and grouping policy,
+    not just the fields which happened to qualify this evaluation. Both
+    policy installation and per-event provenance are read/locked within the
+    same READ COMMITTED transaction as the decision/alert/case writes.
+    """
+    policy = alerts.policy
+    tenant = record.event.tenant_id
+    event_id = str(record.event.event_id)
+    cursor.execute(
+        """SELECT digest_schema, content_digest, content_json, installation_ref
+           FROM tenant_alert_policy_installations
+           WHERE tenant_id = %s AND policy_id = %s AND policy_version = %s
+           FOR SHARE""",
+        (tenant, policy.policy_id, policy.version),
+    )
+    installed = cursor.fetchone()
+    if (
+        installed is None
+        or installed["digest_schema"] != ALERT_POLICY_DIGEST_SCHEMA
+        or installed["content_json"] != alert_policy_content(policy)
+        or installed["content_digest"] != alert_policy_digest(policy)
+    ):
+        raise ValueError("conflicting evaluation replay: untrusted alert policy installation")
+
+    # The source of installation_ref is the locked, separately provisioned DB
+    # record, never a caller-provided policy label or evaluation claim.
+    expected = (
+        policy.policy_id, policy.version, ALERT_POLICY_DIGEST_SCHEMA,
+        alert_policy_digest(policy), installed["installation_ref"],
+    )
+    if inserted:
+        cursor.execute(
+            """INSERT INTO evaluation_alert_policy_provenance (
+                 tenant_id, event_id, policy_id, policy_version, digest_schema,
+                 content_digest, installation_ref
+               ) VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (tenant, event_id, *expected),
+        )
+    cursor.execute(
+        """SELECT policy_id, policy_version, digest_schema,
+                  content_digest, installation_ref
+           FROM evaluation_alert_policy_provenance
+           WHERE tenant_id = %s AND event_id = %s FOR UPDATE""",
+        (tenant, event_id),
+    )
+    saved = cursor.fetchone()
+    if saved is None or (
+        saved["policy_id"], saved["policy_version"], saved["digest_schema"],
+        saved["content_digest"], saved["installation_ref"],
+    ) != expected:
+        # In particular, pre-migration non-alerting events have no source
+        # provenance. Never fabricate it from their old policy_version.
+        raise ValueError("conflicting evaluation replay: alert policy provenance changed")
 
 
 def _verify_canonical_replay(
@@ -303,6 +373,9 @@ class PostgresEvaluationPersistence:
                 if inserted != audit_inserted:
                     raise ValueError("alert persistence found incomplete decision evidence")
                 with self._connection.cursor() as cursor:
+                    _verify_alert_policy_provenance(
+                        cursor, record, alerts=self._alerts, inserted=inserted,
+                    )
                     _verify_canonical_replay(
                         cursor, record, audit, alerts=self._alerts, inserted=inserted,
                     )
