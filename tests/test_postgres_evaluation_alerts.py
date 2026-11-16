@@ -185,13 +185,18 @@ def test_exact_retry_cannot_bypass_writer_authorization(installation, denial):
     elif denial == "expired":
         candidate = replace(candidate, expires_at=datetime.now(UTC) - timedelta(seconds=1))
     writer = PostgresEvaluationAlertWriter("tenant-a", ALERT_POLICY, candidate)
+    tables = ("fraud_decision_audit", "shadow_evaluations", "evaluation_alerts",
+              "analyst_case_events", "security_audit_events")
+    with connect(installation) as connection:
+        before = {table: connection.execute(
+            f"SELECT count(*) AS n FROM {table}"
+        ).fetchone()["n"] for table in tables}
     failure = ValueError if denial == "expired" else AuthorizationRejected
     with pytest.raises(failure):
         evaluate(installation, sample, writer=writer)
     with connect(installation) as connection:
-        for table in ("fraud_decision_audit", "shadow_evaluations", "evaluation_alerts",
-                      "analyst_case_events", "security_audit_events"):
-            assert connection.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] == 1
+        for table in tables:
+            assert connection.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] == before[table]
 
 
 @pytest.mark.parametrize("existing_case", [False, True])
