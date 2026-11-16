@@ -96,6 +96,14 @@ def alert_policy_content(policy: AlertPolicy) -> dict[str, object]:
         "eligible_mode": OperatingMode.SHADOW.value,
         "effective_action": DecisionAction.NO_ACTION_SHADOW.value,
         "grouping_schema": "gasha-alert-group-v1",
+        "grouping_inputs": [
+            "tenant_id", "policy_version", "occurred_at_utc_hour",
+            "sender_customer_id", "beneficiary_type",
+            "destination_institution_id", "beneficiary_id", "device_id",
+        ],
+        "missing_grouping_input_behavior": "append_event_id",
+        "scenario_match_rule": "matching_reason_code_deduped_and_sorted",
+        "score_qualification_rule": "risk_score_gte_minimum",
         "context_schema": "gasha-shadow-evaluation-v1",
         "qualification_schema": "gasha-alert-qualification-v1",
     }
