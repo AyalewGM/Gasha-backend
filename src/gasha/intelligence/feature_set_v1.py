@@ -82,6 +82,7 @@ def compute_feature_set(
     history: tuple[ObservedTransfer, ...],
     *,
     decision_as_of: datetime,
+    relationship_history_complete: bool = True,
 ) -> FeatureSetV1:
     """Calculate prior-only features from data available at the decision cutoff.
 
@@ -90,9 +91,13 @@ def compute_feature_set(
     at target's timestamp are excluded. The target account counts towards
     distinct_accounts_on_device_1h only if it appeared on that device in a
     *prior eligible* observation. Missing optional references remain None.
+    Incomplete relationship history can establish a prior match but cannot
+    establish that the sender and beneficiary never interacted.
     """
     if type(target) is not ObservedTransfer or type(history) is not tuple:
         raise ValueError("invalid feature inputs")
+    if type(relationship_history_complete) is not bool:
+        raise ValueError("relationship history coverage must be a boolean")
     cutoff = _utc("decision_as_of", decision_as_of)
     if not target.occurred_at <= target.available_at <= cutoff:
         raise ValueError("target was not available by decision cutoff")
@@ -123,6 +128,9 @@ def compute_feature_set(
             and e.beneficiary_ref == target.beneficiary_ref
             for e in previous
         )
+        if not prior_relation and not relationship_history_complete:
+            prior_relation = None
+            missing.append("sender_beneficiary_history_coverage")
     if target.device_ref is None:
         accounts = None
         missing.append("device_ref")
