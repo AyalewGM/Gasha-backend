@@ -216,3 +216,83 @@ def test_artifact_directories_are_not_overwritten(tmp_path: Path) -> None:
             artifact_dir=target,
             params=TrainingParams(num_boost_round=20, early_stopping_rounds=5),
         )
+
+
+def lone_spike_event(number: int) -> HistoricalTransactionEvent:
+    """Legitimate event whose single spiking signal trips the rules fusion."""
+    occurred = AT + timedelta(minutes=number)
+    return HistoricalTransactionEvent(
+        transaction=CanonicalTransaction(
+            tenant_id="tenant-a",
+            event_id=UUID(int=number + 1),
+            occurred_at=occurred,
+            channel="mobile",
+            transaction_type="transfer",
+            amount=Decimal(40),
+            currency="ETB",
+            sender_customer_id=f"customer-{number % 11}",
+            sender_account_id=f"account-{number % 11}",
+            beneficiary_id=f"beneficiary-{number % 13}",
+            beneficiary_type=BeneficiaryType.EXTERNAL,
+            destination_institution_id="external-bank",
+            correlation_id=f"corr-{number}",
+        ),
+        intelligence=IntelligenceSnapshot(velocity_risk=0.95),
+        received_at=occurred + timedelta(seconds=1),
+        label=ConfirmedOutcomeLabel(
+            is_fraud=False,
+            label_source="synthetic-analyst",
+            confirmed_at=occurred + timedelta(days=5),
+        ),
+    )
+
+
+def test_trained_model_reduces_false_positives_in_replay(tmp_path: Path) -> None:
+    """UC-05: the candidate model must cut FPR without regressing recall."""
+    from gasha.ml.replay import evaluate_candidate_model
+
+    # Interleave classes across the full window so every chronological
+    # split slice sees both classes: fraud at n%4==0, lone-spike legit at
+    # n%8==3, clean legit elsewhere.
+    cohort = []
+    for n in range(160):
+        if n % 4 == 0:
+            cohort.append(event(n, fraud=True))
+        elif n % 8 == 3:
+            cohort.append(lone_spike_event(n))
+        else:
+            cohort.append(event(n, fraud=False))
+    manifest = train_model(
+        cohort,
+        label_cutoff=CUTOFF,
+        model_version="model-v1",
+        artifact_dir=tmp_path / "model-v1",
+        params=TrainingParams(num_boost_round=80, early_stopping_rounds=10),
+    )
+    registry = ArtifactRegistry(tmp_path)
+    candidate = DecisionPolicy(
+        configuration_version="config-1",
+        policy_version="policy-1",
+        rule_version="rules-1",
+        model_version="model-v1",
+        monitor_threshold=manifest.thresholds.monitor_threshold,
+        review_threshold=manifest.thresholds.review_threshold,
+        hold_threshold=manifest.thresholds.hold_threshold,
+        block_threshold=manifest.thresholds.block_threshold,
+    )
+    incumbent_policy = DecisionPolicy(
+        configuration_version="config-0",
+        policy_version="policy-0",
+        rule_version="rules-1",
+    )
+    evaluation = evaluate_candidate_model(
+        cohort,
+        label_cutoff=CUTOFF,
+        incumbent_policies={"tenant-a": incumbent_policy},
+        candidate_policies={"tenant-a": candidate},
+        resolve=registry.resolve,
+    )
+    assert evaluation.rules.false_positives > 0
+    assert evaluation.model.false_positives < evaluation.rules.false_positives
+    assert evaluation.recall_delta >= 0.0
+    assert evaluation.promotes is True
