@@ -1,6 +1,6 @@
 """Offline MM-05 assessment tests; no API, fraud label, case or bank assertions."""
 
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from json import dumps, loads
@@ -12,6 +12,8 @@ from gasha.intelligence.mm05_activity import (
     ActivityDirection,
     ActivityStatus,
     ActivityWindowPolicy,
+    ActivityFeature,
+    DormancyAssessment,
     compute_mm05_activity,
 )
 from gasha.intelligence.mm05_assessment import (
@@ -209,18 +211,40 @@ def test_snapshot_json_roundtrip_reproduces_original_assessment() -> None:
     )
     original = assess(history)
     assert original.state is MM05State.REVIEW_CANDIDATE
+
+    def encode(value: object) -> str:
+        if type(value) is datetime:
+            return value.isoformat()
+        if type(value) is Decimal:
+            return str(value)
+        raise TypeError("unexpected feature serialization type")
+
     saved = dumps({
         "threshold_snapshot": original.threshold_snapshot.to_payload(),
         "threshold_fingerprint": original.threshold_fingerprint,
+        "feature": asdict(original.feature),
         "source_fingerprint": original.source_fingerprint,
         "state": original.state.value,
         "reason_codes": original.reason_codes,
-    }, sort_keys=True)
+    }, sort_keys=True, default=encode)
     persisted = loads(saved)
     restored = MM05ThresholdSnapshot.from_payload(persisted["threshold_snapshot"])
-    replay = evaluate_mm05_activity(
-        original.feature, policy=restored.to_policy(),
+
+    restored_feature_data = persisted["feature"]
+    for field in ("decision_cutoff", "baseline_start", "current_start"):
+        restored_feature_data[field] = datetime.fromisoformat(restored_feature_data[field])
+    for field in (
+        "baseline_value", "current_value", "count_ratio", "value_ratio",
+        "last_baseline_activity_age_hours", "last_pre_current_activity_age_hours",
+    ):
+        if restored_feature_data[field] is not None:
+            restored_feature_data[field] = Decimal(restored_feature_data[field])
+    restored_feature_data["dormancy_assessment"] = DormancyAssessment(
+        restored_feature_data["dormancy_assessment"],
     )
+    restored_feature = ActivityFeature(**restored_feature_data)
+    assert restored_feature == original.feature
+    replay = evaluate_mm05_activity(restored_feature, policy=restored.to_policy())
     assert replay.threshold_snapshot == restored
     assert replay.threshold_fingerprint == persisted["threshold_fingerprint"]
     assert replay.source_fingerprint == persisted["source_fingerprint"]
