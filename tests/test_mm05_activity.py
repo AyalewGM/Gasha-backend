@@ -1,7 +1,7 @@
 """Non-authoritative MM-05 computation; no alert or enforcement assertions."""
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Context, Decimal, Inexact, ROUND_DOWN, Rounded, localcontext
 
 import pytest
 
@@ -120,7 +120,8 @@ def test_point_in_time_late_arrival_not_leaked_and_fingerprint_differentiates():
     assert a.source_fingerprint != b.source_fingerprint
     assert compute((prior,), dataset="sha256:" + "b" * 64).source_fingerprint != a.source_fingerprint
     assert compute((prior,), epoch="epoch-2").source_fingerprint != a.source_fingerprint
-    assert compute((prior,), cutoff=1).source_fingerprint != a.source_fingerprint
+    # A later request-time cutoff cannot change original decision evidence.
+    assert compute((prior,), cutoff=1) == a
 
 
 def test_timezones_strict_types_and_negative_clocks():
@@ -216,3 +217,63 @@ def test_bounded_maximum_4096_history_rows_and_excess_rejected():
     assert len(result.source_fingerprint) == 71
     with pytest.raises(ValueError, match="bounded immutable"):
         compute(history + (event("bulk-extra", hours=-1, account="another"),))
+
+
+def test_original_receipt_clock_includes_before_and_at_but_not_late_history():
+    before = event("before", hours=-2, available_hours=-1)
+    exactly = event("at", hours=-2, available_hours=0)
+    after = event("after", hours=-2, available_hours=1)
+    history = (before, exactly, after)
+    original = compute(history, cutoff=0, sealed=0)
+    later_replay = compute(tuple(reversed(history)), cutoff=2, sealed=2)
+    assert original.available
+    assert original.decision_cutoff == T  # effective knowledge cutoff, not request clock
+    assert (original.baseline_count, original.current_count) == (0, 3)
+    assert original == later_replay
+    assert original == compute((before, exactly), cutoff=3, sealed=3)
+    assert original.source_fingerprint == later_replay.source_fingerprint
+    # A later request never compensates for missing original-time history sealing.
+    assert compute(history, cutoff=3, sealed=-1).unavailable_reason == "history_incomplete"
+
+
+def test_mm05_arithmetic_is_context_independent_and_projections_are_versioned():
+    baseline = tuple(event(f"base-{i}", hours=-25 - i, amount="0.123456")
+                     for i in range(3))
+    args = {"target": event(amount="0.100000")}
+    with localcontext(Context(prec=4, rounding=ROUND_DOWN, traps=[Inexact, Rounded])):
+        low_precision = compute(baseline, **args)
+    with localcontext(Context(prec=80)):
+        high_precision = compute(tuple(reversed(baseline)), **args)
+    assert low_precision == high_precision  # Entire feature including fingerprint.
+    assert low_precision.arithmetic_version == "exact-micro-units-ratio12-half-even-v1"
+    assert (low_precision.baseline_value, low_precision.current_value) == (
+        Decimal("0.370368"), Decimal("0.100000"),
+    )
+    assert low_precision.count_ratio == Decimal("0.333333333333")
+    assert low_precision.value_ratio == Decimal("0.270001728011")
+
+    older = event("age", hours=-25)
+    age_time = T - timedelta(hours=25, seconds=1)
+    age_row = replace(older, occurred_at=age_time, available_at=age_time)
+    with localcontext(Context(prec=4, rounding=ROUND_DOWN, traps=[Inexact, Rounded])):
+        age_low = compute((age_row,))
+    with localcontext(Context(prec=50)):
+        age_high = compute((age_row,))
+    assert age_low == age_high
+    assert age_low.last_baseline_activity_age_hours == Decimal("25.000277777778")
+
+
+def test_exact_maximum_total_4097_amounts_under_radically_different_contexts():
+    maximum = "999999999999999999"
+    history = tuple(event(f"bulk-{i}", hours=-1, amount=maximum)
+                    for i in range(4096))
+    target = event(amount=maximum)
+    with localcontext(Context(prec=4, rounding=ROUND_DOWN, traps=[Inexact, Rounded])):
+        low = compute(history, target=target)
+    with localcontext(Context(prec=80)):
+        high = compute(history, target=target)
+    assert low == high
+    assert low.current_count == 4097
+    assert low.current_value == Decimal("4096999999999999995903.000000")
+    assert low.baseline_count == 0
+    assert low.value_ratio is None
