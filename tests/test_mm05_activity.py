@@ -9,8 +9,8 @@ from gasha.intelligence.mm05_activity import (
     AccountActivity,
     ActivityDirection,
     ActivityStatus,
-    DormancyAssessment,
     ActivityWindowPolicy,
+    DormancyAssessment,
     compute_mm05_activity,
 )
 
