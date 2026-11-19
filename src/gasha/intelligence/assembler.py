@@ -17,6 +17,7 @@ from gasha.intelligence.assembly_lineage import (
     EffectivePolicySnapshot,
     OriginalDecisionContext,
     ProviderEvidence,
+    aware,
     canonical_bytes,
     context_identity,
     context_matches,
@@ -254,6 +255,7 @@ class IntelligenceAssembler:
             actual.source == source
             and actual.scope == IntelligenceScope.TENANT_OBSERVED
             and actual.source_version == envelope.source_version
+            and aware(actual.observed_at)
             and actual.observed_at.astimezone(UTC) == envelope.observed_at.astimezone(UTC)
         )
 
