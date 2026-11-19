@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
 from json import dumps
+from math import copysign, isfinite
 from typing import Protocol
 
 from pydantic import BaseModel, Field
@@ -55,6 +56,25 @@ class AssemblyRejected(ValueError):
     """No authenticated original-decision authority or invalid event context."""
 
 
+# Feature-schema safety limits are NOT fraud thresholds. They prevent corrupt but
+# correctly signed optional evidence from influencing a decision. Future tenant
+# overrides require a separately issuer-bound versioned schema artifact.
+HISTORY_FEATURE_SCHEMA_VERSION = "gasha-history-features-v1"
+HISTORY_MAX_COUNT = 10_000_000
+HISTORY_MAX_RATIO = 1_000_000.0
+_HISTORY_COUNT_FIELDS = (
+    "account_transfers_1h",
+    "beneficiary_unique_senders_1h",
+    "beneficiary_incoming_count_1h",
+    "sender_beneficiary_prior_transfer_count",
+    "beneficiary_confirmed_fraud_sender_count",
+)
+_HISTORY_OPTIONAL_FIELDS = frozenset((
+    *_HISTORY_COUNT_FIELDS, "amount_to_sender_baseline_ratio",
+    "device_seen_for_sender_before",
+))
+
+
 @dataclass(frozen=True, slots=True)
 class HistoryFeatures:
     account_transfers_1h: int | None = None
@@ -65,6 +85,56 @@ class HistoryFeatures:
     device_seen_for_sender_before: bool | None = None
     beneficiary_confirmed_fraud_sender_count: int | None = None
     missing: tuple[str, ...] = ()
+    schema_version: str = HISTORY_FEATURE_SCHEMA_VERSION
+
+
+def valid_history_features(value: object) -> bool:
+    """Validate the full signed source before accepting any history-derived risk.
+
+    An authentic signature establishes who issued the payload, not that its
+    measurements are finite, well typed, possible, or reproducible. Fail the
+    optional history source unavailable rather than coercing invalid values.
+    """
+    if type(value) is not HistoryFeatures:
+        return False
+    features = value
+    if features.schema_version != HISTORY_FEATURE_SCHEMA_VERSION:
+        return False
+    for name in _HISTORY_COUNT_FIELDS:
+        count = getattr(features, name)
+        if count is not None and (
+            type(count) is not int or not 0 <= count <= HISTORY_MAX_COUNT
+        ):
+            return False
+    ratio = features.amount_to_sender_baseline_ratio
+    if ratio is not None:
+        if type(ratio) not in (int, float):
+            return False
+        if (
+            not isfinite(ratio) or ratio < 0 or ratio > HISTORY_MAX_RATIO
+            or (ratio == 0 and copysign(1.0, ratio) < 0)
+        ):
+            return False
+    if features.device_seen_for_sender_before is not None and (
+        type(features.device_seen_for_sender_before) is not bool
+    ):
+        return False
+    missing = features.missing
+    if (
+        type(missing) is not tuple
+        or any(type(name) is not str or name not in _HISTORY_OPTIONAL_FIELDS
+               for name in missing)
+        or len(set(missing)) != len(missing)
+    ):
+        return False
+    unique = features.beneficiary_unique_senders_1h
+    incoming = features.beneficiary_incoming_count_1h
+    confirmed = features.beneficiary_confirmed_fraud_sender_count
+    if unique is not None and incoming is not None and unique > incoming:
+        return False
+    if confirmed is not None and unique is not None and confirmed > unique:
+        return False
+    return True
 
 
 class HistoryFeatureProvider(Protocol):
@@ -239,6 +309,12 @@ class IntelligenceAssembler:
         journey_policy = JourneyRiskPolicy.model_validate(policies["journey"])
         history = self._fetch(self._history, "compute", transaction, context,
                               "history", HistoryFeatures)
+        # Authentication is necessary but not sufficient. Invalid but genuinely
+        # signed optional history is rejected BEFORE scoring or acceptance into
+        # the replay's provider evidence identity.
+        history_invalid = history is not None and not valid_history_features(history.payload)
+        if history_invalid:
+            history = None
         graph = self._fetch(self._graph, "signals_for", transaction, context,
                             "graph", InternalGraphSignals)
         journey = (
@@ -308,6 +384,8 @@ class IntelligenceAssembler:
 
         if history is None:
             missing.append("history_features")
+            if history_invalid:
+                missing.append("history_features_invalid")
         else:
             features = history.payload
             assert isinstance(features, HistoryFeatures)
