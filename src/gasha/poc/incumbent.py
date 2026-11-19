@@ -1,11 +1,22 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from math import isfinite
+from uuid import UUID
 
+from gasha.domain.models import (
+    CanonicalTransaction,
+    DecisionAction,
+    DecisionPolicy,
+    FraudDecision,
+    IntelligenceSnapshot,
+)
 from gasha.poc.historical import (
     ALERT_ACTIONS,
     ReplayClassification,
+    ReplayDecisionSource,
     ReplayedEventResult,
 )
 
@@ -76,6 +87,14 @@ def compare_incumbent(
     missing = 0
 
     for result in results:
+        # The caller cannot claim Gasha-only detections for an offline vendor
+        # threshold simulation (or for any other substituted replay backend).
+        # Check even unlabeled rows before aggregation or serialization.
+        if result.decision_source is not ReplayDecisionSource.GASHA_DECISION:
+            raise ValueError(
+                "Gasha comparison requires genuine Gasha decisions, not "
+                f"{result.decision_source!s}"
+            )
         classification = result.classification
         if classification == ReplayClassification.UNLABELED:
             continue
@@ -143,3 +162,143 @@ def compare_incumbent(
         neither_detected=neither,
         incremental_confirmed_detection=incremental,
     )
+
+
+class IncumbentScoreUnavailable(ValueError):
+    """An event has no recorded incumbent score; replay must not fabricate one."""
+
+
+class IncumbentScoreBackend:
+    """Threshold-simulation backend, NOT observed incumbent decisions.
+
+    ``scores`` maps ``(tenant_id, event_id)`` to normalized external risk
+    score in ``[0, 1]`` (for example a NetGuardians export prepared by
+    :func:`build_incumbent_scores`). Decisions apply the supplied policy's
+    thresholds to the incumbent score — the comparison measures a
+    hypothetical operating point, NOT actual Bank intervention or verdict.
+    An event with no recorded score fails closed.
+    """
+
+    replay_decision_source = ReplayDecisionSource.INCUMBENT_SCORE_SIMULATION
+
+    def __init__(
+        self, policy: DecisionPolicy, scores: Mapping[tuple[str, UUID], float]
+    ) -> None:
+        self._policy = policy
+        checked: dict[tuple[str, UUID], float] = {}
+        for key, value in scores.items():
+            if (
+                not isinstance(key, tuple)
+                or len(key) != 2
+                or not isinstance(key[0], str)
+                or not key[0].strip()
+                or not isinstance(key[1], UUID)
+                or isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not isfinite(value)
+                or not 0 <= value <= 1
+            ):
+                raise IncumbentScoreUnavailable("invalid tenant-scoped incumbent score")
+            checked[key] = float(value)
+        self._scores = checked
+
+    def decide(
+        self,
+        transaction: CanonicalTransaction,
+        intelligence: IntelligenceSnapshot,
+        evidence_reason_codes: Sequence[str] = (),
+    ) -> FraudDecision:
+        try:
+            score = self._scores[(transaction.tenant_id, transaction.event_id)]
+        except KeyError:
+            raise IncumbentScoreUnavailable(
+                "no incumbent score recorded for requested tenant and event"
+            ) from None
+
+        if score >= self._policy.block_threshold:
+            action = DecisionAction.BLOCK
+        elif score >= self._policy.hold_threshold:
+            action = DecisionAction.HOLD
+        elif score >= self._policy.review_threshold:
+            action = DecisionAction.REVIEW
+        elif score >= self._policy.monitor_threshold:
+            action = DecisionAction.MONITOR
+        else:
+            action = DecisionAction.ALLOW
+
+        reasons = list(evidence_reason_codes)
+        reasons.append(
+            "INCUMBENT_HIGH_SCORE"
+            if score >= self._policy.review_threshold
+            else "INCUMBENT_BELOW_REVIEW"
+        )
+        return FraudDecision(
+            tenant_id=transaction.tenant_id,
+            event_id=transaction.event_id,
+            action=action,
+            risk_score=score,
+            reason_codes=reasons,
+            configuration_version=self._policy.configuration_version,
+            policy_version=self._policy.policy_version,
+            rule_version=self._policy.rule_version,
+            model_version=self._policy.model_version,
+            decided_at=datetime.now(UTC),
+            correlation_id=transaction.correlation_id,
+        )
+
+
+def build_incumbent_scores(
+    records: Sequence[Mapping[str, object]],
+    *,
+    tenant_id_key: str = "tenant_id",
+    event_id_key: str = "event_id",
+    score_key: str = "risk_score",
+    score_max: float = 1.0,
+) -> dict[tuple[str, UUID], float]:
+    """Normalizes an external score export into a ``(tenant_id, event_id) -> [0,1]`` map.
+
+    Provider-neutral: any export that can be shaped into records carrying an
+    event identifier and a numeric score qualifies. ``score_max`` scales
+    vendor-native ranges (for example 1000) into the normalized domain.
+    Missing tenant identity, malformed/out-of-range scores and duplicate
+    tenant/event pairs are all rejected — an incumbent comparison built on partial
+    or ambiguous scores would overstate the challenger.
+    """
+    if not isinstance(score_max, float) or not isfinite(score_max) or score_max <= 0:
+        raise IncumbentScoreUnavailable("score_max must be a positive finite float")
+
+    if not records:
+        raise IncumbentScoreUnavailable("incumbent score export is empty")
+    scores: dict[tuple[str, UUID], float] = {}
+    for index, record in enumerate(records):
+        if tenant_id_key not in record or event_id_key not in record or score_key not in record:
+            raise IncumbentScoreUnavailable(
+                f"incumbent score record {index} missing required keys"
+            )
+        tenant = record[tenant_id_key]
+        if not isinstance(tenant, str) or not tenant.strip() or tenant != tenant.strip():
+            raise IncumbentScoreUnavailable(
+                f"incumbent score record {index} has an invalid tenant id"
+            )
+        raw_id = record[event_id_key]
+        try:
+            event_id = raw_id if isinstance(raw_id, UUID) else UUID(str(raw_id))
+        except (ValueError, AttributeError, TypeError):
+            raise IncumbentScoreUnavailable(
+                f"incumbent score record {index} has a malformed event id"
+            ) from None
+        key = (tenant, event_id)
+        if key in scores:
+            raise IncumbentScoreUnavailable("duplicate tenant-scoped incumbent score")
+        raw_score = record[score_key]
+        if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+            raise IncumbentScoreUnavailable(
+                f"incumbent score record {index} has a non-numeric score"
+            )
+        normalized = float(raw_score) / score_max
+        if not isfinite(normalized) or not 0.0 <= normalized <= 1.0:
+            raise IncumbentScoreUnavailable(
+                f"incumbent score record {index} is outside [0, {score_max}]"
+            )
+        scores[key] = normalized
+    return scores

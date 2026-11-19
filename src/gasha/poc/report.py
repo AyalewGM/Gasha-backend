@@ -20,6 +20,7 @@ from gasha.poc.historical import (
     HistoricalReplayMetrics,
     HistoricalReplayReport,
     MissingTenantPolicyError,
+    ReplayDecisionSource,
 )
 from gasha.poc.incumbent import IncumbentComparison, compare_incumbent
 
@@ -427,6 +428,18 @@ def build_poc_report(
         raise ValueError(
             f"unsupported POC report schema version {report_version!r}; "
             f"expected {POC_REPORT_SCHEMA_VERSION!r}"
+        )
+
+    # This schema names its primary measurements "Gasha". A custom replay
+    # backend, including thresholded vendor scores, must not be serialized
+    # under that identity even if a caller supplies comparison counts.
+    if any(
+        result.decision_source is not ReplayDecisionSource.GASHA_DECISION
+        for result in report.results
+    ):
+        raise ValueError(
+            "Gasha POC report cannot label simulated or alternate "
+            "offline decisions as Gasha decisions"
         )
 
     for result in report.results:
