@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
+from hashlib import sha256
+from json import dumps
 from re import fullmatch
 from typing import cast
 
@@ -96,6 +98,7 @@ class MM05Assessment:
     tenant_id: str
     event_id: str
     policy_version: str
+    threshold_fingerprint: str
     feature_version: str
     arithmetic_version: str
     window_version: str
@@ -104,6 +107,17 @@ class MM05Assessment:
     state: MM05State
     reason_codes: tuple[str, ...]
     feature: ActivityFeature
+
+
+def _policy_fingerprint(policy: MM05ThresholdPolicy) -> str:
+    """Identify the complete threshold content, not a reusable version label."""
+    payload = (
+        VERSION, policy.version, policy.window_version,
+        policy.min_current_count, str(policy.min_current_value),
+        str(policy.min_count_ratio), str(policy.min_value_ratio),
+        policy.max_low_baseline_count, policy.max_low_baseline_active_days,
+    )
+    return "sha256:" + sha256(dumps(payload, separators=(",", ":")).encode()).hexdigest()
 
 
 def evaluate_mm05_activity(
@@ -120,6 +134,8 @@ def evaluate_mm05_activity(
         raise ValueError("typed MM-05 feature and policy required")
     if feature.version != ACTIVITY_VERSION or feature.window_version != policy.window_version:
         raise ValueError("MM-05 feature/policy version mismatch")
+    if feature.arithmetic_version != "exact-micro-units-ratio12-half-even-v1":
+        raise ValueError("unsupported MM-05 arithmetic contract")
     _identifier("tenant", feature.tenant_id)
     _identifier("event", feature.event_id)
     if type(feature.source_fingerprint) is not str or fullmatch(
@@ -212,6 +228,7 @@ def evaluate_mm05_activity(
         tenant_id=feature.tenant_id,
         event_id=feature.event_id,
         policy_version=policy.version,
+        threshold_fingerprint=_policy_fingerprint(policy),
         feature_version=feature.version,
         arithmetic_version=feature.arithmetic_version,
         window_version=feature.window_version,
