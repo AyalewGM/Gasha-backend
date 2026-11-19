@@ -526,12 +526,102 @@ def test_attested_invalid_history_count_fails_optional_source(
 
 @pytest.mark.parametrize("invalid", [
     float("nan"), float("inf"), float("-inf"), -1.0, -0.0,
-    HISTORY_MAX_RATIO + 1, True, False, "4.0", [], {"ratio": 4.0},
+    HISTORY_MAX_RATIO + 1, 10**400, -(10**400), True, False,
+    "4.0", [], {"ratio": 4.0},
 ])
 def test_attested_invalid_baseline_ratio_not_fraud_evidence(invalid: object) -> None:
     assert_invalid_signed_history(HistoryFeatures(
         amount_to_sender_baseline_ratio=invalid  # type: ignore[arg-type]
     ))
+
+
+@pytest.mark.parametrize("field,measured", [
+    ("account_transfers_1h", 5),
+    ("beneficiary_unique_senders_1h", 2),
+    ("beneficiary_incoming_count_1h", 2),
+    ("sender_beneficiary_prior_transfer_count", 1),
+    ("beneficiary_confirmed_fraud_sender_count", 1),
+    ("amount_to_sender_baseline_ratio", 7.0),
+    ("device_seen_for_sender_before", False),
+])
+def test_attested_history_cannot_be_missing_and_measured(
+    field: str, measured: object,
+) -> None:
+    # The fixture genuinely signs the contradictory content, rather than
+    # mutating a previously attested envelope after issuance.
+    contradictory = replace(
+        HistoryFeatures(missing=(field,)), **{field: measured}
+    )
+    assert_invalid_signed_history(contradictory)
+
+
+@pytest.mark.parametrize("listed", [True, False])
+def test_attested_none_is_unavailable_with_or_without_explicit_missing(
+    listed: bool,
+) -> None:
+    features = HistoryFeatures(
+        account_transfers_1h=None,
+        missing=("account_transfers_1h",) if listed else (),
+    )
+    service, _, _, _ = assembler(history=issued("history", features))
+    result = service.assemble(tx(), decision_context=context())
+    assert result == service.assemble(tx(), decision_context=context())
+    assert result.missing.count("account_transfers_1h") == 1
+    assert "history_features_invalid" not in result.missing
+    assert "history" in dict(result.provider_digests)
+    assert "HIGH_ACCOUNT_VELOCITY_1H" not in result.reason_codes
+
+
+@pytest.mark.parametrize("features", [
+    HistoryFeatures(account_transfers_1h=5, missing=("account_transfers_1h",)),
+    HistoryFeatures(
+        amount_to_sender_baseline_ratio=7.0,
+        missing=("amount_to_sender_baseline_ratio",),
+    ),
+    HistoryFeatures(amount_to_sender_baseline_ratio=10**400),
+    HistoryFeatures(amount_to_sender_baseline_ratio=-(10**400)),
+])
+def test_invalid_attested_history_keeps_valid_graph_and_session(
+    features: HistoryFeatures,
+) -> None:
+    service, _, _, _ = assembler(
+        history=issued("history", features),
+        graph=issued("graph", graph_signals(risk=True)),
+    )
+    session = issued("session", session_signals())
+    original = service.assemble(tx(), decision_context=context(), session=session)
+    replay = service.assemble(tx(), decision_context=context(), session=session)
+    assert original == replay
+    assert original.missing[:2] == ("history_features", "history_features_invalid")
+    assert "history" not in dict(original.provider_digests)
+    assert {"graph", "session"} <= set(dict(original.provider_digests))
+    assert original.snapshot.velocity_risk == 0
+    assert original.snapshot.transaction_risk == 0
+    assert original.snapshot.network_risk > 0
+    assert original.snapshot.device_session_risk > 0
+    assert "HIGH_ACCOUNT_VELOCITY_1H" not in original.reason_codes
+    assert "AMOUNT_ABOVE_SENDER_BASELINE" not in original.reason_codes
+    assert "tenant-b" not in str(original)
+
+
+def test_unexpected_history_validation_exception_is_fail_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gasha.intelligence import assembler as module
+
+    def broken(_payload: object) -> bool:
+        raise OverflowError("fixture boundary exception (must not be logged)")
+
+    monkeypatch.setattr(module, "valid_history_features", broken)
+    service, _, _, _ = assembler(
+        history=issued("history", HistoryFeatures(account_transfers_1h=5))
+    )
+    original = service.assemble(tx(), decision_context=context())
+    assert original == service.assemble(tx(), decision_context=context())
+    assert original.snapshot == IntelligenceSnapshot()
+    assert original.missing[:2] == ("history_features", "history_features_invalid")
+    assert original.provider_digests == ()
+    assert "fixture boundary exception" not in str(original)
 
 
 @pytest.mark.parametrize("invalid", ["false", 0, 1, [], {}])
@@ -581,8 +671,9 @@ def test_signed_history_counts_accept_named_integrity_boundaries(
 
 
 @pytest.mark.parametrize("ratio,expected", [
-    (0.0, False), (3.999, False), (4.0, True),
-    (4.001, True), (HISTORY_MAX_RATIO, True),
+    (0.0, False), (0, False), (3.999, False), (4.0, True),
+    (4.001, True), (int(HISTORY_MAX_RATIO), True),
+    (HISTORY_MAX_RATIO, True),
 ])
 def test_signed_finite_ratio_boundary_is_reproducible(
     ratio: float, expected: bool,
