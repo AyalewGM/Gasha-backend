@@ -199,6 +199,7 @@ def compute_mm05_activity(
         "domain": VERSION, "dataset": dataset_digest, "epoch": history_epoch,
         "policy": (policy.version, policy.baseline_days, policy.current_hours, policy.direction.value),
         "target": identity(target), "cutoff": cutoff.isoformat(),
+        "history_present": history is not None,
         "coverage": [c.isoformat() if c is not None else None for c in coverage],
         "eligible": sorted(identity(row) for row in eligible),
     }
