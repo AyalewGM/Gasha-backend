@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from hashlib import sha256
 from json import dumps
 from math import copysign, isfinite
@@ -254,7 +254,7 @@ class IntelligenceAssembler:
             actual.source == source
             and actual.scope == IntelligenceScope.TENANT_OBSERVED
             and actual.source_version == envelope.source_version
-            and actual.observed_at == envelope.observed_at
+            and actual.observed_at.astimezone(UTC) == envelope.observed_at.astimezone(UTC)
         )
 
     def assemble(
