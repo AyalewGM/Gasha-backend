@@ -71,6 +71,7 @@ def test_history_incomplete_and_new_account_fail_as_unavailable_not_zero():
         assert not res.available and res.unavailable_reason == reason
         assert res.baseline_count is res.current_value is res.count_ratio is None
     assert compute(None).unavailable_reason == "history_store_unavailable"
+    assert compute(None).source_fingerprint != compute(()).source_fingerprint
 
 
 def test_complete_zero_baseline_has_undefined_ratios_without_division_inflation():
