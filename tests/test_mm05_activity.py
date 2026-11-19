@@ -1,7 +1,7 @@
 """Non-authoritative MM-05 computation; no alert or enforcement assertions."""
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
-from decimal import Context, Decimal, Inexact, ROUND_DOWN, Rounded, localcontext
+from decimal import ROUND_DOWN, Context, Decimal, Inexact, Rounded, localcontext
 
 import pytest
 
