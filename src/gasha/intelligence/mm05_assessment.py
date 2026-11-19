@@ -12,6 +12,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from re import fullmatch
+from typing import cast
 
 from gasha.intelligence.mm05_activity import (
     VERSION as ACTIVITY_VERSION,
@@ -33,6 +34,8 @@ class MM05State(StrEnum):
 class MM05Reason(StrEnum):
     FEATURE_UNAVAILABLE = "feature_unavailable"
     INSUFFICIENT_BASELINE = "insufficient_baseline"
+    DORMANT_ZERO_BASELINE = "dormant_zero_baseline"
+    ABSOLUTE_MATERIALITY = "absolute_materiality"
     NOT_LOW_ACTIVITY = "not_low_activity"
     BELOW_CURRENT_MATERIALITY = "below_current_materiality"
     COUNT_SURGE_NOT_MET = "count_surge_not_met"
@@ -150,40 +153,61 @@ def evaluate_mm05_activity(
             raise ValueError("available feature has invalid monetary value")
         if type(feature.dormancy_assessment) is not DormancyAssessment:
             raise ValueError("typed dormancy assessment required")
-        if feature.count_ratio is None or feature.value_ratio is None:
-            reasons = (MM05Reason.INSUFFICIENT_BASELINE.value,)
+        baseline_count = cast(int, feature.baseline_count)
+        current_count = cast(int, feature.current_count)
+        baseline_days = cast(int, feature.baseline_active_days)
+        current_value = cast(Decimal, feature.current_value)
+        dormant = feature.dormancy_assessment is DormancyAssessment.DORMANT_CANDIDATE
+        low_baseline = (
+            baseline_count <= policy.max_low_baseline_count
+            and baseline_days <= policy.max_low_baseline_active_days
+        )
+        if not (low_baseline or dormant):
+            state = MM05State.NOT_FLAGGED
+            reasons = (MM05Reason.NOT_LOW_ACTIVITY.value,)
+        elif (
+            current_count < policy.min_current_count
+            or current_value < policy.min_current_value
+        ):
+            # A quiet account with just one event is never a surge by inference.
+            reasons = (MM05Reason.INSUFFICIENT_BASELINE.value,) if baseline_count == 0 else (
+                MM05Reason.BELOW_CURRENT_MATERIALITY.value,
+            )
+            state = (
+                MM05State.NOT_ASSESSED if baseline_count == 0 else MM05State.NOT_FLAGGED
+            )
+        elif feature.count_ratio is None or feature.value_ratio is None:
+            if baseline_count == 0 and dormant:
+                # No ratio/division is invented. A complete, dormant account
+                # with multiple material events can still be reviewed on an
+                # explicitly different absolute-activation basis.
+                state = MM05State.REVIEW_CANDIDATE
+                reasons = (
+                    MM05Reason.DORMANT_CANDIDATE.value,
+                    MM05Reason.DORMANT_ZERO_BASELINE.value,
+                    MM05Reason.ABSOLUTE_MATERIALITY.value,
+                )
+            else:
+                reasons = (MM05Reason.INSUFFICIENT_BASELINE.value,)
         elif any(
             type(ratio) is not Decimal or not ratio.is_finite() or ratio < 0
             for ratio in (feature.count_ratio, feature.value_ratio)
         ):
             raise ValueError("available feature has invalid ratio")
+        elif feature.count_ratio < policy.min_count_ratio:
+            state = MM05State.NOT_FLAGGED
+            reasons = (MM05Reason.COUNT_SURGE_NOT_MET.value,)
+        elif feature.value_ratio < policy.min_value_ratio:
+            state = MM05State.NOT_FLAGGED
+            reasons = (MM05Reason.VALUE_SURGE_NOT_MET.value,)
         else:
-            low_baseline = (
-                feature.baseline_count <= policy.max_low_baseline_count
-                and feature.baseline_active_days <= policy.max_low_baseline_active_days
+            state = MM05State.REVIEW_CANDIDATE
+            reasons = (
+                MM05Reason.DORMANT_CANDIDATE.value if dormant
+                else MM05Reason.LOW_ACTIVITY_BASELINE.value,
+                MM05Reason.COUNT_SURGE.value,
+                MM05Reason.VALUE_SURGE.value,
             )
-            dormant = feature.dormancy_assessment is DormancyAssessment.DORMANT_CANDIDATE
-            if not (low_baseline or dormant):
-                reasons = (MM05Reason.NOT_LOW_ACTIVITY.value,)
-            elif (
-                feature.current_count < policy.min_current_count
-                or feature.current_value < policy.min_current_value
-            ):
-                reasons = (MM05Reason.BELOW_CURRENT_MATERIALITY.value,)
-            elif feature.count_ratio < policy.min_count_ratio:
-                reasons = (MM05Reason.COUNT_SURGE_NOT_MET.value,)
-            elif feature.value_ratio < policy.min_value_ratio:
-                reasons = (MM05Reason.VALUE_SURGE_NOT_MET.value,)
-            else:
-                state = MM05State.REVIEW_CANDIDATE
-                reasons = (
-                    MM05Reason.DORMANT_CANDIDATE.value if dormant
-                    else MM05Reason.LOW_ACTIVITY_BASELINE.value,
-                    MM05Reason.COUNT_SURGE.value,
-                    MM05Reason.VALUE_SURGE.value,
-                )
-            if state is not MM05State.REVIEW_CANDIDATE:
-                state = MM05State.NOT_FLAGGED
 
     return MM05Assessment(
         scenario_id=_SCENARIO_ID,
