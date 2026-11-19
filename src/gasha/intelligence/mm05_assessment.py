@@ -7,8 +7,8 @@ issuer/ledger is implemented (#42/#43/#48). No API, Redis, case, or bank wiring.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -90,7 +90,6 @@ class MM05ThresholdPolicy:
                 raise ValueError(f"{name} outside synthetic integer bounds")
         for name in ("min_current_value", "min_count_ratio", "min_value_ratio"):
             _threshold(name, getattr(self, name))
-
 
 
 def _canonical_decimal(value: Decimal) -> str:
@@ -201,10 +200,15 @@ class MM05ThresholdSnapshot:
         if not isinstance(payload, Mapping):
             raise ValueError("threshold snapshot object required")
         if set(payload) != {
-            "version", "window_version", "min_current_count", "min_current_value",
-            "min_count_ratio", "min_value_ratio", "max_low_baseline_count",
-            "max_low_baseline_active_days",
-        }:
+        "version",
+        "window_version",
+        "min_current_count",
+        "min_current_value",
+        "min_count_ratio",
+        "min_value_ratio",
+        "max_low_baseline_count",
+        "max_low_baseline_active_days",
+    }:
             raise ValueError("threshold snapshot fields must match exactly")
         return cls(
             version=_snapshot_str("version", payload["version"]),
