@@ -5,28 +5,48 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from hashlib import sha256
 from hmac import new
 from uuid import UUID
 
 import pytest
 
-from gasha.domain.models import BeneficiaryType, CanonicalTransaction, IntelligenceSnapshot
+from gasha.domain.models import (
+    BeneficiaryType,
+    CanonicalTransaction,
+    IntelligenceSnapshot,
+)
 from gasha.intelligence.assembler import (
-    AssemblyPolicy, AssemblyRejected, HistoryFeatures, IntelligenceAssembler,
+    AssemblyPolicy,
+    AssemblyRejected,
+    HistoryFeatures,
+    IntelligenceAssembler,
 )
 from gasha.intelligence.assembly_lineage import (
-    OriginalDecisionContext, ProviderEvidence, context_identity,
-    evidence_identity, payload_digest,
+    OriginalDecisionContext,
+    ProviderEvidence,
+    context_identity,
+    evidence_identity,
+    payload_digest,
 )
 from gasha.intelligence.behavioral_session import (
-    BehavioralSessionDetector, BehavioralSessionPolicy, BehavioralSessionSignals,
+    BehavioralSessionDetector,
+    BehavioralSessionPolicy,
+    BehavioralSessionSignals,
 )
 from gasha.intelligence.internal_graph import (
-    InternalGraphDetector, InternalGraphPolicy, InternalGraphSignals,
+    InternalGraphDetector,
+    InternalGraphPolicy,
+    InternalGraphSignals,
 )
-from gasha.intelligence.provenance import IntelligenceScope, IntelligenceSource, SignalProvenance
-from gasha.intelligence.social_engineering import SocialEngineeringDetector, SocialEngineeringPolicy
+from gasha.intelligence.provenance import (
+    IntelligenceScope,
+    IntelligenceSource,
+    SignalProvenance,
+)
+from gasha.intelligence.social_engineering import (
+    SocialEngineeringDetector,
+    SocialEngineeringPolicy,
+)
 from gasha.journey.detector import JourneyAssessment
 
 AT = datetime(2026, 1, 5, 9, tzinfo=UTC)
@@ -179,7 +199,7 @@ def test_verified_signals_same_cutoff_replay_and_provenance() -> None:
     ))
     graph = issued("graph", graph_signals(risk=True))
     session = issued("session", session_signals())
-    service, h, g, j = assembler(history, graph)
+    service, h, g, _ = assembler(history, graph)
     original = service.assemble(
         tx(), decision_context=context(), session=session
     )

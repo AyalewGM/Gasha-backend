@@ -179,5 +179,6 @@ def verified(
             item.payload_digest == payload_digest(item.payload)
             and authority.verify_evidence(item, context) is True
         )
-    except (TypeError, ValueError, OverflowError, AttributeError):
+    except Exception:  # noqa: BLE001
+        # Verification outages or malformed provider evidence cannot grant trust.
         return False

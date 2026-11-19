@@ -22,8 +22,9 @@ from gasha.intelligence.assembly_lineage import (
 from gasha.intelligence.behavioral_session import (
     BehavioralSessionDetector,
     BehavioralSessionSignals,
+    BehavioralSessionAssessment,
 )
-from gasha.intelligence.internal_graph import InternalGraphDetector, InternalGraphSignals
+from gasha.intelligence.internal_graph import (InternalGraphAssessment, InternalGraphDetector, InternalGraphSignals)
 from gasha.intelligence.provenance import (
     IntelligenceEvidence,
     IntelligenceScope,
@@ -33,6 +34,7 @@ from gasha.intelligence.provenance import (
 from gasha.intelligence.social_engineering import (
     SocialEngineeringDetector,
     SocialEngineeringSignals,
+    SocialEngineeringAssessment,
 )
 from gasha.journey.detector import JourneyAssessment
 
@@ -131,9 +133,9 @@ class IntelligenceAssembler:
             if verified(response, source, payload_type, context, self._authority):
                 assert isinstance(response, ProviderEvidence)
                 return response
-        except Exception:
-            # Optional intelligence outages may not turn missing into risk.
-            pass
+        except Exception:  # noqa: BLE001
+            # A failed optional provider is explicitly unavailable, never zero-risk evidence.
+            return None
         return None
 
     @staticmethod
@@ -193,8 +195,12 @@ class IntelligenceAssembler:
                 assessment.tenant_id != transaction.tenant_id
                 or assessment.customer_id != transaction.sender_customer_id
                 or assessment.as_of != context.cutoff
-                or any(event.occurred_at > context.cutoff
-                       for event in assessment.contributing_events)
+                or any(
+                    event.occurred_at.tzinfo is None
+                    or event.occurred_at.utcoffset() is None
+                    or event.occurred_at > context.cutoff
+                    for event in assessment.contributing_events
+                )
             ):
                 journey = None
         if graph is not None:
@@ -226,7 +232,11 @@ class IntelligenceAssembler:
         missing: list[str] = []
         accepted: list[tuple[str, str]] = []
 
-        def consume(name: str, result: object, envelope: ProviderEvidence) -> None:
+        def consume(
+            name: str,
+            result: SocialEngineeringAssessment | InternalGraphAssessment | BehavioralSessionAssessment,
+            envelope: ProviderEvidence,
+        ) -> None:
             for key in IntelligenceSnapshot.model_fields:
                 components[key] = max(
                     components[key], getattr(result.intelligence, key)
