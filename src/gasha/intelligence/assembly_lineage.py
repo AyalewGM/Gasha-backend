@@ -227,7 +227,7 @@ def context_matches(
         and len(context.policy_snapshots) == 5
         and {p.role for p in context.policy_snapshots}
             == {"assembly", "social", "graph", "session", "journey"}
-        and context.received_at >= context.occurred_at
+        and context.received_at.astimezone(UTC) >= context.occurred_at.astimezone(UTC)
         and all(
             isinstance(s, str) and 0 < len(s) <= 128 and s.isascii()
             and all(c.isalnum() or c in "._:-" for c in s)
@@ -259,7 +259,7 @@ def verified(
         and item.dataset_epoch == context.dataset_epoch
         and item.dataset_seal == context.dataset_seal
         and item.as_of.astimezone(UTC) == context.cutoff
-        and item.observed_at <= item.available_at <= context.cutoff
+        and item.observed_at.astimezone(UTC) <= item.available_at.astimezone(UTC) <= context.cutoff
         and isinstance(item.source_version, str)
         and 0 < len(item.source_version) <= 128
         and isinstance(item.attestation, str)
