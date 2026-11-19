@@ -25,8 +25,8 @@ DIGEST = "sha256:" + "b" * 64
 WINDOW = ActivityWindowPolicy("synthetic-window-v1", 30, 24, ActivityDirection.CREDIT, 90)
 POLICY = MM05ThresholdPolicy(
     "synthetic-threshold-v1", WINDOW.version,
-    min_current_count=3, min_current_value=Decimal("300"),
-    min_count_ratio=Decimal("3"), min_value_ratio=Decimal("3"),
+    min_current_count=3, min_current_value=Decimal(300),
+    min_count_ratio=Decimal(3), min_value_ratio=Decimal(3),
     max_low_baseline_count=2, max_low_baseline_active_days=2,
 )
 
@@ -164,7 +164,7 @@ def test_exact_thresholds_and_wrong_window_fail_closed() -> None:
         assess(history, policy=replace(POLICY, window_version="different"))
 
 
-@pytest.mark.parametrize("bad", [Decimal("NaN"), Decimal("Infinity"), Decimal("0"),
+@pytest.mark.parametrize("bad", [Decimal("NaN"), Decimal("Infinity"), Decimal(0),
                                  Decimal("1e1000000"), Decimal("1e-1000000")])
 def test_invalid_policy_decimal_denied(bad: Decimal) -> None:
     with pytest.raises(ValueError):
