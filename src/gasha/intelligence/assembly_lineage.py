@@ -131,7 +131,7 @@ def policy_snapshot(role: str, policy: BaseModel) -> EffectivePolicySnapshot:
         (_POLICY_VERSION + "\n" + role + "\n" + schema + "\n" + content).encode()
     ).hexdigest()
     return EffectivePolicySnapshot(
-        role=role, schema=schema, version=str(getattr(policy, "policy_version")),
+        role=role, schema=schema, version=str(policy.model_dump()["policy_version"]),
         content=content, digest=digest,
     )
 
