@@ -1,9 +1,9 @@
 """Offline MM-05 assessment tests; no API, fraud label, case or bank assertions."""
 
 from dataclasses import FrozenInstanceError, replace
-from json import dumps, loads
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from json import dumps, loads
 
 import pytest
 
