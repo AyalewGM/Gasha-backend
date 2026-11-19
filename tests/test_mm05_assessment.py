@@ -69,8 +69,8 @@ def test_dormant_activation_candidate_with_explainable_lineage() -> None:
     assert result.state is MM05State.REVIEW_CANDIDATE
     assert result.reason_codes == (
         MM05Reason.DORMANT_CANDIDATE.value,
-        MM05Reason.COUNT_SURGE.value,
-        MM05Reason.VALUE_SURGE.value,
+        MM05Reason.DORMANT_ZERO_BASELINE.value,
+        MM05Reason.ABSOLUTE_MATERIALITY.value,
     )
     assert result.feature.current_count == 3
     assert result.policy_version == POLICY.version
@@ -110,15 +110,17 @@ def test_payroll_business_cycle_and_gradual_growth_controls_do_not_flag() -> Non
 
 
 def test_high_count_alone_and_high_value_alone_are_not_combined_surge() -> None:
-    baseline = (entry("base", -25, "100"),)
+    baseline = (entry("base", -25, "1000"),)
     count_only = baseline + (
-        entry("c1", -3, "1"), entry("c2", -2, "1"), entry("c3", -1, "1"),
+        entry("c1", -3, "100"), entry("c2", -2, "100"), entry("c3", -1, "100"),
     )
-    count_result = assess(count_only, target_amount="1")
+    count_result = assess(count_only, target_amount="100")
     assert count_result.state is MM05State.NOT_FLAGGED
     assert count_result.reason_codes == (MM05Reason.VALUE_SURGE_NOT_MET.value,)
-    value_only = baseline + (entry("v1", -1, "3000"),)
-    value_result = assess(value_only, target_amount="3000")
+    value_only = (entry("base", -25, "100"), entry("v1", -1, "3000"))
+    value_result = assess(
+        value_only, target_amount="3000", policy=replace(POLICY, min_current_count=2),
+    )
     assert value_result.state is MM05State.NOT_FLAGGED
     assert value_result.reason_codes == (MM05Reason.COUNT_SURGE_NOT_MET.value,)
 
