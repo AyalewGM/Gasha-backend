@@ -18,6 +18,9 @@ from gasha.domain.models import (
 from gasha.intelligence.assembler import (
     AssemblyPolicy,
     AssemblyRejected,
+    HISTORY_FEATURE_SCHEMA_VERSION,
+    HISTORY_MAX_COUNT,
+    HISTORY_MAX_RATIO,
     HistoryFeatures,
     IntelligenceAssembler,
 )
@@ -482,3 +485,141 @@ def test_journey_policy_artifact_and_envelope_are_bound() -> None:
     unavailable = service.assemble(tx(), decision_context=context())
     assert unavailable.snapshot.journey_risk == 0
     assert "journey_intelligence" in unavailable.missing
+
+
+# Authenticated sources can be wrong: authenticity must precede a separate
+# versioned semantic-validation boundary. Each payload below is re-digested
+# and signed by the fixture issuer, not merely tampered after signing.
+_HISTORY_COUNTS = (
+    "account_transfers_1h",
+    "beneficiary_unique_senders_1h",
+    "beneficiary_incoming_count_1h",
+    "sender_beneficiary_prior_transfer_count",
+    "beneficiary_confirmed_fraud_sender_count",
+)
+
+
+def assert_invalid_signed_history(features: HistoryFeatures) -> None:
+    signed = issued("history", features)
+    service, _, _, _ = assembler(history=signed)
+    original = service.assemble(tx(), decision_context=context())
+    replay = service.assemble(tx(), decision_context=context())
+    assert original == replay
+    assert original.snapshot == IntelligenceSnapshot()
+    assert original.reason_codes == ()
+    assert original.evidence == ()
+    assert original.missing[:2] == ("history_features", "history_features_invalid")
+    assert original.provider_digests == ()
+    assert original.snapshot_digest == replay.snapshot_digest
+    assert "tenant-b" not in str(original)
+
+
+@pytest.mark.parametrize("field", _HISTORY_COUNTS)
+@pytest.mark.parametrize("invalid", [
+    -1, HISTORY_MAX_COUNT + 1, True, False, "5", 5.0, 1.5, [], {"count": 5},
+])
+def test_attested_invalid_history_count_fails_optional_source(
+    field: str, invalid: object,
+) -> None:
+    assert_invalid_signed_history(replace(HistoryFeatures(), **{field: invalid}))
+
+
+@pytest.mark.parametrize("invalid", [
+    float("nan"), float("inf"), float("-inf"), -1.0, -0.0,
+    HISTORY_MAX_RATIO + 1, True, False, "4.0", [], {"ratio": 4.0},
+])
+def test_attested_invalid_baseline_ratio_not_fraud_evidence(invalid: object) -> None:
+    assert_invalid_signed_history(HistoryFeatures(
+        amount_to_sender_baseline_ratio=invalid  # type: ignore[arg-type]
+    ))
+
+
+@pytest.mark.parametrize("invalid", ["false", 0, 1, [], {}])
+def test_attested_invalid_device_boolean_is_unavailable(invalid: object) -> None:
+    assert_invalid_signed_history(HistoryFeatures(
+        device_seen_for_sender_before=invalid  # type: ignore[arg-type]
+    ))
+
+
+@pytest.mark.parametrize("invalid", [
+    ["account_transfers_1h"], "account_transfers_1h",
+    ("account_transfers_1h", "account_transfers_1h"),
+    ("unapproved_field",), (1,), (["account_transfers_1h"],),
+    ("account_transfers_1h", None),
+])
+def test_attested_invalid_missing_field_names_are_unavailable(invalid: object) -> None:
+    assert_invalid_signed_history(HistoryFeatures(
+        missing=invalid  # type: ignore[arg-type]
+    ))
+
+
+@pytest.mark.parametrize("features", [
+    HistoryFeatures(
+        beneficiary_unique_senders_1h=3, beneficiary_incoming_count_1h=2
+    ),
+    HistoryFeatures(
+        beneficiary_confirmed_fraud_sender_count=3, beneficiary_unique_senders_1h=2
+    ),
+    HistoryFeatures(schema_version="unknown-schema-v2"),
+])
+def test_attested_impossible_count_relations_or_schema_fail_closed(
+    features: HistoryFeatures,
+) -> None:
+    assert_invalid_signed_history(features)
+
+
+@pytest.mark.parametrize("field", _HISTORY_COUNTS)
+@pytest.mark.parametrize("boundary", [0, HISTORY_MAX_COUNT])
+def test_signed_history_counts_accept_named_integrity_boundaries(
+    field: str, boundary: int,
+) -> None:
+    features = replace(HistoryFeatures(), **{field: boundary})
+    service, _, _, _ = assembler(history=issued("history", features))
+    result = service.assemble(tx(), decision_context=context())
+    assert "history_features_invalid" not in result.missing
+    assert "history" in dict(result.provider_digests)
+
+
+@pytest.mark.parametrize("ratio,expected", [
+    (0.0, False), (3.999, False), (4.0, True),
+    (4.001, True), (HISTORY_MAX_RATIO, True),
+])
+def test_signed_finite_ratio_boundary_is_reproducible(
+    ratio: float, expected: bool,
+) -> None:
+    features = HistoryFeatures(amount_to_sender_baseline_ratio=ratio)
+    service, _, _, _ = assembler(history=issued("history", features))
+    result = service.assemble(tx(), decision_context=context())
+    assert ("AMOUNT_ABOVE_SENDER_BASELINE" in result.reason_codes) is expected
+    assert "history_features_invalid" not in result.missing
+    assert result == service.assemble(tx(), decision_context=context())
+
+
+def test_signed_boolean_and_missing_metadata_positive_controls() -> None:
+    features = HistoryFeatures(
+        device_seen_for_sender_before=False,
+        beneficiary_unique_senders_1h=1,
+        beneficiary_incoming_count_1h=1,
+        beneficiary_confirmed_fraud_sender_count=1,
+        missing=("account_transfers_1h",),
+        schema_version=HISTORY_FEATURE_SCHEMA_VERSION,
+    )
+    service, _, _, _ = assembler(history=issued("history", features))
+    result = service.assemble(tx(), decision_context=context())
+    assert "history_features_invalid" not in result.missing
+    assert "history" in dict(result.provider_digests)
+    assert result.snapshot.transaction_risk > 0
+    assert result == service.assemble(tx(), decision_context=context())
+
+
+def test_invalid_history_does_not_suppress_independent_verified_graph() -> None:
+    invalid = issued("history", HistoryFeatures(account_transfers_1h=float("inf")))
+    graph = issued("graph", graph_signals(risk=True))
+    service, _, _, _ = assembler(history=invalid, graph=graph)
+    result = service.assemble(tx(), decision_context=context())
+    assert "history_features_invalid" in result.missing
+    assert "history" not in dict(result.provider_digests)
+    assert "graph" in dict(result.provider_digests)
+    assert result.snapshot.velocity_risk == 0
+    assert result.snapshot.network_risk > 0
+    assert result == service.assemble(tx(), decision_context=context())
