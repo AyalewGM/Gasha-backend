@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hmac import new
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -714,3 +715,166 @@ def test_invalid_history_does_not_suppress_independent_verified_graph() -> None:
     assert result.snapshot.velocity_risk == 0
     assert result.snapshot.network_risk > 0
     assert result == service.assemble(tx(), decision_context=context())
+
+
+# A matching wall clock is not necessarily the same instant at a DST fold.
+# Every fixture here is reissued using the synthetic test authority; these
+# are provenance/chronology negatives, not forged or modified signatures.
+_NY = ZoneInfo("America/New_York")
+
+
+def dst_original(
+    occurred_at: datetime, received_at: datetime,
+) -> tuple[CanonicalTransaction, OriginalDecisionContext]:
+    transaction = tx().model_copy(update={"occurred_at": occurred_at})
+    unsigned = replace(
+        context(), occurred_at=occurred_at, received_at=received_at,
+        transaction_digest=transaction_digest(transaction), attestation="x" * 64,
+    )
+    return transaction, replace(
+        unsigned, attestation=mac(context_identity(unsigned))
+    )
+
+
+def dst_payload(source: str, observed_at: datetime) -> object:
+    if source == "history":
+        return HistoryFeatures(account_transfers_1h=5)
+    if source == "graph":
+        original = graph_signals(risk=True)
+    else:
+        original = session_signals()
+    return original.model_copy(update={
+        "provenance": original.provenance.model_copy(
+            update={"observed_at": observed_at}
+        ),
+    })
+
+
+@pytest.mark.parametrize("occurred,received,allowed", [
+    (
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1),
+        datetime(2026, 11, 1, 1, 30, tzinfo=_NY, fold=0),
+        False,
+    ),
+    (
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=0),
+        datetime(2026, 11, 1, 1, 30, tzinfo=_NY, fold=1),
+        True,
+    ),
+    (
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1),
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1),
+        True,
+    ),
+    (
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1),
+        datetime(2026, 11, 1, 6, 30, tzinfo=UTC),
+        True,
+    ),
+])
+def test_issuer_signed_original_receipt_uses_utc_instant_order(
+    occurred: datetime, received: datetime, allowed: bool,
+) -> None:
+    transaction, original = dst_original(occurred, received)
+    history = issued(
+        "history", HistoryFeatures(account_transfers_1h=5), ctx=original
+    )
+    service, h, g, j = assembler(history=history)
+    if not allowed:
+        with pytest.raises(AssemblyRejected, match="identity/clock"):
+            service.assemble(transaction, decision_context=original)
+        assert h.received == g.received == j.received == []
+    else:
+        first = service.assemble(transaction, decision_context=original)
+        assert first == service.assemble(transaction, decision_context=original)
+        assert "history" in dict(first.provider_digests)
+        assert h.received == g.received == [received.astimezone(UTC)] * 2
+
+
+@pytest.mark.parametrize("source", ["history", "graph", "session"])
+def test_issuer_signed_dst_fold_rejects_provider_observation_after_availability(
+    source: str,
+) -> None:
+    # Later physical instant (EST) has an earlier wall time than the
+    # provider's earlier availability instant (EDT).
+    observed = datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1)
+    available = datetime(2026, 11, 1, 1, 30, tzinfo=_NY, fold=0)
+    transaction, original = dst_original(
+        datetime(2026, 11, 1, 5, 0, tzinfo=UTC),
+        datetime(2026, 11, 1, 7, 0, tzinfo=UTC),
+    )
+    bad = issued(
+        source, dst_payload(source, observed), ctx=original,
+        observed=observed, available=available,
+    )
+    good_graph = issued("graph", graph_signals(risk=True), ctx=original)
+    good_session = issued("session", session_signals(), ctx=original)
+    service, _, _, _ = assembler(
+        history=bad if source == "history" else None,
+        graph=bad if source == "graph" else good_graph,
+    )
+    result = service.assemble(
+        transaction, decision_context=original,
+        session=bad if source == "session" else good_session,
+    )
+    marker = {
+        "history": "history_features",
+        "graph": "graph_intelligence",
+        "session": "session_telemetry",
+    }[source]
+    assert marker in result.missing
+    assert source not in dict(result.provider_digests)
+    if source == "history":
+        assert result.snapshot.velocity_risk == 0
+        assert result.snapshot.network_risk > 0
+    elif source == "graph":
+        assert result.snapshot.network_risk == 0
+        assert result.snapshot.device_session_risk > 0
+    else:
+        assert result.snapshot.device_session_risk == 0
+        assert result.snapshot.network_risk > 0
+    assert result == service.assemble(
+        transaction, decision_context=original,
+        session=bad if source == "session" else good_session,
+    )
+
+
+@pytest.mark.parametrize("source", ["graph", "session"])
+def test_signed_embedded_provenance_dst_fold_not_equal_to_envelope(
+    source: str,
+) -> None:
+    early = datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=0)
+    late = datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1)
+    transaction, original = dst_original(
+        datetime(2026, 11, 1, 5, 0, tzinfo=UTC),
+        datetime(2026, 11, 1, 7, 0, tzinfo=UTC),
+    )
+    bad = issued(
+        source, dst_payload(source, early), ctx=original,
+        observed=late,
+    )
+    def assess(envelope: ProviderEvidence) -> object:
+        service, _, _, _ = assembler(
+            graph=envelope if source == "graph" else None,
+        )
+        return service.assemble(
+            transaction, decision_context=original,
+            session=envelope if source == "session" else None,
+        )
+
+    rejected = assess(bad)
+    assert source not in dict(rejected.provider_digests)
+    assert ("graph_intelligence" if source == "graph" else "session_telemetry") in rejected.missing
+    assert rejected.snapshot.network_risk == 0
+    assert rejected.snapshot.device_session_risk == 0
+    assert rejected == assess(bad)
+
+    # Differently represented clocks that denote the SAME UTC instant pass.
+    good = issued(
+        source, dst_payload(source, late), ctx=original,
+        observed=late.astimezone(UTC),
+    )
+    accepted = assess(good)
+    assert source in dict(accepted.provider_digests)
+    assert accepted.snapshot.network_risk > 0 if source == "graph" else accepted.snapshot.device_session_risk > 0
+    assert accepted == assess(good)
