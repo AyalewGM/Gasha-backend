@@ -53,7 +53,7 @@ from gasha.intelligence.social_engineering import (
     SocialEngineeringDetector,
     SocialEngineeringPolicy,
 )
-from gasha.journey.detector import JourneyAssessment
+from gasha.journey.detector import ContributingEvent, JourneyAssessment
 from gasha.journey.policy import JourneyRiskPolicy
 
 AT = datetime(2026, 1, 5, 9, tzinfo=UTC)
@@ -878,3 +878,111 @@ def test_signed_embedded_provenance_dst_fold_not_equal_to_envelope(
     assert source in dict(accepted.provider_digests)
     assert accepted.snapshot.network_risk > 0 if source == "graph" else accepted.snapshot.device_session_risk > 0
     assert accepted == assess(good)
+
+# SEC-171-05: signed UC-03 journey payload clocks must use physical UTC
+# instants, including during the repeated New York DST hour. All payloads
+# below are freshly digested and attested by the synthetic fixture issuer.
+@pytest.mark.parametrize("cutoff,as_of,event_at,accepted", [
+    # Identical instant in New York EST and UTC; previously falsely rejected.
+    (
+        datetime(2026, 11, 1, 6, 15, tzinfo=UTC),
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1),
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1),
+        True,
+    ),
+    # Same local wall time, but earlier EDT fold: not the cutoff instant.
+    (
+        datetime(2026, 11, 1, 6, 15, tzinfo=UTC),
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=0),
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=0),
+        False,
+    ),
+    (
+        datetime(2026, 11, 1, 6, 15, tzinfo=UTC),
+        datetime(2026, 11, 1, 6, 15, tzinfo=UTC),
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1),
+        True,
+    ),
+    # Earlier wall clock may actually be AFTER the original UTC cutoff.
+    (
+        datetime(2026, 11, 1, 5, 45, tzinfo=UTC),
+        datetime(2026, 11, 1, 5, 45, tzinfo=UTC),
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1),
+        False,
+    ),
+    # Later local wall clock in EDT can be earlier than cutoff in EST.
+    (
+        datetime(2026, 11, 1, 6, 15, tzinfo=UTC),
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1),
+        datetime(2026, 11, 1, 1, 30, tzinfo=_NY, fold=0),
+        True,
+    ),
+    (
+        datetime(2026, 11, 1, 5, 15, tzinfo=UTC),
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=0),
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=0),
+        True,
+    ),
+    (
+        datetime(2026, 11, 1, 6, 15, tzinfo=UTC),
+        datetime(2026, 11, 1, 6, 15),
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1),
+        False,
+    ),
+    (
+        datetime(2026, 11, 1, 6, 15, tzinfo=UTC),
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1),
+        datetime(2026, 11, 1, 5, 30),
+        False,
+    ),
+    (
+        datetime(2026, 11, 1, 6, 15, tzinfo=UTC),
+        datetime(2026, 11, 1, 1, 15, tzinfo=_NY, fold=1),
+        datetime(2026, 11, 1, 1, 30, tzinfo=_NY, fold=1),
+        False,
+    ),
+])
+def test_signed_journey_dst_payload_uses_aware_utc_instant(
+    cutoff: datetime, as_of: datetime, event_at: datetime, accepted: bool,
+) -> None:
+    transaction, original = dst_original(
+        datetime(2026, 11, 1, 5, tzinfo=UTC), cutoff
+    )
+    assessment = JourneyAssessment(
+        tenant_id="tenant-a", customer_id="customer-1", as_of=as_of,
+        journey_risk=0.81, reason_codes=("JOURNEY_ANOMALY",),
+        contributing_events=(ContributingEvent(
+            event_id=UUID(int=9), kind="authentication", subtype="login_failed",
+            occurred_at=event_at,
+        ),),
+        configuration_version="jcfg-v1", policy_version="jp-v1",
+    )
+    journey = issued("journey", assessment, ctx=original)
+    history = issued(
+        "history", HistoryFeatures(account_transfers_1h=5), ctx=original
+    )
+    graph = issued("graph", graph_signals(risk=True), ctx=original)
+    session = issued("session", session_signals(), ctx=original)
+    service, _, _, _ = assembler(
+        history=history, graph=graph, journey=journey, include_journey=True
+    )
+    result = service.assemble(
+        transaction, decision_context=original, session=session
+    )
+    assert result == service.assemble(
+        transaction, decision_context=original, session=session
+    )
+    digests = dict(result.provider_digests)
+    assert {"history", "graph", "session"} <= digests.keys()
+    assert result.snapshot.velocity_risk > 0
+    assert result.snapshot.network_risk > 0
+    assert result.snapshot.device_session_risk > 0
+    assert ("journey" in digests) is accepted
+    assert ("journey_intelligence" not in result.missing) is accepted
+    assert ("JOURNEY_ANOMALY" in result.reason_codes) is accepted
+    if accepted:
+        assert result.snapshot.journey_risk == pytest.approx(0.81)
+    else:
+        assert result.snapshot.journey_risk == 0.0
+        assert "journey" not in digests
+        assert "customer-1" not in str(result.reason_codes)

@@ -344,13 +344,16 @@ class IntelligenceAssembler:
             if (
                 assessment.tenant_id != transaction.tenant_id
                 or assessment.customer_id != transaction.sender_customer_id
-                or assessment.as_of != context.cutoff
+                # Payload clocks must describe the original decision's UTC
+                # instant. Comparing local wall clocks across a DST fold can
+                # reject valid evidence or permit a stale/future assessment.
+                or not aware(assessment.as_of)
+                or assessment.as_of.astimezone(UTC) != context.cutoff
                 or assessment.policy_version != journey_policy.policy_version
                 or assessment.configuration_version != journey_policy.configuration_version
                 or any(
-                    event.occurred_at.tzinfo is None
-                    or event.occurred_at.utcoffset() is None
-                    or event.occurred_at > context.cutoff
+                    not aware(event.occurred_at)
+                    or event.occurred_at.astimezone(UTC) > context.cutoff
                     for event in assessment.contributing_events
                 )
             ):
