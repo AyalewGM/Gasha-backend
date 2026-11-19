@@ -8,14 +8,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Context, Decimal, DivisionByZero, InvalidOperation, Overflow, ROUND_HALF_EVEN, localcontext
 from enum import StrEnum
 from hashlib import sha256
 from json import dumps
 from re import fullmatch
 from zoneinfo import ZoneInfo
 
-VERSION = "mm05-activity-v2"
+VERSION = "mm05-activity-v3"
+_ARITHMETIC_VERSION = "exact-micro-units-ratio12-half-even-v1"
+_RATIO_QUANTUM = Decimal("0.000000000001")
+_RATIO_CONTEXT = Context(
+    prec=64, rounding=ROUND_HALF_EVEN,
+    traps=[DivisionByZero, InvalidOperation, Overflow],
+)
 _MAX_AMOUNT = Decimal("1e18")
 _MAX_ROWS = 4096
 _MAX_RAW_DECIMAL_DIGITS = 64
@@ -88,6 +94,37 @@ def _money_text(value: Decimal) -> str:
     return text
 
 
+def _micro_units(amount: Decimal) -> int:
+    """Convert accepted money to exact integer millionths, independent of context."""
+    text = _money_text(amount)
+    whole, dot, fraction = text.partition(".")
+    return int(whole) * 1_000_000 + (int(fraction.ljust(6, "0")) if dot else 0)
+
+
+def _from_micro_units(value: int) -> Decimal:
+    """Construct Decimal from an exact fixed-point string, without arithmetic."""
+    whole, fraction = divmod(value, 1_000_000)
+    return Decimal(f"{whole}.{fraction:06d}")
+
+
+def _project_ratio(numerator: int, denominator: int) -> Decimal:
+    """Versioned, 12-place half-even projection of an exact rational value."""
+    if denominator <= 0:
+        raise ValueError("positive ratio denominator required")
+    with localcontext(_RATIO_CONTEXT):
+        return (Decimal(numerator) / Decimal(denominator)).quantize(_RATIO_QUANTUM)
+
+
+def _age_hours(older: datetime, newer: datetime) -> Decimal:
+    """No float total_seconds() conversion: retain exact microsecond duration."""
+    elapsed = newer - older
+    microseconds = (
+        (elapsed.days * 86_400 + elapsed.seconds) * 1_000_000
+        + elapsed.microseconds
+    )
+    return _project_ratio(microseconds, 3_600_000_000)
+
+
 def _amount(value: object) -> Decimal:
     if type(value) is not Decimal:
         raise ValueError("finite positive Decimal amount required")
@@ -146,6 +183,7 @@ class ActivityWindowPolicy:
 @dataclass(frozen=True, slots=True)
 class ActivityFeature:
     version: str
+    arithmetic_version: str
     tenant_id: str
     event_id: str
     window_version: str
@@ -173,7 +211,7 @@ def _unavailable(
     baseline_start: datetime, current_start: datetime, reason: str, fingerprint: str,
 ) -> ActivityFeature:
     return ActivityFeature(
-        VERSION, target.tenant_id, target.event_id, policy.version, cutoff,
+        VERSION, _ARITHMETIC_VERSION, target.tenant_id, target.event_id, policy.version, cutoff,
         baseline_start, current_start, False, reason,
         None, None, None, None, None, None, None, None,
         DormancyAssessment.HISTORY_INSUFFICIENT, None, None, fingerprint,
@@ -190,7 +228,8 @@ def compute_mm05_activity(
 
     Baseline [baseline_start,current_start), current [current_start,target_time]
     include a boundary event only in its later window. History must be complete
-    and sealed through cutoff; coverage is a caller claim, not authentication.
+    and sealed through the target receipt time; coverage is a caller claim,
+    not authentication. Later decision_cutoff values never rewrite original evidence.
     Same-time other events are excluded because their order is not established.
     Reversed/failed and the opposite direction do not contribute. No FX is done.
     """
@@ -201,6 +240,8 @@ def compute_mm05_activity(
     cutoff = _clock("decision_cutoff", decision_cutoff)
     if not target.occurred_at <= target.available_at <= cutoff:
         raise ValueError("target is unavailable at the decision cutoff")
+    # PO original-decision contract: later reconciliation cannot expand knowledge.
+    cutoff = target.available_at
     if type(dataset_digest) is not str or fullmatch(r"sha256:[0-9a-f]{64}", dataset_digest) is None:
         raise ValueError("dataset digest required")
     _ref("history epoch", history_epoch)
@@ -238,16 +279,22 @@ def compute_mm05_activity(
             row.direction.value, row.status.value, _money_text(row.amount), row.currency,
         )
 
-    # Do not bind to post-cutoff history, which may have arrived after a past
-    # replay decision. The declared seal and coverage remain explicit inputs.
+    # Original decision evidence uses only facts received by the target receipt
+    # time, even when a caller later requests replay at a later decision time.
     eligible = [r for r in rows if r.occurred_at < target.occurred_at and r.available_at <= cutoff]
+    # A seal extended after this decision is not new original-decision evidence.
+    opened, covered, sealed = coverage
+    effective_coverage = (
+        opened, covered, min(sealed, cutoff) if sealed is not None else None,
+    )
     packet = {
-        "domain": VERSION, "dataset": dataset_digest, "epoch": history_epoch,
+        "domain": VERSION, "arithmetic": _ARITHMETIC_VERSION,
+        "dataset": dataset_digest, "epoch": history_epoch,
         "policy": (policy.version, policy.baseline_days, policy.current_hours,
                    policy.direction.value, policy.dormancy_days),
         "target": identity(target), "cutoff": cutoff.isoformat(),
         "history_present": history is not None,
-        "coverage": [c.isoformat() if c is not None else None for c in coverage],
+        "coverage": [c.isoformat() if c is not None else None for c in effective_coverage],
         "eligible": sorted(identity(row) for row in eligible),
     }
     fingerprint = "sha256:" + sha256(
@@ -300,20 +347,21 @@ def compute_mm05_activity(
         dormancy = DormancyAssessment.DORMANT_CANDIDATE
     else:
         dormancy = DormancyAssessment.HISTORY_INSUFFICIENT
-    baseline_value = sum((row.amount for row in baseline), Decimal(0))
-    current_value = sum((row.amount for row in current), Decimal(0))
+    baseline_units = sum(_micro_units(row.amount) for row in baseline)
+    current_units = sum(_micro_units(row.amount) for row in current)
+    baseline_value = _from_micro_units(baseline_units)
+    current_value = _from_micro_units(current_units)
     return ActivityFeature(
-        VERSION, target.tenant_id, target.event_id, policy.version, cutoff,
+        VERSION, _ARITHMETIC_VERSION, target.tenant_id, target.event_id, policy.version, cutoff,
         baseline_start, current_start, True, None,
         len(baseline), len(current), baseline_value, current_value,
         len({row.occurred_at.date() for row in baseline}),
         len({row.occurred_at.date() for row in current}),
-        (Decimal(str((target.occurred_at - last).total_seconds())) / Decimal(3600)
-         if last is not None else None),
-        (Decimal(str((target.occurred_at - last_pre_current).total_seconds())) / Decimal(3600)
-         if last_pre_current is not None else None),
+        _age_hours(last, target.occurred_at) if last is not None else None,
+        _age_hours(last_pre_current, target.occurred_at)
+        if last_pre_current is not None else None,
         dormancy,
-        Decimal(len(current)) / Decimal(len(baseline)) if baseline else None,
-        current_value / baseline_value if baseline_value else None,
+        _project_ratio(len(current), len(baseline)) if baseline else None,
+        _project_ratio(current_units, baseline_units) if baseline_units else None,
         fingerprint,
     )
