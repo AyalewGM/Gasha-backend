@@ -1,8 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from math import isfinite
+from uuid import UUID
 
+from gasha.domain.models import (
+    CanonicalTransaction,
+    DecisionAction,
+    DecisionPolicy,
+    FraudDecision,
+    IntelligenceSnapshot,
+)
 from gasha.poc.historical import (
     ALERT_ACTIONS,
     ReplayClassification,
@@ -143,3 +153,119 @@ def compare_incumbent(
         neither_detected=neither,
         incremental_confirmed_detection=incremental,
     )
+
+
+class IncumbentScoreUnavailable(ValueError):
+    """An event has no recorded incumbent score; replay must not fabricate one."""
+
+
+class IncumbentScoreBackend:
+    """Replay backend that reproduces an external system's own decisions.
+
+    ``scores`` maps ``event_id`` to the incumbent system's normalized risk
+    score in ``[0, 1]`` (for example a NetGuardians export prepared by
+    :func:`build_incumbent_scores`). Decisions apply the supplied policy's
+    thresholds to the incumbent score — the comparison measures the
+    incumbent's own scoring at a chosen operating point, not a Gasha signal.
+    An event with no recorded score fails closed.
+    """
+
+    def __init__(
+        self, policy: DecisionPolicy, scores: Mapping[UUID, float]
+    ) -> None:
+        self._policy = policy
+        self._scores = scores
+
+    def decide(
+        self,
+        transaction: CanonicalTransaction,
+        intelligence: IntelligenceSnapshot,
+        evidence_reason_codes: Sequence[str] = (),
+    ) -> FraudDecision:
+        try:
+            score = self._scores[transaction.event_id]
+        except KeyError:
+            raise IncumbentScoreUnavailable(
+                f"no incumbent score recorded for event {transaction.event_id}"
+            ) from None
+
+        if score >= self._policy.block_threshold:
+            action = DecisionAction.BLOCK
+        elif score >= self._policy.hold_threshold:
+            action = DecisionAction.HOLD
+        elif score >= self._policy.review_threshold:
+            action = DecisionAction.REVIEW
+        elif score >= self._policy.monitor_threshold:
+            action = DecisionAction.MONITOR
+        else:
+            action = DecisionAction.ALLOW
+
+        reasons = list(evidence_reason_codes)
+        reasons.append(
+            "INCUMBENT_HIGH_SCORE"
+            if score >= self._policy.review_threshold
+            else "INCUMBENT_BELOW_REVIEW"
+        )
+        return FraudDecision(
+            tenant_id=transaction.tenant_id,
+            event_id=transaction.event_id,
+            action=action,
+            risk_score=score,
+            reason_codes=reasons,
+            configuration_version=self._policy.configuration_version,
+            policy_version=self._policy.policy_version,
+            rule_version=self._policy.rule_version,
+            model_version=self._policy.model_version,
+            decided_at=datetime.now(UTC),
+            correlation_id=transaction.correlation_id,
+        )
+
+
+def build_incumbent_scores(
+    records: Sequence[Mapping[str, object]],
+    *,
+    event_id_key: str = "event_id",
+    score_key: str = "risk_score",
+    score_max: float = 1.0,
+) -> dict[UUID, float]:
+    """Normalizes an external score export into an ``event_id -> [0,1]`` map.
+
+    Provider-neutral: any export that can be shaped into records carrying an
+    event identifier and a numeric score qualifies. ``score_max`` scales
+    vendor-native ranges (for example 1000) into the normalized domain.
+    Malformed rows, non-finite or out-of-range scores, and duplicate event
+    identifiers are all rejected — an incumbent comparison built on partial
+    or ambiguous scores would overstate the challenger.
+    """
+    if not isinstance(score_max, float) or not isfinite(score_max) or score_max <= 0:
+        raise IncumbentScoreUnavailable("score_max must be a positive finite float")
+
+    scores: dict[UUID, float] = {}
+    for index, record in enumerate(records):
+        if event_id_key not in record or score_key not in record:
+            raise IncumbentScoreUnavailable(
+                f"incumbent score record {index} missing required keys"
+            )
+        raw_id = record[event_id_key]
+        try:
+            event_id = raw_id if isinstance(raw_id, UUID) else UUID(str(raw_id))
+        except (ValueError, AttributeError, TypeError):
+            raise IncumbentScoreUnavailable(
+                f"incumbent score record {index} has a malformed event id"
+            ) from None
+        if event_id in scores:
+            raise IncumbentScoreUnavailable(
+                f"duplicate incumbent score for event {event_id}"
+            )
+        raw_score = record[score_key]
+        if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+            raise IncumbentScoreUnavailable(
+                f"incumbent score record {index} has a non-numeric score"
+            )
+        normalized = float(raw_score) / score_max
+        if not isfinite(normalized) or not 0.0 <= normalized <= 1.0:
+            raise IncumbentScoreUnavailable(
+                f"incumbent score record {index} is outside [0, {score_max}]"
+            )
+        scores[event_id] = normalized
+    return scores
