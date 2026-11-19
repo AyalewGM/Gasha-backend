@@ -10,9 +10,9 @@ import pytest
 from gasha.intelligence.mm05_activity import (
     AccountActivity,
     ActivityDirection,
+    ActivityFeature,
     ActivityStatus,
     ActivityWindowPolicy,
-    ActivityFeature,
     DormancyAssessment,
     compute_mm05_activity,
 )
