@@ -79,6 +79,11 @@ class FusedDecisionService:
             action = DecisionAction.HOLD
         elif score >= self.policy.review_threshold:
             action = DecisionAction.REVIEW
+        elif (
+            self.policy.challenge_threshold is not None
+            and score >= self.policy.challenge_threshold
+        ):
+            action = DecisionAction.CHALLENGE
         elif score >= self.policy.monitor_threshold:
             action = DecisionAction.MONITOR
         else:

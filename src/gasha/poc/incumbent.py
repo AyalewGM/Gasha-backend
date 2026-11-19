@@ -195,6 +195,11 @@ class IncumbentScoreBackend:
             action = DecisionAction.HOLD
         elif score >= self._policy.review_threshold:
             action = DecisionAction.REVIEW
+        elif (
+            self._policy.challenge_threshold is not None
+            and score >= self._policy.challenge_threshold
+        ):
+            action = DecisionAction.CHALLENGE
         elif score >= self._policy.monitor_threshold:
             action = DecisionAction.MONITOR
         else:

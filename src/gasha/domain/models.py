@@ -79,6 +79,7 @@ class DecisionPolicy(BaseModel):
     rule_version: str = Field(min_length=1)
     model_version: str | None = None
     monitor_threshold: RiskScore = 0.50
+    challenge_threshold: RiskScore | None = None
     review_threshold: RiskScore = 0.70
     hold_threshold: RiskScore = 0.85
     block_threshold: RiskScore = 0.95
@@ -93,6 +94,13 @@ class DecisionPolicy(BaseModel):
         )
         if thresholds != tuple(sorted(thresholds)) or len(set(thresholds)) != len(thresholds):
             raise ValueError("decision thresholds must be strictly increasing")
+        challenge = self.challenge_threshold
+        if challenge is not None and not (
+            self.monitor_threshold < challenge < self.review_threshold
+        ):
+            raise ValueError(
+                "challenge threshold must sit strictly between monitor and review"
+            )
         return self
 
 
