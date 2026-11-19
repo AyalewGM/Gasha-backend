@@ -6,7 +6,10 @@ from decimal import Decimal
 import pytest
 
 from gasha.intelligence.mm05_activity import (
-    AccountActivity, ActivityDirection, ActivityStatus, ActivityWindowPolicy,
+    AccountActivity,
+    ActivityDirection,
+    ActivityStatus,
+    ActivityWindowPolicy,
     compute_mm05_activity,
 )
 
