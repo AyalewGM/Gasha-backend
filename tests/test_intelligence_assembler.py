@@ -25,6 +25,8 @@ from gasha.intelligence.assembly_lineage import (
     OriginalDecisionContext,
     ProviderEvidence,
     context_identity,
+    policy_snapshot,
+    transaction_digest,
     evidence_identity,
     payload_digest,
 )
@@ -48,6 +50,7 @@ from gasha.intelligence.social_engineering import (
     SocialEngineeringPolicy,
 )
 from gasha.journey.detector import JourneyAssessment
+from gasha.journey.policy import JourneyRiskPolicy
 
 AT = datetime(2026, 1, 5, 9, tzinfo=UTC)
 RECEIVED = AT + timedelta(seconds=20)
@@ -69,11 +72,29 @@ def mac(value: bytes) -> str:
     return new(KEY, value, "sha256").hexdigest()
 
 
-def context() -> OriginalDecisionContext:
+def context(
+    *, baseline_ratio_threshold: float = 4.0, velocity_threshold: int = 3,
+) -> OriginalDecisionContext:
+    snapshots = (
+        policy_snapshot("assembly", AssemblyPolicy(
+            policy_version="assembly-v1", velocity_1h_threshold=velocity_threshold
+        )),
+        policy_snapshot("social", SocialEngineeringPolicy(
+            policy_version="soc-v1",
+            amount_baseline_ratio_threshold=baseline_ratio_threshold,
+        )),
+        policy_snapshot("graph", InternalGraphPolicy(policy_version="graph-v1")),
+        policy_snapshot("session", BehavioralSessionPolicy(policy_version="beh-v1")),
+        policy_snapshot("journey", JourneyRiskPolicy(
+            policy_version="jp-v1", configuration_version="jcfg-v1"
+        )),
+    )
     unsigned = OriginalDecisionContext(
         tenant_id="tenant-a", event_id=UUID(int=1),
         decision_id="original-1", occurred_at=AT, received_at=RECEIVED,
-        dataset_epoch="epoch-1", dataset_seal="seal-1", attestation="x" * 64,
+        dataset_epoch="epoch-1", dataset_seal="seal-1",
+        transaction_digest=transaction_digest(tx()), policy_snapshots=snapshots,
+        attestation="x" * 64,
     )
     return replace(unsigned, attestation=mac(context_identity(unsigned)))
 
@@ -105,6 +126,8 @@ def issued(
         as_of=ctx.cutoff, observed_at=observed or AT,
         available_at=available or ctx.cutoff, payload_digest=payload_digest(payload),
         attestation="x" * 64, payload=payload,
+        policy_digest=(next(p.digest for p in ctx.policy_snapshots if p.role == "journey")
+                       if source == "journey" else None),
     )
     return replace(raw, attestation=mac(evidence_identity(raw)))
 
@@ -156,6 +179,7 @@ def assembler(
     include_journey: bool = False,
     baseline_ratio_threshold: float = 4.0,
     authority: Authority | None = None,
+    velocity_threshold: int = 3,
 ) -> tuple[IntelligenceAssembler, Provider, Provider, Provider]:
     h = Provider(history)
     g = Provider(graph)
@@ -174,7 +198,9 @@ def assembler(
         internal_graph=InternalGraphDetector(
             InternalGraphPolicy(policy_version="graph-v1")
         ),
-        assembly_policy=AssemblyPolicy(policy_version="assembly-v1"),
+        assembly_policy=AssemblyPolicy(
+            policy_version="assembly-v1", velocity_1h_threshold=velocity_threshold
+        ),
         source_version="assembly-src-v1",
         journey=j if include_journey else None,
     )
@@ -293,14 +319,18 @@ def test_missing_baseline_never_triggers_low_ratio_threshold() -> None:
         history=issued("history", HistoryFeatures(amount_to_sender_baseline_ratio=None)),
         baseline_ratio_threshold=0.5,
     )
-    result = service.assemble(tx(), decision_context=context())
+    result = service.assemble(
+        tx(), decision_context=context(baseline_ratio_threshold=0.5)
+    )
     assert result.snapshot.transaction_risk == 0
     assert "amount_to_sender_baseline_ratio" in result.missing
     measured, _, _, _ = assembler(
         history=issued("history", HistoryFeatures(amount_to_sender_baseline_ratio=1.0)),
         baseline_ratio_threshold=0.5,
     )
-    assert measured.assemble(tx(), decision_context=context()).snapshot.transaction_risk > 0
+    assert measured.assemble(
+        tx(), decision_context=context(baseline_ratio_threshold=0.5)
+    ).snapshot.transaction_risk > 0
 
 
 def test_journey_future_and_wrong_tenant_are_missing() -> None:
@@ -334,3 +364,121 @@ def test_provider_outage_is_explicitly_unavailable() -> None:
     result = service.assemble(tx(), decision_context=context())
     assert "history_features" in result.missing
     assert result.snapshot == IntelligenceSnapshot()
+
+
+@pytest.mark.parametrize("change", [
+    {"amount": Decimal("5000.01")},
+    {"currency": "USD"},
+    {"sender_customer_id": "customer-2"},
+    {"sender_account_id": "account-2"},
+    {"beneficiary_id": "beneficiary-2"},
+    {"beneficiary_type": BeneficiaryType.INTERNAL},
+    {"destination_institution_id": "other-bank"},
+    {"channel": "internet"},
+    {"transaction_type": "withdrawal"},
+    {"correlation_id": "other-correlation"},
+    {"device_id": "device-2"},
+])
+def test_original_issuer_transaction_binding_rejects_same_identity_substitution(change) -> None:
+    service, h, g, j = assembler()
+    changed = tx().model_copy(update=change)
+    with pytest.raises(AssemblyRejected, match="identity/clock"):
+        service.assemble(changed, decision_context=context())
+    assert h.received == g.received == j.received == []
+
+
+def test_exact_decimal_canonicalization() -> None:
+    assert transaction_digest(tx()) == transaction_digest(
+        tx().model_copy(update={"amount": Decimal("5000.0000")})
+    )
+    assert transaction_digest(tx()) != transaction_digest(
+        tx().model_copy(update={"amount": Decimal("5000.0001")})
+    )
+    for bad in (Decimal("1E+999"), Decimal("1E-999")):
+        with pytest.raises(ValueError):
+            transaction_digest(tx().model_copy(update={"amount": bad}))
+
+
+def test_same_policy_version_changed_velocity_rejected_before_provider() -> None:
+    fact = issued("history", HistoryFeatures(account_transfers_1h=5))
+    first, _, _, _ = assembler(history=fact)
+    original = first.assemble(tx(), decision_context=context())
+    assert "HIGH_ACCOUNT_VELOCITY_1H" in original.reason_codes
+    second, h, g, _ = assembler(history=fact, velocity_threshold=6)
+    with pytest.raises(AssemblyRejected, match="effective policy"):
+        second.assemble(tx(), decision_context=context())
+    assert h.received == g.received == []
+    new_context = context(velocity_threshold=6)
+    revised = second.assemble(tx(), decision_context=new_context)
+    assert "HIGH_ACCOUNT_VELOCITY_1H" not in revised.reason_codes
+    assert original.snapshot_digest != revised.snapshot_digest
+    assert original.policy_snapshots[0].digest != revised.policy_snapshots[0].digest
+
+
+def test_unverified_policy_snapshot_rejected_before_provider_call() -> None:
+    signed = context()
+    service, h, g, _ = assembler()
+    for broken in (
+        replace(signed, policy_snapshots=signed.policy_snapshots[:-1]),
+        replace(signed, policy_snapshots=signed.policy_snapshots[:1] + (
+            replace(signed.policy_snapshots[1], content="{}"),
+        ) + signed.policy_snapshots[2:]),
+        replace(signed, policy_snapshots=signed.policy_snapshots[:2] + (
+            replace(signed.policy_snapshots[2], digest="0" * 64),
+        ) + signed.policy_snapshots[3:]),
+    ):
+        with pytest.raises(AssemblyRejected):
+            service.assemble(tx(), decision_context=broken)
+        assert h.received == g.received == []
+
+
+def test_issuer_signed_invalid_effective_policy_fails_closed() -> None:
+    signed = context()
+    corrupted = replace(
+        signed, policy_snapshots=signed.policy_snapshots[:1] + (
+            replace(signed.policy_snapshots[1], digest="0" * 64),
+        ) + signed.policy_snapshots[2:],
+        attestation="x" * 64,
+    )
+    reissued = replace(corrupted, attestation=mac(context_identity(corrupted)))
+    service, h, g, _ = assembler()
+    with pytest.raises(AssemblyRejected, match="unverified effective policy"):
+        service.assemble(tx(), decision_context=reissued)
+    assert h.received == g.received == []
+
+
+def test_equally_scored_attested_provider_metadata_has_distinct_identity() -> None:
+    features = HistoryFeatures(account_transfers_1h=0)
+    first, _, _, _ = assembler(
+        history=issued("history", features, available=RECEIVED - timedelta(seconds=2))
+    )
+    second, _, _, _ = assembler(
+        history=issued("history", features, available=RECEIVED - timedelta(seconds=1))
+    )
+    a = first.assemble(tx(), decision_context=context())
+    b = second.assemble(tx(), decision_context=context())
+    assert a.snapshot == b.snapshot
+    assert a.provider_digests != b.provider_digests
+    assert a.snapshot_digest != b.snapshot_digest
+    assert a == first.assemble(tx(), decision_context=context())
+
+
+def test_journey_policy_artifact_and_envelope_are_bound() -> None:
+    assessment = JourneyAssessment(
+        tenant_id="tenant-a", customer_id="customer-1", as_of=RECEIVED,
+        journey_risk=0.5, reason_codes=("JOURNEY_ANOMALY",),
+        contributing_events=(), configuration_version="jcfg-v1",
+        policy_version="jp-v1",
+    )
+    signed = issued("journey", assessment)
+    service, _, _, _ = assembler(journey=signed, include_journey=True)
+    result = service.assemble(tx(), decision_context=context())
+    assert result.snapshot.journey_risk == pytest.approx(0.5)
+    assert {p.role for p in result.policy_snapshots} == {
+        "assembly", "social", "graph", "session", "journey"
+    }
+    unbound = replace(signed, policy_digest="0" * 64)
+    service, _, _, _ = assembler(journey=unbound, include_journey=True)
+    unavailable = service.assemble(tx(), decision_context=context())
+    assert unavailable.snapshot.journey_risk == 0
+    assert "journey_intelligence" in unavailable.missing
