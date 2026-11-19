@@ -20,11 +20,15 @@ from gasha.intelligence.assembly_lineage import (
     verified,
 )
 from gasha.intelligence.behavioral_session import (
+    BehavioralSessionAssessment,
     BehavioralSessionDetector,
     BehavioralSessionSignals,
-    BehavioralSessionAssessment,
 )
-from gasha.intelligence.internal_graph import (InternalGraphAssessment, InternalGraphDetector, InternalGraphSignals)
+from gasha.intelligence.internal_graph import (
+    InternalGraphAssessment,
+    InternalGraphDetector,
+    InternalGraphSignals,
+)
 from gasha.intelligence.provenance import (
     IntelligenceEvidence,
     IntelligenceScope,
@@ -32,9 +36,9 @@ from gasha.intelligence.provenance import (
     SignalProvenance,
 )
 from gasha.intelligence.social_engineering import (
+    SocialEngineeringAssessment,
     SocialEngineeringDetector,
     SocialEngineeringSignals,
-    SocialEngineeringAssessment,
 )
 from gasha.journey.detector import JourneyAssessment
 
