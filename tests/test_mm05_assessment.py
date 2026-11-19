@@ -74,6 +74,8 @@ def test_dormant_activation_candidate_with_explainable_lineage() -> None:
     )
     assert result.feature.current_count == 3
     assert result.policy_version == POLICY.version
+    assert result.threshold_fingerprint.startswith("sha256:")
+    assert len(result.threshold_fingerprint) == 71
     assert result.source_fingerprint == result.feature.source_fingerprint
     assert result.knowledge_cutoff == NOW
 
@@ -148,6 +150,20 @@ def test_replay_order_late_arrival_and_cutoff_are_deterministic() -> None:
                            cutoff_hours=3, sealed_hours=3)
     assert first.feature.current_count == 3
     assert first.state is MM05State.REVIEW_CANDIDATE
+
+
+def test_threshold_content_and_arithmetic_contract_are_bound() -> None:
+    feature = assess((entry("base", -25, "100"),)).feature
+    a = evaluate_mm05_activity(feature, policy=POLICY)
+    changed = replace(POLICY, min_current_value=Decimal(301))
+    b = evaluate_mm05_activity(feature, policy=changed)
+    assert a.policy_version == b.policy_version
+    assert a.threshold_fingerprint != b.threshold_fingerprint
+    with pytest.raises(ValueError, match="arithmetic"):
+        evaluate_mm05_activity(
+            replace(feature, arithmetic_version="untrusted-arithmetic"),
+            policy=POLICY,
+        )
 
 
 def test_exact_thresholds_and_wrong_window_fail_closed() -> None:
