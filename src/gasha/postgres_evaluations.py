@@ -127,8 +127,13 @@ def _verify_alert_policy_provenance(
     The runtime cannot create/repair the installation record. It must match
     the full code-defined eligibility, mapping, priority and grouping policy,
     not just the fields which happened to qualify this evaluation. Both
-    policy installation and per-event provenance are read/locked within the
-    same READ COMMITTED transaction as the decision/alert/case writes.
+    policy installation and per-event provenance are read in the same READ
+    COMMITTED transaction as the decision/alert/case writes. The immutable
+    installation and provenance rows need no row lock: PostgreSQL requires
+    UPDATE privileges for both SELECT FOR SHARE and SELECT FOR UPDATE, while
+    the separate provisioning/runtime trust boundary grants only SELECT on
+    policy installations and SELECT/INSERT on provenance. The canonical
+    evaluation, decision audit, and alert rows remain row-locked on replay.
     """
     policy = alerts.policy
     tenant = record.event.tenant_id
@@ -137,7 +142,7 @@ def _verify_alert_policy_provenance(
         """SELECT digest_schema, content_digest, content_json, installation_ref
            FROM tenant_alert_policy_installations
            WHERE tenant_id = %s AND policy_id = %s AND policy_version = %s
-           FOR SHARE""",
+           """,
         (tenant, policy.policy_id, policy.version),
     )
     installed = cursor.fetchone()
@@ -149,7 +154,7 @@ def _verify_alert_policy_provenance(
     ):
         raise ValueError("conflicting evaluation replay: untrusted alert policy installation")
 
-    # The source of installation_ref is the locked, separately provisioned DB
+    # The source of installation_ref is the separately provisioned, immutable DB
     # record, never a caller-provided policy label or evaluation claim.
     expected = (
         policy.policy_id, policy.version, ALERT_POLICY_DIGEST_SCHEMA,
@@ -167,7 +172,7 @@ def _verify_alert_policy_provenance(
         """SELECT policy_id, policy_version, digest_schema,
                   content_digest, installation_ref
            FROM evaluation_alert_policy_provenance
-           WHERE tenant_id = %s AND event_id = %s FOR UPDATE""",
+           WHERE tenant_id = %s AND event_id = %s""",
         (tenant, event_id),
     )
     saved = cursor.fetchone()
