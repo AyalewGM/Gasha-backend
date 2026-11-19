@@ -16,11 +16,11 @@ from gasha.domain.models import (
     IntelligenceSnapshot,
 )
 from gasha.intelligence.assembler import (
-    AssemblyPolicy,
-    AssemblyRejected,
     HISTORY_FEATURE_SCHEMA_VERSION,
     HISTORY_MAX_COUNT,
     HISTORY_MAX_RATIO,
+    AssemblyPolicy,
+    AssemblyRejected,
     HistoryFeatures,
     IntelligenceAssembler,
 )
