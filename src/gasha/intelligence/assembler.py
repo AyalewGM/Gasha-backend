@@ -108,12 +108,18 @@ def valid_history_features(value: object) -> bool:
             return False
     ratio = features.amount_to_sender_baseline_ratio
     if ratio is not None:
-        if type(ratio) not in (int, float):
-            return False
-        if (
-            not isfinite(ratio) or ratio < 0 or ratio > HISTORY_MAX_RATIO
-            or (ratio == 0 and copysign(1.0, ratio) < 0)
-        ):
+        if type(ratio) is int:
+            # Arbitrarily large signed integers must be bounded BEFORE a
+            # float conversion: math.isfinite(10**400) raises OverflowError.
+            if ratio < 0 or ratio > int(HISTORY_MAX_RATIO):
+                return False
+        elif type(ratio) is float:
+            if (
+                not isfinite(ratio) or ratio < 0 or ratio > HISTORY_MAX_RATIO
+                or (ratio == 0 and copysign(1.0, ratio) < 0)
+            ):
+                return False
+        else:
             return False
     if features.device_seen_for_sender_before is not None and (
         type(features.device_seen_for_sender_before) is not bool
@@ -126,6 +132,11 @@ def valid_history_features(value: object) -> bool:
                for name in missing)
         or len(set(missing)) != len(missing)
     ):
+        return False
+    # "missing" means unavailable at the original cutoff, never present but
+    # merely unscored. Contradictory issuer-signed measurements are rejected
+    # as a whole optional source before scoring.
+    if any(getattr(features, name) is not None for name in missing):
         return False
     unique = features.beneficiary_unique_senders_1h
     incoming = features.beneficiary_incoming_count_1h
@@ -310,7 +321,12 @@ class IntelligenceAssembler:
         # Authentication is necessary but not sufficient. Invalid but genuinely
         # signed optional history is rejected BEFORE scoring or acceptance into
         # the replay's provider evidence identity.
-        history_invalid = history is not None and not valid_history_features(history.payload)
+        try:
+            history_invalid = history is not None and not valid_history_features(history.payload)
+        except Exception:  # noqa: BLE001
+            # A malformed optional source must not interrupt the assessment
+            # even if a future schema validator raises unexpectedly.
+            history_invalid = True
         if history_invalid:
             history = None
         graph = self._fetch(self._graph, "signals_for", transaction, context,
