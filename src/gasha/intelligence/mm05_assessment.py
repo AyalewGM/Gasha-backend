@@ -14,15 +14,12 @@ from enum import StrEnum
 from re import fullmatch
 from typing import cast
 
-from gasha.intelligence.mm05_activity import (
-    VERSION as ACTIVITY_VERSION,
-    ActivityFeature,
-    DormancyAssessment,
-)
+from gasha.intelligence.mm05_activity import VERSION as ACTIVITY_VERSION
+from gasha.intelligence.mm05_activity import ActivityFeature, DormancyAssessment
 
 VERSION = "mm05-offline-assessment-v1"
 _SCENARIO_ID = "MM-05"
-_MAX_RATIO = Decimal("1000000")
+_MAX_RATIO = Decimal(1000000)
 
 
 class MM05State(StrEnum):
