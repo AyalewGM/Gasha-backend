@@ -31,6 +31,7 @@ _DECISION_POLICY_KEYS = frozenset(
         "rule_version",
         "model_version",
         "monitor_threshold",
+        "challenge_threshold",
         "review_threshold",
         "hold_threshold",
         "block_threshold",
@@ -124,7 +125,10 @@ def _number(name: str, value: object) -> float:
 
 
 def _validate_decision_policy(payload: object) -> None:
-    if type(payload) is not dict or frozenset(payload) != _DECISION_POLICY_KEYS:
+    if type(payload) is not dict or frozenset(payload) not in (
+        _DECISION_POLICY_KEYS,
+        _DECISION_POLICY_KEYS - {"challenge_threshold"},
+    ):
         raise TenantConfigRejected(
             "decision_policy content must carry exactly the DecisionPolicy fields"
         )
@@ -136,6 +140,13 @@ def _validate_decision_policy(payload: object) -> None:
     thresholds = [_number(name, payload[name]) for name in _THRESHOLD_FIELDS]
     if thresholds != sorted(thresholds) or len(set(thresholds)) != len(thresholds):
         raise TenantConfigRejected("decision thresholds must be strictly increasing")
+    challenge = payload.get("challenge_threshold")
+    if challenge is not None:
+        challenge = _number("challenge_threshold", challenge)
+        if not payload["monitor_threshold"] < challenge < payload["review_threshold"]:
+            raise TenantConfigRejected(
+                "challenge threshold must sit strictly between monitor and review"
+            )
 
 
 def _scalar(name: str, value: object) -> None:
