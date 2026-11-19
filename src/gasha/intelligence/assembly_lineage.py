@@ -96,7 +96,7 @@ def exact_amount(value: object) -> str:
     if type(value) is not Decimal or not value.is_finite() or value <= 0:
         raise ValueError("finite positive Decimal required")
     sign, digits_tuple, exponent = value.as_tuple()
-    if sign or len(digits_tuple) > 40 or abs(exponent) > 40:
+    if sign or not isinstance(exponent, int) or len(digits_tuple) > 40 or abs(exponent) > 40:
         raise ValueError("amount beyond canonical bounds")
     digits = "".join(str(d) for d in digits_tuple).lstrip("0") or "0"
     while len(digits) > 1 and digits.endswith("0"):
