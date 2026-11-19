@@ -1,6 +1,7 @@
 """Offline MM-05 assessment tests; no API, fraud label, case or bank assertions."""
 
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
+from json import dumps, loads
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -17,6 +18,7 @@ from gasha.intelligence.mm05_assessment import (
     MM05Reason,
     MM05State,
     MM05ThresholdPolicy,
+    MM05ThresholdSnapshot,
     evaluate_mm05_activity,
 )
 
@@ -197,3 +199,99 @@ def test_broken_feature_and_wrong_tenant_denied() -> None:
         assess((entry("foreign", -1, tenant="tenant-b"),))
     with pytest.raises(ValueError, match="typed MM-05"):
         evaluate_mm05_activity(feature, policy="not-a-policy")  # type: ignore[arg-type]
+
+
+def test_snapshot_json_roundtrip_reproduces_original_assessment() -> None:
+    history = (
+        entry("base", -25, "100"),
+        entry("first", -2, "100"),
+        entry("second", -1, "100"),
+    )
+    original = assess(history)
+    assert original.state is MM05State.REVIEW_CANDIDATE
+    saved = dumps({
+        "threshold_snapshot": original.threshold_snapshot.to_payload(),
+        "threshold_fingerprint": original.threshold_fingerprint,
+        "source_fingerprint": original.source_fingerprint,
+        "state": original.state.value,
+        "reason_codes": original.reason_codes,
+    }, sort_keys=True)
+    persisted = loads(saved)
+    restored = MM05ThresholdSnapshot.from_payload(persisted["threshold_snapshot"])
+    replay = evaluate_mm05_activity(
+        original.feature, policy=restored.to_policy(),
+    )
+    assert replay.threshold_snapshot == restored
+    assert replay.threshold_fingerprint == persisted["threshold_fingerprint"]
+    assert replay.source_fingerprint == persisted["source_fingerprint"]
+    assert replay.state.value == persisted["state"]
+    assert list(replay.reason_codes) == persisted["reason_codes"]
+    assert replay == original
+
+
+def test_equal_numeric_decimals_share_identity_under_different_contexts() -> None:
+    base = assess((entry("base", -25, "100"),))
+    equivalent = replace(
+        POLICY,
+        min_current_value=Decimal("300.00"),
+        min_count_ratio=Decimal("3.000"),
+        min_value_ratio=Decimal("3e0"),
+    )
+    same = evaluate_mm05_activity(base.feature, policy=equivalent)
+    assert same.threshold_snapshot == base.threshold_snapshot
+    assert same.threshold_fingerprint == base.threshold_fingerprint
+    assert same == base
+    assert base.threshold_snapshot.min_current_value == "300"
+    assert base.threshold_snapshot.min_count_ratio == "3"
+
+
+def test_saved_snapshot_survives_later_policy_replacement() -> None:
+    original = assess((
+        entry("base", -25, "100"),
+        entry("burst1", -2, "100"),
+        entry("burst2", -1, "100"),
+    ))
+    changed = replace(POLICY, min_current_value=Decimal("300.000001"))
+    newer = evaluate_mm05_activity(original.feature, policy=changed)
+    assert original.policy_version == newer.policy_version
+    assert original.state is MM05State.REVIEW_CANDIDATE
+    assert newer.state is MM05State.NOT_FLAGGED
+    assert original.threshold_snapshot != newer.threshold_snapshot
+    assert original.threshold_fingerprint != newer.threshold_fingerprint
+    assert evaluate_mm05_activity(
+        original.feature, policy=original.threshold_snapshot.to_policy(),
+    ) == original
+    with pytest.raises(FrozenInstanceError):
+        original.threshold_snapshot.min_current_count = 7  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("change", [
+    {"min_current_count": True},
+    {"min_current_count": 3.0},
+    {"min_current_value": "300.0"},
+    {"min_current_value": "3e2"},
+    {"min_current_value": "NaN"},
+    {"min_current_value": "1e999999"},
+    {"min_value_ratio": "0"},
+    {"window_version": None},
+    {"extra": "unexpected"},
+])
+def test_untrusted_snapshot_payload_rejected(change: dict[str, object]) -> None:
+    original = MM05ThresholdSnapshot.from_policy(POLICY).to_payload()
+    with pytest.raises(ValueError):
+        MM05ThresholdSnapshot.from_payload({**original, **change})
+
+
+def test_missing_and_rewritten_snapshot_cannot_replay_saved_identity() -> None:
+    original = assess((entry("base", -25, "100"),))
+    saved = loads(dumps(original.threshold_snapshot.to_payload()))
+    saved.pop("min_count_ratio")
+    with pytest.raises(ValueError, match="exactly"):
+        MM05ThresholdSnapshot.from_payload(saved)
+
+    tampered = original.threshold_snapshot.to_payload()
+    tampered["min_current_value"] = "301"
+    rewritten = MM05ThresholdSnapshot.from_payload(loads(dumps(tampered)))
+    replay = evaluate_mm05_activity(original.feature, policy=rewritten.to_policy())
+    assert replay.threshold_fingerprint != original.threshold_fingerprint
+    assert replay.threshold_snapshot != original.threshold_snapshot
