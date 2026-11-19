@@ -15,9 +15,11 @@ from json import dumps
 from re import fullmatch
 from zoneinfo import ZoneInfo
 
-VERSION = "mm05-activity-v1"
+VERSION = "mm05-activity-v2"
 _MAX_AMOUNT = Decimal("1e18")
 _MAX_ROWS = 4096
+_MAX_RAW_DECIMAL_DIGITS = 64
+_MAX_SCALE = 6  # Provisional synthetic monetary contract; Bank currencies need approval.
 
 
 class ActivityStatus(StrEnum):
@@ -29,6 +31,12 @@ class ActivityStatus(StrEnum):
 class ActivityDirection(StrEnum):
     DEBIT = "debit"
     CREDIT = "credit"
+
+
+class DormancyAssessment(StrEnum):
+    DORMANT_CANDIDATE = "dormant_candidate"
+    RECENT_ACTIVITY = "recent_activity"
+    HISTORY_INSUFFICIENT = "history_insufficient"
 
 
 def _ref(name: str, value: object) -> str:
@@ -45,14 +53,46 @@ def _clock(name: str, value: object) -> datetime:
     return value.astimezone(UTC)
 
 
-def _amount(value: object) -> Decimal:
-    if type(value) is not Decimal or not value.is_finite() or not 0 < value <= _MAX_AMOUNT:
-        raise ValueError("finite positive Decimal amount required")
-    return value
-
-
 def _money_text(value: Decimal) -> str:
-    return format(value.normalize(), "f")
+    """Exact bounded money canonicalization: no context-dependent normalize/round.
+
+    Up to six *significant fractional* places, 1e18 positive maximum, and
+    at most 64 raw coefficient digits (including redundant trailing zeros).
+    Validate exponent and coefficient before building any fixed-point string.
+    """
+    if type(value) is not Decimal or not value.is_finite():
+        raise ValueError("finite positive Decimal amount required")
+    parts = value.as_tuple()
+    if parts.sign or len(parts.digits) > _MAX_RAW_DECIMAL_DIGITS or type(parts.exponent) is not int:
+        raise ValueError("amount coefficient or exponent outside canonical budget")
+    digits = "".join(str(digit) for digit in parts.digits).lstrip("0")
+    if not digits:
+        raise ValueError("positive amount required")
+    exponent = parts.exponent
+    while digits.endswith("0"):
+        digits = digits[:-1]
+        exponent += 1
+    if exponent < -_MAX_SCALE:
+        raise ValueError("amount scale exceeds canonical budget")
+    whole = len(digits) + exponent
+    if whole > 19:
+        raise ValueError("amount magnitude exceeds canonical budget")
+    if exponent >= 0:
+        text = digits + "0" * exponent
+    elif whole > 0:
+        text = digits[:whole] + "." + digits[whole:]
+    else:
+        text = "0." + "0" * (-whole) + digits
+    if value > _MAX_AMOUNT:
+        raise ValueError("amount magnitude exceeds permitted maximum")
+    return text
+
+
+def _amount(value: object) -> Decimal:
+    if type(value) is not Decimal:
+        raise ValueError("finite positive Decimal amount required")
+    _money_text(value)
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +129,7 @@ class ActivityWindowPolicy:
     baseline_days: int
     current_hours: int
     direction: ActivityDirection
+    dormancy_days: int = 90
 
     def __post_init__(self) -> None:
         _ref("window version", self.version)
@@ -98,6 +139,8 @@ class ActivityWindowPolicy:
             raise ValueError("current_hours out of range")
         if type(self.direction) is not ActivityDirection:
             raise ValueError("typed direction required")
+        if type(self.dormancy_days) is not int or not 1 <= self.dormancy_days <= 365:
+            raise ValueError("dormancy_days out of range")
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +161,8 @@ class ActivityFeature:
     baseline_active_days: int | None
     current_active_days: int | None
     last_baseline_activity_age_hours: Decimal | None
+    last_pre_current_activity_age_hours: Decimal | None
+    dormancy_assessment: DormancyAssessment
     count_ratio: Decimal | None
     value_ratio: Decimal | None
     source_fingerprint: str
@@ -130,7 +175,8 @@ def _unavailable(
     return ActivityFeature(
         VERSION, target.tenant_id, target.event_id, policy.version, cutoff,
         baseline_start, current_start, False, reason,
-        None, None, None, None, None, None, None, None, None, fingerprint,
+        None, None, None, None, None, None, None, None,
+        DormancyAssessment.HISTORY_INSUFFICIENT, None, None, fingerprint,
     )
 
 
@@ -197,7 +243,8 @@ def compute_mm05_activity(
     eligible = [r for r in rows if r.occurred_at < target.occurred_at and r.available_at <= cutoff]
     packet = {
         "domain": VERSION, "dataset": dataset_digest, "epoch": history_epoch,
-        "policy": (policy.version, policy.baseline_days, policy.current_hours, policy.direction.value),
+        "policy": (policy.version, policy.baseline_days, policy.current_hours,
+                   policy.direction.value, policy.dormancy_days),
         "target": identity(target), "cutoff": cutoff.isoformat(),
         "history_present": history is not None,
         "coverage": [c.isoformat() if c is not None else None for c in coverage],
@@ -234,6 +281,25 @@ def compute_mm05_activity(
     current = [row for row in account_rows if row.occurred_at >= current_start]
     current.append(target)
     last = max((row.occurred_at for row in baseline), default=None)
+    # Dormancy is about *all settled account movements* before the activation
+    # window, not only baseline-window events in the configured direction.
+    pre_current = [
+        row.occurred_at for row in eligible
+        if row.account_ref == target.account_ref
+        and row.status is ActivityStatus.SETTLED
+        and row.occurred_at < current_start
+    ]
+    last_pre_current = max(pre_current, default=None)
+    dormancy_start = current_start - timedelta(days=policy.dormancy_days)
+    opened, covered, _ = coverage
+    if last_pre_current is not None and last_pre_current > dormancy_start:
+        dormancy = DormancyAssessment.RECENT_ACTIVITY
+    elif opened is not None and covered is not None and (
+        opened <= dormancy_start and covered <= dormancy_start
+    ):
+        dormancy = DormancyAssessment.DORMANT_CANDIDATE
+    else:
+        dormancy = DormancyAssessment.HISTORY_INSUFFICIENT
     baseline_value = sum((row.amount for row in baseline), Decimal(0))
     current_value = sum((row.amount for row in current), Decimal(0))
     return ActivityFeature(
@@ -244,6 +310,9 @@ def compute_mm05_activity(
         len({row.occurred_at.date() for row in current}),
         (Decimal(str((target.occurred_at - last).total_seconds())) / Decimal(3600)
          if last is not None else None),
+        (Decimal(str((target.occurred_at - last_pre_current).total_seconds())) / Decimal(3600)
+         if last_pre_current is not None else None),
+        dormancy,
         Decimal(len(current)) / Decimal(len(baseline)) if baseline else None,
         current_value / baseline_value if baseline_value else None,
         fingerprint,
