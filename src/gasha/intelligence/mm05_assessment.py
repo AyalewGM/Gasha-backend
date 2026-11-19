@@ -115,13 +115,13 @@ def _canonical_decimal(value: Decimal) -> str:
 def _snapshot_str(name: str, value: object) -> str:
     if type(value) is not str or len(value) > 128:
         raise ValueError(f"{name} must be a bounded canonical string")
-    return cast(str, value)
+    return value
 
 
 def _snapshot_int(name: str, value: object) -> int:
     if type(value) is not int:
         raise ValueError(f"{name} must be an integer")
-    return cast(int, value)
+    return value
 
 
 @dataclass(frozen=True, slots=True)
