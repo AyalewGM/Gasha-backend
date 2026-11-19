@@ -14,9 +14,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
+from gasha.decision.service import action_for_score
 from gasha.domain.models import (
     CanonicalTransaction,
-    DecisionAction,
     DecisionPolicy,
     FraudDecision,
     IntelligenceSnapshot,
@@ -73,21 +73,7 @@ class FusedDecisionService:
             reasons.extend(self._model_reasons(transaction, intelligence))
             reasons = list(dict.fromkeys(reasons))
 
-        if score >= self.policy.block_threshold:
-            action = DecisionAction.BLOCK
-        elif score >= self.policy.hold_threshold:
-            action = DecisionAction.HOLD
-        elif score >= self.policy.review_threshold:
-            action = DecisionAction.REVIEW
-        elif (
-            self.policy.challenge_threshold is not None
-            and score >= self.policy.challenge_threshold
-        ):
-            action = DecisionAction.CHALLENGE
-        elif score >= self.policy.monitor_threshold:
-            action = DecisionAction.MONITOR
-        else:
-            action = DecisionAction.ALLOW
+        action = action_for_score(self.policy, score)
 
         return FraudDecision(
             tenant_id=transaction.tenant_id,

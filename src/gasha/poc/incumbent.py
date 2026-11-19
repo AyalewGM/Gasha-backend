@@ -6,9 +6,9 @@ from datetime import UTC, datetime
 from math import isfinite
 from uuid import UUID
 
+from gasha.decision.service import action_for_score
 from gasha.domain.models import (
     CanonicalTransaction,
-    DecisionAction,
     DecisionPolicy,
     FraudDecision,
     IntelligenceSnapshot,
@@ -189,21 +189,7 @@ class IncumbentScoreBackend:
                 f"no incumbent score recorded for event {transaction.event_id}"
             ) from None
 
-        if score >= self._policy.block_threshold:
-            action = DecisionAction.BLOCK
-        elif score >= self._policy.hold_threshold:
-            action = DecisionAction.HOLD
-        elif score >= self._policy.review_threshold:
-            action = DecisionAction.REVIEW
-        elif (
-            self._policy.challenge_threshold is not None
-            and score >= self._policy.challenge_threshold
-        ):
-            action = DecisionAction.CHALLENGE
-        elif score >= self._policy.monitor_threshold:
-            action = DecisionAction.MONITOR
-        else:
-            action = DecisionAction.ALLOW
+        action = action_for_score(self._policy, score)
 
         reasons = list(evidence_reason_codes)
         reasons.append(

@@ -10,6 +10,21 @@ from gasha.domain.models import (
 )
 
 
+def action_for_score(policy: DecisionPolicy, score: float) -> DecisionAction:
+    """Maps a fused risk score to an action through the policy threshold ladder."""
+    if score >= policy.block_threshold:
+        return DecisionAction.BLOCK
+    if score >= policy.hold_threshold:
+        return DecisionAction.HOLD
+    if score >= policy.review_threshold:
+        return DecisionAction.REVIEW
+    if policy.challenge_threshold is not None and score >= policy.challenge_threshold:
+        return DecisionAction.CHALLENGE
+    if score >= policy.monitor_threshold:
+        return DecisionAction.MONITOR
+    return DecisionAction.ALLOW
+
+
 class DecisionService:
     """Deterministic risk fusion driven by a versioned tenant policy."""
 
@@ -40,21 +55,7 @@ class DecisionService:
         ]
         reasons = list(dict.fromkeys([*evidence_reason_codes, *component_reasons]))
 
-        if score >= self.policy.block_threshold:
-            action = DecisionAction.BLOCK
-        elif score >= self.policy.hold_threshold:
-            action = DecisionAction.HOLD
-        elif score >= self.policy.review_threshold:
-            action = DecisionAction.REVIEW
-        elif (
-            self.policy.challenge_threshold is not None
-            and score >= self.policy.challenge_threshold
-        ):
-            action = DecisionAction.CHALLENGE
-        elif score >= self.policy.monitor_threshold:
-            action = DecisionAction.MONITOR
-        else:
-            action = DecisionAction.ALLOW
+        action = action_for_score(self.policy, score)
 
         return FraudDecision(
             tenant_id=transaction.tenant_id,
