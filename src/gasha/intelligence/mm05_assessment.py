@@ -8,8 +8,9 @@ issuer/ledger is implemented (#42/#43/#48). No API, Redis, case, or bank wiring.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Mapping
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from hashlib import sha256
 from json import dumps
@@ -19,7 +20,7 @@ from typing import cast
 from gasha.intelligence.mm05_activity import VERSION as ACTIVITY_VERSION
 from gasha.intelligence.mm05_activity import ActivityFeature, DormancyAssessment
 
-VERSION = "mm05-offline-assessment-v1"
+VERSION = "mm05-offline-assessment-v2"
 _SCENARIO_ID = "MM-05"
 _MAX_RATIO = Decimal(1000000)
 
@@ -91,6 +92,136 @@ class MM05ThresholdPolicy:
             _threshold(name, getattr(self, name))
 
 
+
+def _canonical_decimal(value: Decimal) -> str:
+    """Canonical base-10 numeric identity, independent of ambient Decimal context.
+
+    Numerically equivalent 300, 300.0 and 3e2 serialize identically.
+    _threshold bounds coefficient and exponent before text expansion.
+    """
+    _threshold("snapshot decimal", value)
+    parts = value.as_tuple()
+    digits = "".join(str(digit) for digit in parts.digits)
+    exponent = cast(int, parts.exponent)
+    point = len(digits) + exponent
+    if point <= 0:
+        text = "0." + "0" * (-point) + digits
+    elif point >= len(digits):
+        text = digits + "0" * (point - len(digits))
+    else:
+        text = digits[:point] + "." + digits[point:]
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _snapshot_str(name: str, value: object) -> str:
+    if type(value) is not str or len(value) > 128:
+        raise ValueError(f"{name} must be a bounded canonical string")
+    return cast(str, value)
+
+
+def _snapshot_int(name: str, value: object) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{name} must be an integer")
+    return cast(int, value)
+
+
+@dataclass(frozen=True, slots=True)
+class MM05ThresholdSnapshot:
+    """Immutable, JSON-reconstructible synthetic threshold values.
+
+    All monetary and ratio fields use canonical plain-decimal strings.
+    This is evidence for offline replay, not an authorized policy issuer.
+    """
+
+    version: str
+    window_version: str
+    min_current_count: int
+    min_current_value: str
+    min_count_ratio: str
+    min_value_ratio: str
+    max_low_baseline_count: int
+    max_low_baseline_active_days: int
+
+    def __post_init__(self) -> None:
+        # Revalidate even when loading an untrusted serialized snapshot.
+        policy = self.to_policy()
+        for name in ("min_current_value", "min_count_ratio", "min_value_ratio"):
+            if getattr(self, name) != _canonical_decimal(getattr(policy, name)):
+                raise ValueError(f"{name} is not canonical")
+
+    @classmethod
+    def from_policy(cls, policy: MM05ThresholdPolicy) -> MM05ThresholdSnapshot:
+        if type(policy) is not MM05ThresholdPolicy:
+            raise ValueError("typed synthetic threshold policy required")
+        return cls(
+            version=policy.version,
+            window_version=policy.window_version,
+            min_current_count=policy.min_current_count,
+            min_current_value=_canonical_decimal(policy.min_current_value),
+            min_count_ratio=_canonical_decimal(policy.min_count_ratio),
+            min_value_ratio=_canonical_decimal(policy.min_value_ratio),
+            max_low_baseline_count=policy.max_low_baseline_count,
+            max_low_baseline_active_days=policy.max_low_baseline_active_days,
+        )
+
+    def to_policy(self) -> MM05ThresholdPolicy:
+        for name in ("min_current_value", "min_count_ratio", "min_value_ratio"):
+            text = _snapshot_str(name, getattr(self, name))
+            try:
+                _threshold(name, Decimal(text))
+            except (InvalidOperation, ValueError) as exc:
+                raise ValueError(f"{name} is not a bounded canonical decimal") from exc
+        return MM05ThresholdPolicy(
+            version=self.version,
+            window_version=self.window_version,
+            min_current_count=self.min_current_count,
+            min_current_value=Decimal(self.min_current_value),
+            min_count_ratio=Decimal(self.min_count_ratio),
+            min_value_ratio=Decimal(self.min_value_ratio),
+            max_low_baseline_count=self.max_low_baseline_count,
+            max_low_baseline_active_days=self.max_low_baseline_active_days,
+        )
+
+    def to_payload(self) -> dict[str, str | int]:
+        """Exact JSON object for durable offline serialization."""
+        return {
+            "version": self.version,
+            "window_version": self.window_version,
+            "min_current_count": self.min_current_count,
+            "min_current_value": self.min_current_value,
+            "min_count_ratio": self.min_count_ratio,
+            "min_value_ratio": self.min_value_ratio,
+            "max_low_baseline_count": self.max_low_baseline_count,
+            "max_low_baseline_active_days": self.max_low_baseline_active_days,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> MM05ThresholdSnapshot:
+        """Fail closed on absent, extra or wrong-typed serialized fields."""
+        if not isinstance(payload, Mapping):
+            raise ValueError("threshold snapshot object required")
+        if set(payload) != {
+            "version", "window_version", "min_current_count", "min_current_value",
+            "min_count_ratio", "min_value_ratio", "max_low_baseline_count",
+            "max_low_baseline_active_days",
+        }:
+            raise ValueError("threshold snapshot fields must match exactly")
+        return cls(
+            version=_snapshot_str("version", payload["version"]),
+            window_version=_snapshot_str("window_version", payload["window_version"]),
+            min_current_count=_snapshot_int("min_current_count", payload["min_current_count"]),
+            min_current_value=_snapshot_str("min_current_value", payload["min_current_value"]),
+            min_count_ratio=_snapshot_str("min_count_ratio", payload["min_count_ratio"]),
+            min_value_ratio=_snapshot_str("min_value_ratio", payload["min_value_ratio"]),
+            max_low_baseline_count=_snapshot_int(
+                "max_low_baseline_count", payload["max_low_baseline_count"],
+            ),
+            max_low_baseline_active_days=_snapshot_int(
+                "max_low_baseline_active_days", payload["max_low_baseline_active_days"],
+            ),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class MM05Assessment:
     scenario_id: str
@@ -98,6 +229,7 @@ class MM05Assessment:
     tenant_id: str
     event_id: str
     policy_version: str
+    threshold_snapshot: MM05ThresholdSnapshot
     threshold_fingerprint: str
     feature_version: str
     arithmetic_version: str
@@ -109,15 +241,11 @@ class MM05Assessment:
     feature: ActivityFeature
 
 
-def _policy_fingerprint(policy: MM05ThresholdPolicy) -> str:
-    """Identify the complete threshold content, not a reusable version label."""
-    payload = (
-        VERSION, policy.version, policy.window_version,
-        policy.min_current_count, str(policy.min_current_value),
-        str(policy.min_count_ratio), str(policy.min_value_ratio),
-        policy.max_low_baseline_count, policy.max_low_baseline_active_days,
-    )
-    return "sha256:" + sha256(dumps(payload, separators=(",", ":")).encode()).hexdigest()
+def _policy_fingerprint(snapshot: MM05ThresholdSnapshot) -> str:
+    """Hash the exact retained snapshot, not an external policy version."""
+    payload = (VERSION, snapshot.to_payload())
+    encoded = dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + sha256(encoded).hexdigest()
 
 
 def evaluate_mm05_activity(
@@ -132,6 +260,8 @@ def evaluate_mm05_activity(
     """
     if type(feature) is not ActivityFeature or type(policy) is not MM05ThresholdPolicy:
         raise ValueError("typed MM-05 feature and policy required")
+    snapshot = MM05ThresholdSnapshot.from_policy(policy)
+    policy = snapshot.to_policy()  # Decisions and digest use the very same retained values.
     if feature.version != ACTIVITY_VERSION or feature.window_version != policy.window_version:
         raise ValueError("MM-05 feature/policy version mismatch")
     if feature.arithmetic_version != "exact-micro-units-ratio12-half-even-v1":
@@ -228,7 +358,8 @@ def evaluate_mm05_activity(
         tenant_id=feature.tenant_id,
         event_id=feature.event_id,
         policy_version=policy.version,
-        threshold_fingerprint=_policy_fingerprint(policy),
+        threshold_snapshot=snapshot,
+        threshold_fingerprint=_policy_fingerprint(snapshot),
         feature_version=feature.version,
         arithmetic_version=feature.arithmetic_version,
         window_version=feature.window_version,
