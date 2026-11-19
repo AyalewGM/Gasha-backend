@@ -25,10 +25,10 @@ from gasha.intelligence.assembly_lineage import (
     OriginalDecisionContext,
     ProviderEvidence,
     context_identity,
-    policy_snapshot,
-    transaction_digest,
     evidence_identity,
     payload_digest,
+    policy_snapshot,
+    transaction_digest,
 )
 from gasha.intelligence.behavioral_session import (
     BehavioralSessionDetector,
