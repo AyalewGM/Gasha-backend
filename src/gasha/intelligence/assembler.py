@@ -14,14 +14,14 @@ from gasha.domain.models import CanonicalTransaction, IntelligenceSnapshot, Risk
 from gasha.intelligence.assembly_lineage import (
     AssemblyAuthority,
     EffectivePolicySnapshot,
-    canonical_bytes,
-    evidence_identity,
-    verified_policy_snapshot,
     OriginalDecisionContext,
     ProviderEvidence,
+    canonical_bytes,
     context_identity,
     context_matches,
+    evidence_identity,
     verified,
+    verified_policy_snapshot,
 )
 from gasha.intelligence.behavioral_session import (
     BehavioralSessionAssessment,
