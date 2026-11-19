@@ -13,6 +13,10 @@ from pydantic import BaseModel, Field
 from gasha.domain.models import CanonicalTransaction, IntelligenceSnapshot, RiskScore
 from gasha.intelligence.assembly_lineage import (
     AssemblyAuthority,
+    EffectivePolicySnapshot,
+    canonical_bytes,
+    evidence_identity,
+    verified_policy_snapshot,
     OriginalDecisionContext,
     ProviderEvidence,
     context_identity,
@@ -22,11 +26,13 @@ from gasha.intelligence.assembly_lineage import (
 from gasha.intelligence.behavioral_session import (
     BehavioralSessionAssessment,
     BehavioralSessionDetector,
+    BehavioralSessionPolicy,
     BehavioralSessionSignals,
 )
 from gasha.intelligence.internal_graph import (
     InternalGraphAssessment,
     InternalGraphDetector,
+    InternalGraphPolicy,
     InternalGraphSignals,
 )
 from gasha.intelligence.provenance import (
@@ -38,9 +44,11 @@ from gasha.intelligence.provenance import (
 from gasha.intelligence.social_engineering import (
     SocialEngineeringAssessment,
     SocialEngineeringDetector,
+    SocialEngineeringPolicy,
     SocialEngineeringSignals,
 )
 from gasha.journey.detector import JourneyAssessment
+from gasha.journey.policy import JourneyRiskPolicy
 
 
 class AssemblyRejected(ValueError):
@@ -96,6 +104,7 @@ class AssembledIntelligence:
     decision_id: str
     original_context_digest: str
     provider_digests: tuple[tuple[str, str], ...]
+    policy_snapshots: tuple[EffectivePolicySnapshot, ...]
     snapshot_digest: str
 
 
@@ -143,6 +152,13 @@ class IntelligenceAssembler:
         return None
 
     @staticmethod
+    def _envelope_digest(envelope: ProviderEvidence) -> str:
+        """Includes verified source, clocks, epoch, seal, policy and attestation."""
+        return sha256(
+            evidence_identity(envelope) + b"\n" + envelope.attestation.encode()
+        ).hexdigest()
+
+    @staticmethod
     def _provenance(
         envelope: ProviderEvidence, source: IntelligenceSource
     ) -> SignalProvenance:
@@ -169,10 +185,7 @@ class IntelligenceAssembler:
     ) -> AssembledIntelligence:
         if type(transaction) is not CanonicalTransaction:
             raise AssemblyRejected("typed canonical transaction required")
-        if not context_matches(
-            decision_context, transaction.tenant_id, transaction.event_id,
-            transaction.occurred_at
-        ):
+        if not context_matches(decision_context, transaction):
             raise AssemblyRejected("original-decision identity/clock mismatch")
         try:
             if self._authority.verify_context(decision_context) is not True:
@@ -183,6 +196,47 @@ class IntelligenceAssembler:
             raise AssemblyRejected("unavailable original-decision authority") from exc
 
         context = decision_context
+        expected_types: dict[str, type[BaseModel]] = {
+            "assembly": AssemblyPolicy,
+            "social": SocialEngineeringPolicy,
+            "graph": InternalGraphPolicy,
+            "session": BehavioralSessionPolicy,
+            "journey": JourneyRiskPolicy,
+        }
+        policies: dict[str, BaseModel] = {}
+        for item in context.policy_snapshots:
+            policy = verified_policy_snapshot(
+                item, item.role, expected_types[item.role]
+            )
+            if policy is None:
+                raise AssemblyRejected("unverified effective policy snapshot")
+            policies[item.role] = policy
+
+        # Only public detector policy interfaces are read. A trusted issuer
+        # binds every effective parameter in the original context signature.
+        # Reconstructed policies drive fresh detectors (no mutable later policy).
+        if any(
+            canonical_bytes(actual) != canonical_bytes(policies[role])
+            for role, actual in (
+                ("assembly", self._policy),
+                ("social", self._social.policy),
+                ("graph", self._graph_detector.policy),
+                ("session", self._behavioral.policy),
+            )
+        ):
+            raise AssemblyRejected("effective policy differs from signed original")
+
+        assembly_policy = AssemblyPolicy.model_validate(policies["assembly"])
+        social_detector = SocialEngineeringDetector(
+            SocialEngineeringPolicy.model_validate(policies["social"])
+        )
+        graph_detector = InternalGraphDetector(
+            InternalGraphPolicy.model_validate(policies["graph"])
+        )
+        session_detector = BehavioralSessionDetector(
+            BehavioralSessionPolicy.model_validate(policies["session"])
+        )
+        journey_policy = JourneyRiskPolicy.model_validate(policies["journey"])
         history = self._fetch(self._history, "compute", transaction, context,
                               "history", HistoryFeatures)
         graph = self._fetch(self._graph, "signals_for", transaction, context,
@@ -199,6 +253,8 @@ class IntelligenceAssembler:
                 assessment.tenant_id != transaction.tenant_id
                 or assessment.customer_id != transaction.sender_customer_id
                 or assessment.as_of != context.cutoff
+                or assessment.policy_version != journey_policy.policy_version
+                or assessment.configuration_version != journey_policy.configuration_version
                 or any(
                     event.occurred_at.tzinfo is None
                     or event.occurred_at.utcoffset() is None
@@ -232,7 +288,7 @@ class IntelligenceAssembler:
         }
         reasons: list[str] = []
         evidence: list[IntelligenceEvidence] = []
-        versions = [self._policy.policy_version]
+        versions = [assembly_policy.policy_version]
         missing: list[str] = []
         accepted: list[tuple[str, str]] = []
 
@@ -248,14 +304,14 @@ class IntelligenceAssembler:
             reasons.extend(result.reason_codes)
             evidence.extend(result.evidence)
             versions.append(result.signal_policy_version)
-            accepted.append((name, envelope.payload_digest))
+            accepted.append((name, self._envelope_digest(envelope)))
 
         if history is None:
             missing.append("history_features")
         else:
             features = history.payload
             assert isinstance(features, HistoryFeatures)
-            accepted.append(("history", history.payload_digest))
+            accepted.append(("history", self._envelope_digest(history)))
             missing.extend(features.missing)
             for name in (
                 "account_transfers_1h", "beneficiary_unique_senders_1h",
@@ -267,7 +323,7 @@ class IntelligenceAssembler:
             ):
                 if getattr(features, name) is None:
                     missing.append(name)
-            social = self._social.assess(
+            social = social_detector.assess(
                 transaction,
                 SocialEngineeringSignals(
                     beneficiary_is_new_to_sender=(
@@ -301,10 +357,10 @@ class IntelligenceAssembler:
             consume("social", social, history)
             if (
                 features.account_transfers_1h is not None
-                and features.account_transfers_1h >= self._policy.velocity_1h_threshold
+                and features.account_transfers_1h >= assembly_policy.velocity_1h_threshold
             ):
                 components["velocity_risk"] = max(
-                    components["velocity_risk"], self._policy.velocity_risk
+                    components["velocity_risk"], assembly_policy.velocity_risk
                 )
                 reasons.append("HIGH_ACCOUNT_VELOCITY_1H")
                 evidence.append(IntelligenceEvidence(
@@ -319,14 +375,14 @@ class IntelligenceAssembler:
         else:
             signals = graph.payload
             assert isinstance(signals, InternalGraphSignals)
-            consume("graph", self._graph_detector.assess(signals), graph)
+            consume("graph", graph_detector.assess(signals), graph)
 
         if session is None:
             missing.append("session_telemetry")
         else:
             telemetry = session.payload
             assert isinstance(telemetry, BehavioralSessionSignals)
-            consume("session", self._behavioral.assess(telemetry), session)
+            consume("session", session_detector.assess(telemetry), session)
 
         if journey is None:
             missing.append("journey_intelligence")
@@ -338,7 +394,7 @@ class IntelligenceAssembler:
             )
             reasons.extend(assessment.reason_codes)
             versions.append(assessment.policy_version)
-            accepted.append(("journey", journey.payload_digest))
+            accepted.append(("journey", self._envelope_digest(journey)))
 
         snapshot = IntelligenceSnapshot(**components)
         unique_reasons = tuple(dict.fromkeys(reasons))
@@ -353,6 +409,7 @@ class IntelligenceAssembler:
                 "evidence": [item.model_dump(mode="json") for item in evidence],
                 "missing": unique_missing,
                 "policy_versions": unique_versions,
+                "policy_snapshots": [item.digest for item in context.policy_snapshots],
                 "providers": accepted,
                 "assembly_version": self._source_version,
             },
@@ -363,5 +420,6 @@ class IntelligenceAssembler:
             evidence=tuple(evidence), missing=unique_missing,
             signal_policy_versions=unique_versions, decision_id=context.decision_id,
             original_context_digest=context_hash,
-            provider_digests=tuple(accepted), snapshot_digest=fingerprint,
+            provider_digests=tuple(accepted),
+            policy_snapshots=context.policy_snapshots, snapshot_digest=fingerprint,
         )
