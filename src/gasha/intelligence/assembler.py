@@ -132,9 +132,7 @@ def valid_history_features(value: object) -> bool:
     confirmed = features.beneficiary_confirmed_fraud_sender_count
     if unique is not None and incoming is not None and unique > incoming:
         return False
-    if confirmed is not None and unique is not None and confirmed > unique:
-        return False
-    return True
+    return not (confirmed is not None and unique is not None and confirmed > unique)
 
 
 class HistoryFeatureProvider(Protocol):
