@@ -198,7 +198,7 @@ class MM05ThresholdSnapshot:
     def from_payload(cls, payload: object) -> MM05ThresholdSnapshot:
         """Fail closed on absent, extra or wrong-typed serialized fields."""
         if not isinstance(payload, Mapping):
-            raise ValueError("threshold snapshot object required")
+            raise TypeError("threshold snapshot object required")
         if set(payload) != {
         "version",
         "window_version",
