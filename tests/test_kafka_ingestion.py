@@ -13,14 +13,14 @@ from gasha.ingestion.errors import RejectionReason
 from gasha.ingestion.kafka_json import JsonEventConsumer
 from gasha.ingestion.pending import InMemoryPendingEvaluationStore
 from gasha.ingestion.reference import ReferenceJsonAdapter
-from gasha.ingestion.shadow_copy import (
-    SHADOW_COPY_SCHEMA,
-    SyntheticShadowCopyAdapter,
-)
 from gasha.ingestion.service import (
     IngestionOutcome,
     IngestionService,
     InMemoryDeadLetterSink,
+)
+from gasha.ingestion.shadow_copy import (
+    SHADOW_COPY_SCHEMA,
+    SyntheticShadowCopyAdapter,
 )
 from gasha.ingestion.worker import IngestionWorker
 from gasha.orchestration import (
