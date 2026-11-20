@@ -133,7 +133,7 @@ class SyntheticFeatureEvidenceV1(BaseModel):
             "late_observations": assessment.late_observations,
             "nonprior_observations": assessment.nonprior_observations,
             "unavailable_signals": assessment.unavailable_signals,
-        )
+        }
         evidence = cls(**fields, lineage_ref=_lineage_ref(fields))
         evidence.assert_matches_event(event)
         return evidence
