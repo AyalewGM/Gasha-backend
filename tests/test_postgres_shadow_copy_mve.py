@@ -39,11 +39,14 @@ from gasha.ingestion.contracts import FraudEventEnvelope, InboundBankEvent
 from gasha.ingestion.service import IngestionOutcome, IngestionService
 from gasha.ingestion.shadow_copy import SHADOW_COPY_SCHEMA, SyntheticShadowCopyAdapter
 from gasha.ingestion.worker import IngestionWorker
-from gasha.orchestration import ShadowOrchestrator
 from gasha.intelligence.feature_assessment_v1 import assess_synthetic_shadow_features
 from gasha.intelligence.feature_set_v1 import ObservedTransfer
 from gasha.intelligence.internal_graph import InternalGraphPolicy
-from gasha.postgres_evaluations import PostgresEvaluationPersistence, PostgresShadowEvaluationRepository
+from gasha.orchestration import ShadowOrchestrator
+from gasha.postgres_evaluations import (
+    PostgresEvaluationPersistence,
+    PostgresShadowEvaluationRepository,
+)
 from gasha.security.access import Capability, CredentialRejected
 
 schema = alerts.schema
