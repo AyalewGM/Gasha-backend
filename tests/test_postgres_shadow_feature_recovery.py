@@ -6,7 +6,7 @@ broker/Bank isolation or source authenticity. No Bank feed or payment actions.
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from json import dumps
 from uuid import UUID, uuid4
 
@@ -16,7 +16,11 @@ import test_postgres_synthetic_fraud_workflow as workflow
 from test_kafka_ingestion import FakeRecord, make_consumer
 from test_postgres_case_writer_bridge import principal
 from test_postgres_evaluations import POLICY
-from test_postgres_shadow_copy_mve import TENANT, _synthetic_copy
+from test_postgres_shadow_copy_mve import (
+    TENANT,
+    _computed_graph_from_normalized,
+    _synthetic_copy,
+)
 
 from gasha.cases.evaluation_alerts import (
     PostgresEvaluationAlertWriter,
@@ -579,3 +583,189 @@ def test_post_ack_worker_audit_outage_rolls_back_lineage_then_recovers(installat
         assert db.execute(
             "SELECT count(*) AS n FROM dead_letters"
         ).fetchone()["n"] == 0
+
+
+@pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+def test_legacy_completed_pending_and_source_bound_shadow_recover_together(
+    installation,
+) -> None:
+    """One empty-transport recovery retires committed legacy state and derives
+    fresh synthetic feature evidence without touching a foreign tenant.
+
+    This is a PostgreSQL/worker simulation, not physical Bank/NetGuardians
+    fault isolation, Bank-trusted source attestation, or payment enforcement.
+    """
+    alerts.install_policy(installation, workflow.ALERT_POLICY)
+    with workflow.connect(installation) as db:
+        for migration in (
+            "005_create_dead_letters.sql",
+            "007_create_pending_evaluations.sql",
+            "008_pending_lease_fencing.sql",
+            "009_pending_terminal_state.sql",
+            "020_pending_adapter_contract.sql",
+        ):
+            db.execute((alerts.MIGRATIONS / migration).read_text())
+
+    completed_copy = _synthetic_copy()
+    first_copy, second_copy = _synthetic_copy(), _synthetic_copy()
+    incomplete_copy, foreign_copy = _synthetic_copy(), _synthetic_copy("tenant-b")
+    ingestion = IngestionService({
+        "synthetic-shadow-copy": SyntheticShadowCopyAdapter(),
+    })
+    completed = ingestion.ingest(completed_copy).envelope
+    healthy = tuple(
+        ingestion.ingest(copy).envelope
+        for copy in (first_copy, second_copy, incomplete_copy)
+    )
+    foreign = ingestion.ingest(foreign_copy).envelope
+    assert completed is not None and foreign is not None
+    assert all(event is not None for event in healthy)
+    stale = datetime.now(UTC) - timedelta(minutes=10)
+
+    with workflow.connect(installation) as db:
+        seeder = PostgresPendingEvaluationStore(
+            db, tenant_ids=(TENANT,), worker_id="combined-legacy-seed",
+            lease_ttl=timedelta(seconds=1),
+        )
+        seeder.enqueue(completed, enqueued_at=stale, policy=POLICY)
+        for event in healthy:
+            assert event is not None
+            seeder.enqueue(event, enqueued_at=stale, policy=POLICY)
+        PostgresPendingEvaluationStore(
+            db, tenant_ids=("tenant-b",), worker_id="combined-foreign-seed",
+            lease_ttl=timedelta(seconds=1),
+        ).enqueue(foreign, enqueued_at=stale, policy=POLICY)
+
+    # Crash after evaluation/alert/case/audit commit, before pending.complete.
+    committed = alerts.evaluate(
+        installation, _computed_graph_from_normalized(completed),
+        policy=POLICY,
+        writer=PostgresEvaluationAlertWriter(
+            TENANT, workflow.ALERT_POLICY,
+            principal(caps=frozenset({Capability.CASE_CREATE})),
+        ),
+    )
+    assert committed.effective_action is DecisionAction.NO_ACTION_SHADOW
+    with workflow.connect(installation) as db:
+        db.execute(
+            "UPDATE pending_evaluations "
+            "SET adapter_type=NULL, adapter_schema_version=NULL "
+            "WHERE tenant_id=%s AND event_id=%s",
+            (TENANT, str(completed.event_id)),
+        )
+        db.commit()
+
+    # Independent synthetic downstream paths do not invoke the Gasha worker.
+    bank_path = ["bank-synthetic-continues-during-Gasha-failure"]
+    netguardians_path = list(bank_path)
+    snapshots = (
+        snapshot_for_copy(first_copy),
+        snapshot_for_copy(second_copy),
+        replace(
+            snapshot_for_copy(incomplete_copy),
+            relationship_history_complete=False,
+        ),
+    )
+    empty, empty_batch, dead_letters = make_consumer([])
+    with workflow.connect(installation) as db:
+        writer = PostgresEvaluationAlertWriter(
+            TENANT, workflow.ALERT_POLICY,
+            principal(caps=frozenset({Capability.CASE_CREATE})),
+        )
+        orchestrator = ShadowOrchestrator(
+            {TENANT: POLICY},
+            persistence=PostgresEvaluationPersistence(
+                db, tenant_ids=(TENANT,), require_lease=True, alerts=writer,
+            ),
+        )
+        worker = IngestionWorker(
+            empty,
+            ingestion,
+            evaluate=SyntheticShadowWorkerEvaluator(
+                orchestrator, history_source=SyntheticFixtures(snapshots),
+            ),
+            pending=PostgresPendingEvaluationStore(
+                db, tenant_ids=(TENANT,), worker_id="combined-recovery",
+            ),
+            worker_id="combined-recovery", tenant_ids=(TENANT,),
+            dead_letters=dead_letters,
+        )
+        assert worker.run_once(max_events=1) == 0
+        assert empty_batch.commits == 0 and dead_letters.records == ()
+        assert db.execute(
+            "SELECT count(*) AS n FROM pending_evaluations WHERE tenant_id=%s",
+            (TENANT,),
+        ).fetchone()["n"] == 0
+        assert db.execute(
+            "SELECT count(*) AS n FROM pending_evaluations WHERE tenant_id=%s",
+            ("tenant-b",),
+        ).fetchone()["n"] == 1
+        assert db.execute(
+            "SELECT count(*) AS n FROM dead_letters",
+        ).fetchone()["n"] == 0
+        assert db.execute(
+            "SELECT count(*) AS n FROM shadow_evaluations WHERE tenant_id=%s",
+            (TENANT,),
+        ).fetchone()["n"] == 4
+        assert db.execute(
+            "SELECT count(*) AS n FROM fraud_decision_audit WHERE tenant_id=%s",
+            (TENANT,),
+        ).fetchone()["n"] == 4
+        assert db.execute(
+            "SELECT count(*) AS n FROM analyst_case_events",
+        ).fetchone()["n"] == 1
+
+        repository = PostgresShadowEvaluationRepository(db, tenant_ids=(TENANT,))
+        for copy in (first_copy, second_copy, incomplete_copy):
+            saved = repository.get(TENANT, UUID(str(copy.payload["event_id"])))
+            assert saved is not None and saved.feature_evidence is not None
+            assert saved.evaluation.effective_action is DecisionAction.NO_ACTION_SHADOW
+            assert saved.feature_evidence.decision_as_of == copy.received_at
+            assert "sender-1" not in saved.feature_evidence.model_dump_json()
+        unavailable = repository.get(
+            TENANT, UUID(str(incomplete_copy.payload["event_id"])),
+        )
+        assert unavailable is not None and unavailable.feature_evidence is not None
+        assert (
+            "beneficiary_unique_senders_1h"
+            in unavailable.feature_evidence.unavailable_signals
+        )
+        assert "UNAVAILABLE_BENEFICIARY_FAN_IN" in (
+            unavailable.event.evidence_reason_codes
+        )
+        for copy in (first_copy, second_copy):
+            event_id = str(copy.payload["event_id"])
+            alert = db.execute(
+                "SELECT context_ref FROM evaluation_alerts "
+                "WHERE tenant_id=%s AND event_id=%s",
+                (TENANT, event_id),
+            ).fetchone()
+            assert alert is not None
+            saved = repository.get(TENANT, UUID(event_id))
+            assert saved is not None
+            assert alert["context_ref"] == evaluation_context_ref(saved)
+
+        counts = {
+            table: db.execute(
+                f"SELECT count(*) AS n FROM {table}",
+            ).fetchone()["n"]
+            for table in (
+                "shadow_evaluations", "fraud_decision_audit",
+                "evaluation_alerts", "analyst_case_events",
+                "security_audit_events", "dead_letters",
+            )
+        }
+        assert counts["evaluation_alerts"] >= 3
+        assert db.execute(
+            "SELECT count(*) AS n FROM security_audit_events "
+            "WHERE action='alert.generate'",
+        ).fetchone()["n"] == counts["evaluation_alerts"]
+        # No broker redelivery, duplicate alert/case, false legacy DLQ or
+        # payment action is introduced by another recovery pass.
+        assert worker.run_once(max_events=1) == 0
+        for table, count in counts.items():
+            assert db.execute(
+                f"SELECT count(*) AS n FROM {table}",
+            ).fetchone()["n"] == count
+
+    assert bank_path == netguardians_path
