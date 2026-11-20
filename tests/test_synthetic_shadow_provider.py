@@ -21,6 +21,7 @@ from gasha.intelligence.synthetic_shadow_provider import (
 from gasha.orchestration import ShadowOrchestrator
 
 
+
 DECISION_POLICY = DecisionPolicy(
     configuration_version="synthetic-config-1",
     policy_version="synthetic-decision-1",
@@ -60,9 +61,7 @@ def test_recovered_worker_callable_derives_evidence_from_source_snapshot_only():
     assert record.feature_evidence is not None
     assert len(record.feature_evidence.lineage_ref) == 64
     assert record.feature_evidence.eligible_observations == 5
-    assert record.feature_evidence.unavailable_signals == ("device_ref",) or (
-        "device_ref" not in record.feature_evidence.unavailable_signals
-    )
+    assert "beneficiary_unique_senders_1h" not in record.feature_evidence.unavailable_signals
     assert "sender-1" not in record.feature_evidence.model_dump_json()
 
 
