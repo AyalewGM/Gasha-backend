@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, Self
 from uuid import UUID
 
 from pydantic import BaseModel, model_validator
@@ -41,7 +41,7 @@ class ShadowEvaluationRecord(BaseModel):
     feature_evidence: SyntheticFeatureEvidenceV1 | None = None
 
     @model_validator(mode="after")
-    def validate_feature_evidence(self):
+    def validate_feature_evidence(self) -> Self:
         if self.feature_evidence is not None:
             self.feature_evidence.assert_matches_event(self.event)
             if (
