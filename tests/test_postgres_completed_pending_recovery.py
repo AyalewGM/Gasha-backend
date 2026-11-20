@@ -29,6 +29,7 @@ from gasha.ingestion.shadow_copy import SyntheticShadowCopyAdapter
 from gasha.ingestion.worker import IngestionWorker
 from gasha.security.access import Capability
 
+schema = alerts.schema
 installation = workflow.installation
 
 
