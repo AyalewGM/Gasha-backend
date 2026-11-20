@@ -87,6 +87,7 @@ def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
             "007_create_pending_evaluations.sql",
             "008_pending_lease_fencing.sql",
             "009_pending_terminal_state.sql",
+            "020_pending_adapter_contract.sql",
         ):
             db.execute((alerts.MIGRATIONS / migration).read_text())
 
@@ -245,6 +246,7 @@ def test_post_ack_provider_rejection_retries_without_partial_shadow_evidence(
             "007_create_pending_evaluations.sql",
             "008_pending_lease_fencing.sql",
             "009_pending_terminal_state.sql",
+            "020_pending_adapter_contract.sql",
         ):
             db.execute((alerts.MIGRATIONS / migration).read_text())
 
@@ -380,6 +382,7 @@ def test_post_ack_missing_provider_terminal_dlq_is_idempotent(installation) -> N
             "007_create_pending_evaluations.sql",
             "008_pending_lease_fencing.sql",
             "009_pending_terminal_state.sql",
+            "020_pending_adapter_contract.sql",
         ):
             db.execute((alerts.MIGRATIONS / migration).read_text())
 
@@ -470,6 +473,7 @@ def test_post_ack_worker_audit_outage_rolls_back_lineage_then_recovers(installat
             "007_create_pending_evaluations.sql",
             "008_pending_lease_fencing.sql",
             "009_pending_terminal_state.sql",
+            "020_pending_adapter_contract.sql",
         ):
             db.execute((alerts.MIGRATIONS / migration).read_text())
 
