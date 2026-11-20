@@ -491,3 +491,57 @@ def test_receipt_feature_evidence_is_atomic_with_shadow_alert_and_case(installat
         tampered["feature_evidence"]["source_fingerprint"] = "0" * 64
         with pytest.raises(ValueError, match="digest mismatch"):
             ShadowEvaluationRecord.model_validate(tampered)
+
+
+@pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+def test_feature_evidence_alert_audit_failure_rolls_back_all(installation) -> None:
+    """A failed terminal alert audit cannot leave lineage, alert or case."""
+    from psycopg.errors import CheckViolation
+
+    alerts.install_policy(installation, workflow.ALERT_POLICY)
+    receipt = IngestionService({
+        "synthetic-shadow-copy": SyntheticShadowCopyAdapter(),
+    }).ingest(_synthetic_copy())
+    assert receipt.envelope is not None
+    assessment = _computed_graph_assessment(receipt.envelope)
+    writer = PostgresEvaluationAlertWriter(
+        TENANT, workflow.ALERT_POLICY,
+        principal(caps=frozenset({Capability.CASE_CREATE})),
+    )
+    with workflow.connect(installation) as db:
+        db.execute(
+            "ALTER TABLE security_audit_events ADD CONSTRAINT "
+            "feature_evidence_audit_guard "
+            "CHECK (action <> 'alert.generate') NOT VALID"
+        )
+    with pytest.raises(CheckViolation):
+        with workflow.connect(installation) as db:
+            orchestrator = ShadowOrchestrator(
+                {TENANT: POLICY},
+                persistence=PostgresEvaluationPersistence(db, alerts=writer),
+            )
+            orchestrator.evaluate(
+                assessment.assessed_envelope, feature_assessment=assessment,
+            )
+    with workflow.connect(installation) as db:
+        for table in (
+            "shadow_evaluations", "fraud_decision_audit",
+            "evaluation_alerts", "analyst_case_events",
+            "evaluation_alert_policy_provenance",
+        ):
+            assert db.execute(
+                f"SELECT count(*) AS n FROM {table}",
+            ).fetchone()["n"] == 0
+        db.execute(
+            "ALTER TABLE security_audit_events "
+            "DROP CONSTRAINT feature_evidence_audit_guard"
+        )
+    with workflow.connect(installation) as db:
+        result = ShadowOrchestrator(
+            {TENANT: POLICY},
+            persistence=PostgresEvaluationPersistence(db, alerts=writer),
+        ).evaluate(assessment.assessed_envelope, feature_assessment=assessment)
+        assert result.effective_action is DecisionAction.NO_ACTION_SHADOW
+        assert db.execute(
+            "SELECT count(*) AS n FROM shadow_evaluations",
+        ).fetchone()["n"] == 1
