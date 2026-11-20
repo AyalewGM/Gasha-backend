@@ -6,10 +6,11 @@ clock, install a model, persist lineage, or authorize payment enforcement.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timezone
 from hashlib import sha256
 from json import dumps
+from re import fullmatch
 from uuid import UUID
 
 from gasha.domain.models import IntelligenceSnapshot, OperatingMode
@@ -90,6 +91,8 @@ def assess_synthetic_shadow_features(
         normalized.operating_mode is not OperatingMode.SHADOW
         or normalized.adapter.adapter_type != "synthetic-shadow-copy"
         or normalized.adapter.schema_version != SHADOW_COPY_SCHEMA
+        or type(normalized.adapter.source_system) is not str
+        or fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", normalized.adapter.source_system) is None
         or tx.tenant_id != normalized.tenant_id
         or tx.event_id != normalized.event_id
         or normalized.intelligence != IntelligenceSnapshot()
@@ -118,6 +121,19 @@ def assess_synthetic_shadow_features(
         target, observations, decision_as_of=decision_as_of,
         relationship_history_complete=relationship_history_complete,
     )
+    # Incomplete source coverage cannot establish a measured graph zero (or
+    # an authoritative fan-in count). Keep the core feature engine reusable;
+    # this synthetic assessment conservatively marks its graph signal absent.
+    if not relationship_history_complete and target.beneficiary_ref is not None:
+        features = replace(
+            features,
+            beneficiary_unique_senders_1h=None,
+            missing=tuple(sorted({*features.missing, "beneficiary_unique_senders_1h"})),
+            computation_fingerprint=_digest([
+                ASSESSMENT_VERSION, features.computation_fingerprint,
+                "beneficiary_history_incomplete",
+            ]),
+        )
     late = sum(
         item.occurred_at < target.occurred_at and item.available_at > decision_as_of
         for item in observations
@@ -131,7 +147,8 @@ def assess_synthetic_shadow_features(
     reasons: tuple[str, ...]
     if features.beneficiary_unique_senders_1h is None:
         # Never turn missing beneficiary telemetry into a measured zero-risk signal.
-        unavailable.append("beneficiary_unique_senders_1h")
+        if "beneficiary_unique_senders_1h" not in unavailable:
+            unavailable.append("beneficiary_unique_senders_1h")
         assessment_intelligence = IntelligenceSnapshot()
         reasons = ("UNAVAILABLE_BENEFICIARY_FAN_IN",)
     else:
@@ -156,6 +173,7 @@ def assess_synthetic_shadow_features(
         ASSESSMENT_VERSION, normalized.tenant_id, str(normalized.event_id),
         decision_as_of.isoformat(), normalized.adapter.adapter_type,
         normalized.adapter.adapter_version, normalized.adapter.schema_version,
+        normalized.adapter.source_system,
         features.source_fingerprint,
         sorted(_observation_identity(item) for item in observations),
     ])
@@ -163,6 +181,7 @@ def assess_synthetic_shadow_features(
         ASSESSMENT_VERSION, source, features.computation_fingerprint,
         policy.model_dump(mode="json"), assessment_intelligence.model_dump(mode="json"),
         reasons, missing, eligible, late, nonprior,
+        relationship_history_complete,
     ])
     # Risk is computed by Gasha; the synthetic JSON adapter cannot supply it.
     assessed = normalized.model_copy(update={
