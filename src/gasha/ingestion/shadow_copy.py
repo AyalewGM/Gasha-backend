@@ -16,6 +16,8 @@ from typing import NoReturn
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+from pydantic_core import TzInfo
+
 from gasha.domain.models import BeneficiaryType, IntelligenceSnapshot, OperatingMode
 from gasha.ingestion.contracts import (
     AdapterMetadata,
@@ -154,9 +156,18 @@ class SyntheticShadowCopyAdapter:
         received = event.received_at
         if (
             type(received) is not datetime
-            or type(received.tzinfo) not in (timezone, ZoneInfo)
-            or received.utcoffset() is None
+            or type(received.tzinfo) not in (timezone, ZoneInfo, TzInfo)
         ):
+            self._reject(event, RejectionReason.INVALID_TIMESTAMP, "receipt clock required")
+        if type(received.tzinfo) is TzInfo:
+            # Pydantic's JSON decoder produces its exact fixed-offset TzInfo.
+            # Reparse its ISO offset into stdlib timezone before delegating.
+            # Never call an arbitrary user-supplied tzinfo implementation.
+            try:
+                received = datetime.fromisoformat(received.isoformat())
+            except (ValueError, OverflowError):
+                self._reject(event, RejectionReason.INVALID_TIMESTAMP, "invalid receipt clock")
+        if received.utcoffset() is None:
             self._reject(event, RejectionReason.INVALID_TIMESTAMP, "receipt clock required")
         if occurred.astimezone(UTC) > received.astimezone(UTC):
             self._reject(event, RejectionReason.INVALID_TIMESTAMP, "event after receipt")
