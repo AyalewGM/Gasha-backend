@@ -39,10 +39,11 @@ from gasha.ingestion.contracts import FraudEventEnvelope, InboundBankEvent
 from gasha.ingestion.service import IngestionOutcome, IngestionService
 from gasha.ingestion.shadow_copy import SHADOW_COPY_SCHEMA, SyntheticShadowCopyAdapter
 from gasha.ingestion.worker import IngestionWorker
+from gasha.orchestration import ShadowOrchestrator
 from gasha.intelligence.feature_assessment_v1 import assess_synthetic_shadow_features
 from gasha.intelligence.feature_set_v1 import ObservedTransfer
 from gasha.intelligence.internal_graph import InternalGraphPolicy
-from gasha.postgres_evaluations import PostgresShadowEvaluationRepository
+from gasha.postgres_evaluations import PostgresEvaluationPersistence, PostgresShadowEvaluationRepository
 from gasha.security.access import Capability, CredentialRejected
 
 schema = alerts.schema
@@ -73,7 +74,7 @@ def _computed_graph_event(copy: InboundBankEvent):
     return _computed_graph_from_normalized(receipt.envelope)
 
 
-def _computed_graph_from_normalized(normalized: FraudEventEnvelope) -> FraudEventEnvelope:
+def _computed_graph_assessment(normalized: FraudEventEnvelope):
     assert normalized.operating_mode is OperatingMode.SHADOW
     assert normalized.intelligence.transaction_risk == 0.0
     occurred = normalized.canonical_transaction.occurred_at
@@ -103,7 +104,12 @@ def _computed_graph_from_normalized(normalized: FraudEventEnvelope) -> FraudEven
     assert assessment.late_observations == 1
     assert assessment.decision_as_of == receipt_as_of
     assert len(assessment.computation_fingerprint) == 64
-    return assessment.assessed_envelope
+    return assessment
+
+
+def _computed_graph_from_normalized(normalized: FraudEventEnvelope) -> FraudEventEnvelope:
+    return _computed_graph_assessment(normalized).assessed_envelope
+
 
 @pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
 def test_copy_to_durable_deduped_alert_authenticated_case_and_feedback(
@@ -402,3 +408,83 @@ def test_synthetic_copy_audit_failure_cannot_leave_partial_alert_case(installati
     assert result.effective_action is DecisionAction.NO_ACTION_SHADOW
     with workflow.connect(installation) as db:
         assert db.execute("SELECT count(*) AS n FROM evaluation_alerts").fetchone()["n"] == 1
+
+
+@pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+def test_receipt_feature_evidence_is_atomic_with_shadow_alert_and_case(installation) -> None:
+    """Persist opaque lineage with the same transaction as alert, case and audit.
+
+    Deliberately synthetic-only: existing protected history still exposes its
+    immutable source_context_ref, not a new unapproved analyst field.
+    """
+    alerts.install_policy(installation, workflow.ALERT_POLICY)
+    receipt = IngestionService({
+        "synthetic-shadow-copy": SyntheticShadowCopyAdapter(),
+    }).ingest(_synthetic_copy())
+    assert receipt.envelope is not None
+    assessment = _computed_graph_assessment(receipt.envelope)
+    writer = PostgresEvaluationAlertWriter(
+        TENANT, workflow.ALERT_POLICY,
+        principal(caps=frozenset({Capability.CASE_CREATE})),
+    )
+    with workflow.connect(installation) as db:
+        orchestrator = ShadowOrchestrator(
+            {TENANT: workflow.POLICY},
+            persistence=PostgresEvaluationPersistence(db, alerts=writer),
+        )
+        result = orchestrator.evaluate(
+            assessment.assessed_envelope, feature_assessment=assessment,
+        )
+        assert result.effective_action is DecisionAction.NO_ACTION_SHADOW
+        persisted = PostgresShadowEvaluationRepository(
+            db, tenant_ids=(TENANT,),
+        ).get(TENANT, assessment.event_id)
+        assert persisted is not None and persisted.feature_evidence is not None
+        evidence = persisted.feature_evidence
+        assert evidence.source_fingerprint == assessment.source_fingerprint
+        assert evidence.computation_fingerprint == assessment.computation_fingerprint
+        assert evidence.late_observations == 1
+        assert evidence.canonical_transaction_fingerprint
+        assert evidence.lineage_ref
+        alert = db.execute(
+            "SELECT case_id, context_ref FROM evaluation_alerts "
+            "WHERE tenant_id = %s AND event_id = %s",
+            (TENANT, assessment.event_id),
+        ).fetchone()
+        assert alert is not None
+        assert alert["context_ref"] == evaluation_context_ref(persisted)
+        source = db.execute(
+            "SELECT source_context_ref FROM analyst_case_events "
+            "WHERE tenant_id = %s AND case_id = %s",
+            (TENANT, alert["case_id"]),
+        ).fetchone()
+        assert source is not None
+        assert source["source_context_ref"] == alert["context_ref"]
+        # Exact duplicate causes neither a new case nor another audit.
+        assert orchestrator.evaluate(
+            assessment.assessed_envelope, feature_assessment=assessment,
+        ).effective_action is DecisionAction.NO_ACTION_SHADOW
+        for table, expected in (
+            ("shadow_evaluations", 1), ("fraud_decision_audit", 1),
+            ("evaluation_alerts", 1), ("analyst_case_events", 1),
+        ):
+            assert db.execute(
+                f"SELECT count(*) AS n FROM {table}",
+            ).fetchone()["n"] == expected
+        assert db.execute(
+            "SELECT count(*) AS n FROM security_audit_events "
+            "WHERE action = 'alert.generate'",
+        ).fetchone()["n"] == 1
+
+    # A mutated stored digest cannot masquerade as a valid feature lineage.
+    from gasha.orchestration import ShadowEvaluationRecord
+    with workflow.connect(installation) as db:
+        original = db.execute(
+            "SELECT record_json FROM shadow_evaluations "
+            "WHERE tenant_id = %s AND event_id = %s",
+            (TENANT, assessment.event_id),
+        ).fetchone()["record_json"]
+        tampered = dict(original) if isinstance(original, dict) else __import__("json").loads(original)
+        tampered["feature_evidence"]["source_fingerprint"] = "0" * 64
+        with pytest.raises(ValueError, match="digest mismatch"):
+            ShadowEvaluationRecord.model_validate(tampered)
