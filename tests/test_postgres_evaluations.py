@@ -127,7 +127,7 @@ class FakeCursor:
                 row["leased_by"] = worker_id
                 row["leased_until"] = leased_until
                 row["lease_token"] = str(uuid4())
-                claimed.append(dict(row))
+                claimed.append({**row, "tenant_id": key[0], "event_id": key[1]})
             self.rows_out = claimed
             self.rowcount = len(claimed)
             return
