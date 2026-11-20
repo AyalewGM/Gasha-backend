@@ -263,9 +263,18 @@ def test_pending_clock_fails_closed_before_any_custom_timezone_callback() -> Non
 
 
 @pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
-@pytest.mark.parametrize("tamper", ["invalid-receipt-clock", "tenant-substitution"])
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "invalid-receipt-clock",
+        "tenant-substitution",
+        "nested-tenant-substitution",
+        "nested-event-id-substitution",
+    ],
+)
+@pytest.mark.parametrize("forced_dlq_failure", [False, True])
 def test_poison_pending_row_is_quarantined_without_blocking_healthy_recovery(
-    installation, tamper: str,
+    installation, tamper: str, forced_dlq_failure: bool,
 ) -> None:
     """A bad persisted row is terminal/DLQ, while a neighbor can be claimed.
 
@@ -307,8 +316,16 @@ def test_poison_pending_row_is_quarantined_without_blocking_healthy_recovery(
         malformed = loads(str(stored["record_json"]))
         if tamper == "invalid-receipt-clock":
             malformed["event"]["received_at"] = "SENSITIVE_MALFORMED_CLOCK"
-        else:
+        elif tamper == "tenant-substitution":
             malformed["event"]["tenant_id"] = "tenant-b"
+        elif tamper == "nested-tenant-substitution":
+            malformed["event"]["canonical_transaction"]["tenant_id"] = "tenant-b"
+        elif tamper == "nested-event-id-substitution":
+            malformed["event"]["canonical_transaction"]["event_id"] = (
+                "00000000-0000-4000-8000-000000000042"
+            )
+        else:
+            pytest.fail(f"unknown synthetic tamper case: {tamper}")
         db.execute(
             "UPDATE pending_evaluations SET record_json=%s "
             "WHERE tenant_id=%s AND event_id=%s",
@@ -320,6 +337,44 @@ def test_poison_pending_row_is_quarantined_without_blocking_healthy_recovery(
         worker = PostgresPendingEvaluationStore(
             db, tenant_ids=(TENANT,), worker_id="recover-poison",
         )
+        if forced_dlq_failure:
+            # The injected SQL failure must rollback *both* the poison
+            # terminalization and the healthy row's lease claim.
+            db.execute("""
+                CREATE FUNCTION reject_synthetic_dead_letter()
+                RETURNS trigger LANGUAGE plpgsql AS $
+                BEGIN
+                    RAISE EXCEPTION 'synthetic dead-letter write failure';
+                END;
+                $;
+            """)
+            db.execute("""
+                CREATE TRIGGER reject_synthetic_dead_letter
+                BEFORE INSERT ON dead_letters
+                FOR EACH ROW EXECUTE FUNCTION reject_synthetic_dead_letter()
+            """)
+            db.commit()
+            with pytest.raises(Exception, match="synthetic dead-letter write failure"):
+                worker.due(datetime.now(UTC))
+            unchanged = db.execute(
+                "SELECT tenant_id, event_id, terminal, attempts, leased_by "
+                "FROM pending_evaluations"
+            ).fetchall()
+            assert len(unchanged) == 2
+            assert all(
+                row["tenant_id"] == TENANT
+                and row["terminal"] is False
+                and row["attempts"] == 0
+                and row["leased_by"] == "seed-poison"
+                for row in unchanged
+            )
+            assert db.execute(
+                "SELECT count(*) AS n FROM dead_letters"
+            ).fetchone()["n"] == 0
+            db.execute("DROP TRIGGER reject_synthetic_dead_letter ON dead_letters")
+            db.execute("DROP FUNCTION reject_synthetic_dead_letter()")
+            db.commit()
+
         claimed = worker.due(datetime.now(UTC))
         assert len(claimed) == 1
         assert claimed[0].event.event_id == good.event_id
@@ -344,12 +399,17 @@ def test_poison_pending_row_is_quarantined_without_blocking_healthy_recovery(
         assert "invalid persisted pending record" in serialized
         assert "SENSITIVE_MALFORMED_CLOCK" not in serialized
         assert "tenant-b" not in serialized
+        assert "00000000-0000-4000-8000-000000000042" not in serialized
+        assert str(good.event_id) not in serialized
         worker.complete(
             TENANT, good.event_id, owner="recover-poison",
             claim_token=claimed[0].claim_token,
             now=datetime.now(UTC),
         )
         assert worker.due(datetime.now(UTC)) == ()
+        assert db.execute(
+            "SELECT count(*) AS n FROM dead_letters"
+        ).fetchone()["n"] == 1
         assert db.execute(
             "SELECT count(*) AS n FROM pending_evaluations"
         ).fetchone()["n"] == 1
