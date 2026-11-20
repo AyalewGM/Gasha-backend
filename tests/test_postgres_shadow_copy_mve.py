@@ -39,13 +39,9 @@ from gasha.ingestion.contracts import FraudEventEnvelope, InboundBankEvent
 from gasha.ingestion.service import IngestionOutcome, IngestionService
 from gasha.ingestion.shadow_copy import SHADOW_COPY_SCHEMA, SyntheticShadowCopyAdapter
 from gasha.ingestion.worker import IngestionWorker
-from gasha.intelligence.feature_set_v1 import ObservedTransfer, compute_feature_set
-from gasha.intelligence.internal_graph import (
-    InternalGraphDetector,
-    InternalGraphPolicy,
-    InternalGraphSignals,
-)
-from gasha.intelligence.provenance import IntelligenceScope, IntelligenceSource, SignalProvenance
+from gasha.intelligence.feature_assessment_v1 import assess_synthetic_shadow_features
+from gasha.intelligence.feature_set_v1 import ObservedTransfer
+from gasha.intelligence.internal_graph import InternalGraphPolicy
 from gasha.postgres_evaluations import PostgresShadowEvaluationRepository
 from gasha.security.access import Capability, CredentialRejected
 
@@ -82,12 +78,8 @@ def _computed_graph_from_normalized(normalized: FraudEventEnvelope) -> FraudEven
     assert normalized.intelligence.transaction_risk == 0.0
     occurred = normalized.canonical_transaction.occurred_at
     receipt_as_of = normalized.received_at
-    assert occurred <= receipt_as_of
+    assert receipt_as_of is not None and occurred <= receipt_as_of
     tx = normalized.canonical_transaction
-    target = ObservedTransfer(
-        normalized.tenant_id, str(tx.event_id), tx.sender_account_id,
-        tx.beneficiary_id, tx.device_id, occurred, receipt_as_of,
-    )
     history = tuple(
         ObservedTransfer(
             normalized.tenant_id, f"prior-{n}", f"prior-account-{n}",
@@ -95,36 +87,23 @@ def _computed_graph_from_normalized(normalized: FraudEventEnvelope) -> FraudEven
             occurred - timedelta(minutes=n), occurred - timedelta(minutes=n),
         ) for n in range(1, 6)
     )
-    # A past transaction observed after the receipt cutoff cannot contribute.
     late_observation = ObservedTransfer(
         normalized.tenant_id, "late-after-receipt", "late-sender",
         tx.beneficiary_id, None, occurred - timedelta(minutes=10),
         receipt_as_of + timedelta(seconds=1),
     )
-    features = compute_feature_set(
-        target, history + (late_observation,), decision_as_of=receipt_as_of,
+    # The production-shaped assessment contract replaces the test's prior
+    # direct model_copy risk injection. The *persisted* feature lineage still
+    # requires a separate reviewed atomic storage/projection change under #145.
+    assessment = assess_synthetic_shadow_features(
+        normalized, history + (late_observation,),
+        policy=InternalGraphPolicy(policy_version="synthetic-graph-v1"),
     )
-    assert features.decision_as_of == receipt_as_of
-    assert features.beneficiary_unique_senders_1h == 5
-    # Risk is derived on the Gasha side from synthetic observed history;
-    # the inbound copy never supplies it or chooses the decision policy.
-    assessed = InternalGraphDetector(
-        InternalGraphPolicy(policy_version="synthetic-graph-v1")
-    ).assess(InternalGraphSignals(
-        unique_senders_to_beneficiary_1h=features.beneficiary_unique_senders_1h,
-        provenance=SignalProvenance(
-            source=IntelligenceSource.TENANT_NETWORK,
-            scope=IntelligenceScope.TENANT_OBSERVED,
-            observed_at=occurred,
-            source_version=features.version,
-        ),
-    ))
-    return normalized.model_copy(update={
-        "intelligence": assessed.intelligence,
-        "evidence_reason_codes": assessed.reason_codes,
-        "signal_policy_versions": (assessed.signal_policy_version,),
-    })
-
+    assert assessment.feature_set.beneficiary_unique_senders_1h == 5
+    assert assessment.late_observations == 1
+    assert assessment.decision_as_of == receipt_as_of
+    assert len(assessment.computation_fingerprint) == 64
+    return assessment.assessed_envelope
 
 @pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
 def test_copy_to_durable_deduped_alert_authenticated_case_and_feedback(
