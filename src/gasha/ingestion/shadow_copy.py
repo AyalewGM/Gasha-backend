@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from typing import NoReturn
 from datetime import UTC, datetime, timezone
+from typing import NoReturn
 from zoneinfo import ZoneInfo
 
 from gasha.domain.models import IntelligenceSnapshot, OperatingMode
