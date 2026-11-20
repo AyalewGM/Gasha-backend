@@ -287,7 +287,8 @@ def test_post_ack_provider_rejection_retries_without_partial_shadow_evidence(
         bad_snapshot = replace(good_snapshot, source_system="forged-source")
     elif fault == "cutoff":
         bad_snapshot = replace(
-            good_snapshot, receipt_cutoff=good_snapshot.receipt_cutoff + timedelta(seconds=1),
+            good_snapshot,
+            receipt_cutoff=good_snapshot.receipt_cutoff + timedelta(seconds=1),
         )
     elif fault == "foreign_observation":
         observation = replace(good_snapshot.observations[0], tenant_id="tenant-b")
@@ -348,7 +349,9 @@ def test_post_ack_provider_rejection_retries_without_partial_shadow_evidence(
         assert worker.run_once(max_events=1) == 0
         assert worker.run_once(max_events=1) == 0
         assert empty_batch.commits == 0 and dlq.records == ()
-        assert db.execute("SELECT count(*) AS n FROM pending_evaluations").fetchone()["n"] == 0
+        assert db.execute(
+            "SELECT count(*) AS n FROM pending_evaluations"
+        ).fetchone()["n"] == 0
         assert db.execute("SELECT count(*) AS n FROM shadow_evaluations").fetchone()["n"] == 1
         assert db.execute("SELECT count(*) AS n FROM evaluation_alerts").fetchone()["n"] == 1
         assert db.execute("SELECT count(*) AS n FROM analyst_case_events").fetchone()["n"] == 1
@@ -364,7 +367,7 @@ def test_post_ack_provider_rejection_retries_without_partial_shadow_evidence(
         assert record.feature_evidence.tenant_id == good_snapshot.tenant_id
         assert record.feature_evidence.event_id == good_snapshot.event_id
         assert record.feature_evidence.decision_as_of == good_snapshot.receipt_cutoff
-        assert record.effective_action is DecisionAction.NO_ACTION_SHADOW
+        assert record.evaluation.effective_action is DecisionAction.NO_ACTION_SHADOW
 
 
 @pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
