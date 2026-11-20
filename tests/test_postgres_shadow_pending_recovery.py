@@ -10,9 +10,9 @@ from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from json import dumps, loads
 
 import pytest
-from pydantic import TypeAdapter
 import test_postgres_evaluation_alerts as alerts
 import test_postgres_synthetic_fraud_workflow as workflow
+from pydantic import TypeAdapter
 from test_kafka_ingestion import FakeRecord, make_consumer
 from test_postgres_case_writer_bridge import principal
 from test_postgres_evaluations import POLICY
@@ -51,6 +51,7 @@ def test_acknowledged_shadow_copy_recovers_from_postgres_without_broker_redelive
     alerts.install_policy(installation, workflow.ALERT_POLICY)
     with workflow.connect(installation) as db:
         for migration in (
+            "005_create_dead_letters.sql",
             "007_create_pending_evaluations.sql",
             "008_pending_lease_fencing.sql",
             "009_pending_terminal_state.sql",
@@ -248,7 +249,7 @@ def test_pending_clock_fails_closed_before_any_custom_timezone_callback() -> Non
     for bad in (
         datetime(2026, 11, 20),
         datetime(2026, 11, 20, tzinfo=UnsafeTimezone()),
-        UnsafeDateTime(2026, 11, 20, tzinfo=timezone.utc),
+        UnsafeDateTime(2026, 11, 20, tzinfo=UTC),
         "SENSITIVE_MALFORMED_CLOCK",
     ):
         with pytest.raises(ValueError, match="invalid persisted pending timestamp"):
@@ -257,7 +258,7 @@ def test_pending_clock_fails_closed_before_any_custom_timezone_callback() -> Non
     with pytest.raises(ValueError, match="invalid persisted pending timestamp"):
         _restored_pending_clock(None)
     assert _restored_pending_clock(None, optional=True) is None
-    standard = datetime(2026, 11, 20, tzinfo=timezone.utc)
+    standard = datetime(2026, 11, 20, tzinfo=UTC)
     assert _restored_pending_clock(standard) is standard
 
 
@@ -274,6 +275,7 @@ def test_poison_pending_row_is_quarantined_without_blocking_healthy_recovery(
     alerts.install_policy(installation, workflow.ALERT_POLICY)
     with workflow.connect(installation) as db:
         for migration in (
+            "005_create_dead_letters.sql",
             "007_create_pending_evaluations.sql",
             "008_pending_lease_fencing.sql",
             "009_pending_terminal_state.sql",
