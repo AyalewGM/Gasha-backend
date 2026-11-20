@@ -83,15 +83,18 @@ class FakeCursor:
                     "op": "insert",
                     "row": {
                         "record_json": params[2],
-                        "leased_by": params[6],
-                        "leased_until": params[7],
-                        "lease_token": params[8], "terminal": False,
+                        "adapter_type": params[3],
+                        "adapter_schema_version": params[4],
+                        "leased_by": params[8],
+                        "leased_until": params[9],
+                        "lease_token": params[10], "terminal": False,
                     },
                 },
             )
             return
         if normalized.startswith(
-            "SELECT record_json, leased_by, leased_until, lease_token, terminal "
+            "SELECT record_json, adapter_type, adapter_schema_version, "
+            "leased_by, leased_until, lease_token, terminal "
             "FROM pending_evaluations WHERE tenant_id"
         ):
             key = (str(params[0]), str(params[1]))
@@ -127,7 +130,7 @@ class FakeCursor:
                 row["leased_by"] = worker_id
                 row["leased_until"] = leased_until
                 row["lease_token"] = str(uuid4())
-                claimed.append(dict(row))
+                claimed.append({**row, "tenant_id": key[0], "event_id": key[1]})
             self.rows_out = claimed
             self.rowcount = len(claimed)
             return

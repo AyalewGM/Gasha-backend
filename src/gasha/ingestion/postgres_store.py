@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 import socket
 from collections.abc import Mapping
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
+
+from pydantic_core import TzInfo
 
 from gasha.domain.models import DecisionPolicy
 from gasha.ingestion.contracts import FraudEventEnvelope
-from gasha.ingestion.errors import RejectionRecord
+from gasha.ingestion.errors import RejectionReason, RejectionRecord
 from gasha.ingestion.outcome_ingestion import IncumbentOutcomeRecord
 from gasha.ingestion.pending import PendingEvaluationRecord
 from gasha.ingestion.service import DeadLetterSink, IngestionRecord
@@ -219,6 +221,78 @@ def _as_datetime(value: object) -> datetime:
     raise TypeError(f"expected datetime, got {type(value).__name__}")
 
 
+def _restored_pending_clock(
+    value: datetime | None, *, optional: bool = False, allow_naive: bool = False
+) -> datetime | None:
+    """Recover a fixed-offset DB JSON clock without executing arbitrary tzinfo.
+
+    Pydantic v2 decodes persisted JSON offsets into its exact `TzInfo` type.
+    The Gasha synthetic receipt-time feature engine permits only stdlib
+    `datetime.timezone`, so preserve the validated clock's ISO representation
+    while restoring that trusted concrete type. Never call custom callbacks.
+    """
+    if value is None and optional:
+        return None
+    if type(value) is not datetime:
+        raise ValueError("invalid persisted pending timestamp")
+    if value.tzinfo is None:
+        # Only the legacy synthetic reference adapter may preserve a naive
+        # inbound receipt clock. Never reinterpret it as UTC or allow it on
+        # the strict synthetic-shadow-copy receipt-time feature path.
+        if allow_naive:
+            return value
+        raise ValueError("invalid persisted pending timestamp")
+    if type(value.tzinfo) not in (timezone, TzInfo):
+        raise ValueError("invalid persisted pending timestamp")
+    if type(value.tzinfo) is TzInfo:
+        try:
+            value = datetime.fromisoformat(value.isoformat())
+        except (ValueError, OverflowError) as exc:
+            raise ValueError("invalid persisted pending timestamp") from exc
+    if value.utcoffset() is None:
+        raise ValueError("naive persisted pending timestamp")
+    return value
+
+
+def _restored_pending_record(
+    raw: str, *, tenant_id: str, event_id: str,
+    adapter_type: str | None, adapter_schema_version: str | None,
+) -> PendingEvaluationRecord:
+    """Bind mutable pending JSON to SQL identity and enqueue-time adapter policy.
+
+    Older rows lacking an independently stored adapter contract fail closed;
+    self-asserted JSON metadata must never activate naive clock permission.
+    """
+    record = PendingEvaluationRecord.model_validate_json(raw)
+    event = record.event
+    transaction = event.canonical_transaction
+    if (
+        not adapter_type or not adapter_schema_version
+        or event.adapter.adapter_type != adapter_type
+        or event.adapter.schema_version != adapter_schema_version
+        or event.tenant_id != tenant_id
+        or str(event.event_id) != event_id
+        or transaction.tenant_id != tenant_id
+        or str(transaction.event_id) != event_id
+    ):
+        raise ValueError("persisted pending identity or adapter mismatch")
+    received = _restored_pending_clock(
+        event.received_at, optional=True,
+        allow_naive=(
+            adapter_type == "reference-json"
+            and adapter_schema_version == "1.0"
+        ),
+    )
+    occurred = _restored_pending_clock(transaction.occurred_at)
+    normalized = _restored_pending_clock(event.adapter.normalized_at)
+    restored = event.model_copy(update={
+        "received_at": received,
+        "canonical_transaction": transaction.model_copy(update={"occurred_at": occurred}),
+        "adapter": event.adapter.model_copy(update={"normalized_at": normalized}),
+    })
+    return record.model_copy(update={"event": restored})
+
+
 class PostgresPendingEvaluationStore:
     """PostgreSQL pending-evaluation ledger keyed by (tenant_id, event_id).
 
@@ -271,16 +345,19 @@ class PostgresPendingEvaluationStore:
                 """
                 INSERT INTO pending_evaluations (
                     tenant_id, event_id, record_json,
+                    adapter_type, adapter_schema_version,
                     attempts, next_attempt_at, enqueued_at,
                     leased_by, leased_until, lease_token
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (tenant_id, event_id) DO NOTHING
                 """,
                 (
                     event.tenant_id,
                     str(event.event_id),
                     record.model_dump_json(),
+                    event.adapter.adapter_type,
+                    event.adapter.schema_version,
                     0,
                     enqueued_at,
                     enqueued_at,
@@ -297,54 +374,121 @@ class PostgresPendingEvaluationStore:
     def due(
         self, now: datetime, *, limit: int = 100
     ) -> tuple[PendingEvaluationRecord, ...]:
-        """Atomically claims up to ``limit`` due rows for this worker.
+        """Claim due rows, isolating invalid persisted records within one transaction.
 
-        One ``UPDATE ... FOR UPDATE SKIP LOCKED ... RETURNING`` — each
-        due, in-scope, unleased row is stamped ``leased_by``/``leased_until``
-        in the same statement, so concurrent workers can never claim the
-        same row.
+        A malformed JSON clock or mismatched identity must not strand a
+        healthy neighbor after the lease write commits. A poison record is
+        terminalized with a minimized durable dead-letter; its raw JSON and
+        exception text never enter rejection evidence. Unexpected DB errors
+        roll the entire claim/quarantine transaction back.
         """
         tenant_ids = (
             list(self._tenant_ids) if self._tenant_ids is not None else None
         )
-        with self._connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE pending_evaluations AS pe
-                SET leased_by = %s, leased_until = %s, lease_token = gen_random_uuid()
-                WHERE (pe.tenant_id, pe.event_id) IN (
-                    SELECT tenant_id, event_id
-                    FROM pending_evaluations
-                    WHERE NOT terminal AND next_attempt_at <= %s
-                      AND (%s::text[] IS NULL OR tenant_id = ANY(%s))
-                      AND (leased_until IS NULL
-                           OR leased_until <= %s)
-                    ORDER BY enqueued_at ASC
-                    LIMIT %s
-                    FOR UPDATE SKIP LOCKED
+        claimed: list[PendingEvaluationRecord] = []
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE pending_evaluations AS pe
+                    SET leased_by = %s, leased_until = %s,
+                        lease_token = gen_random_uuid()
+                    WHERE (pe.tenant_id, pe.event_id) IN (
+                        SELECT tenant_id, event_id
+                        FROM pending_evaluations
+                        WHERE NOT terminal AND next_attempt_at <= %s
+                          AND (%s::text[] IS NULL OR tenant_id = ANY(%s))
+                          AND (leased_until IS NULL OR leased_until <= %s)
+                        ORDER BY enqueued_at ASC
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING pe.tenant_id, pe.event_id, pe.record_json,
+                              pe.adapter_type, pe.adapter_schema_version,
+                              pe.leased_by, pe.leased_until, pe.lease_token,
+                              pe.terminal
+                    """,
+                    (
+                        self._worker_id, now + self._lease_ttl, now,
+                        tenant_ids, tenant_ids, now, limit,
+                    ),
                 )
-                RETURNING pe.record_json, pe.leased_by, pe.leased_until, pe.lease_token, pe.terminal
-                """,
-                (
-                    self._worker_id,
-                    now + self._lease_ttl,
-                    now,
-                    tenant_ids,
-                    tenant_ids,
-                    now,
-                    limit,
-                ),
-            )
-            rows = cursor.fetchall()
-        self._connection.commit()
-        return tuple(
-            PendingEvaluationRecord.model_validate_json(
-                str(row["record_json"])
-            ).model_copy(
-                update={"leased_by": row["leased_by"], "leased_until": row["leased_until"], "claim_token": str(row["lease_token"]) if row["lease_token"] is not None else None, "terminal": bool(row["terminal"])}
-            )
-            for row in rows
-        )
+                for row in cursor.fetchall():
+                    tenant_id = str(row["tenant_id"])
+                    event_id = str(row["event_id"])
+                    require_tenant(tenant_id, self._tenant_ids)
+                    try:
+                        record = _restored_pending_record(
+                            str(row["record_json"]),
+                            tenant_id=tenant_id, event_id=event_id,
+                            adapter_type=(
+                                str(row["adapter_type"])
+                                if row["adapter_type"] is not None else None
+                            ),
+                            adapter_schema_version=(
+                                str(row["adapter_schema_version"])
+                                if row["adapter_schema_version"] is not None else None
+                            ),
+                        )
+                    except (ValueError, TypeError):
+                        # The database row identity is authoritative for this
+                        # *synthetic* ledger; never trust the corrupt JSON for
+                        # scope, event identity, raw details or provenance.
+                        cursor.execute(
+                            """
+                            UPDATE pending_evaluations AS pe
+                            SET terminal = TRUE, attempts = pe.attempts + 1,
+                                last_error = 'InvalidPendingRecord',
+                                leased_by = NULL, leased_until = NULL,
+                                lease_token = NULL
+                            WHERE pe.tenant_id = %s AND pe.event_id = %s
+                              AND pe.leased_by = %s AND pe.lease_token = %s
+                              AND NOT pe.terminal
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM shadow_evaluations AS se
+                                  WHERE se.tenant_id = pe.tenant_id
+                                    AND se.event_id = pe.event_id
+                              )
+                            """,
+                            (
+                                tenant_id, event_id, self._worker_id,
+                                str(row["lease_token"]),
+                            ),
+                        )
+                        if cursor.rowcount != 1:
+                            raise RuntimeError("pending quarantine state conflict")
+                        rejection = RejectionRecord(
+                            reason=RejectionReason.INVALID_SCHEMA,
+                            detail="invalid persisted pending record",
+                            tenant_id=tenant_id, event_id=event_id,
+                            rejected_at=now,
+                        )
+                        cursor.execute(
+                            """
+                            INSERT INTO dead_letters
+                                (tenant_id, event_id, record_json, rejected_at)
+                            VALUES (%s, %s, %s, %s)
+                            """,
+                            (
+                                tenant_id, event_id, rejection.model_dump_json(),
+                                rejection.rejected_at,
+                            ),
+                        )
+                        continue
+                    claimed.append(record.model_copy(update={
+                        "leased_by": row["leased_by"],
+                        "leased_until": row["leased_until"],
+                        "claim_token": (
+                            str(row["lease_token"])
+                            if row["lease_token"] is not None else None
+                        ),
+                        "terminal": bool(row["terminal"]),
+                    }))
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        return tuple(claimed)
 
     def reschedule(
         self,
@@ -432,7 +576,8 @@ class PostgresPendingEvaluationStore:
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT record_json, leased_by, leased_until, lease_token, terminal
+                SELECT record_json, adapter_type, adapter_schema_version,
+                       leased_by, leased_until, lease_token, terminal
                 FROM pending_evaluations
                 WHERE tenant_id = %s AND event_id = %s
                 """ + (" FOR UPDATE" if lock else ""),
@@ -441,8 +586,17 @@ class PostgresPendingEvaluationStore:
             row = cursor.fetchone()
         if row is None:
             return None
-        return PendingEvaluationRecord.model_validate_json(
-            str(row["record_json"])
+        return _restored_pending_record(
+            str(row["record_json"]), tenant_id=tenant_id,
+            event_id=str(event_id),
+            adapter_type=(
+                str(row["adapter_type"])
+                if row["adapter_type"] is not None else None
+            ),
+            adapter_schema_version=(
+                str(row["adapter_schema_version"])
+                if row["adapter_schema_version"] is not None else None
+            ),
         ).model_copy(
             update={"leased_by": row["leased_by"], "leased_until": row["leased_until"], "claim_token": str(row["lease_token"]) if row["lease_token"] is not None else None, "terminal": bool(row["terminal"])}
         )
