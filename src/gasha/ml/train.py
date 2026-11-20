@@ -105,15 +105,14 @@ def _operating_thresholds(
         block = review + 2.0 * (1.0 - review) / 3.0
     if monitor >= review or review >= hold or hold >= block:
         raise TrainingRejected("operating thresholds are not realizable")
-    # Step-up is a suggested operating point only when the negative
-    # population realizes a distinct point between monitor and review;
-    # otherwise the tenant simply leaves challenge disabled.
-    challenge_threshold: float | None = (
+    # The suggested intermediate point cannot activate step-up: the
+    # server-selected DecisionPolicy still requires channel + policy lineage.
+    challenge_suggestion = (
         min(1.0, challenge) if monitor < challenge < review else None
     )
     thresholds = OperatingThresholds(
         monitor_threshold=min(1.0, monitor),
-        challenge_threshold=challenge_threshold,
+        challenge_threshold=challenge_suggestion,
         review_threshold=min(1.0, review),
         hold_threshold=min(1.0, hold),
         block_threshold=min(1.0, block),

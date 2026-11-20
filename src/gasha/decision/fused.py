@@ -81,9 +81,13 @@ class FusedDecisionService:
             action = DecisionAction.REVIEW
         elif (
             self.policy.challenge_threshold is not None
+            and self.policy.challenge_policy_ref is not None
+            and transaction.channel in self.policy.challenge_supported_channels
             and score >= self.policy.challenge_threshold
         ):
+            # A policy-scoped recommendation; this service cannot dispatch.
             action = DecisionAction.CHALLENGE
+            reasons.append("STEP_UP_RECOMMENDATION_ONLY")
         elif score >= self.policy.monitor_threshold:
             action = DecisionAction.MONITOR
         else:

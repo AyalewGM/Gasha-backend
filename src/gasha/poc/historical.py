@@ -22,9 +22,11 @@ from gasha.domain.models import (
 )
 from gasha.poc.outcomes import IncumbentControlOutcome, OutcomeRecord
 
+# Step-up recommendation is friction, not an observed analyst alert or
+# confirmed fraud intervention. Missing Bank execution/settlement evidence
+# cannot receive TP/alert credit during offline replay.
 ALERT_ACTIONS = frozenset(
     {
-        DecisionAction.CHALLENGE,
         DecisionAction.REVIEW,
         DecisionAction.HOLD,
         DecisionAction.BLOCK,
@@ -99,6 +101,14 @@ class ReplayClassification(StrEnum):
     UNLABELED = "unlabeled"
 
 
+class ReplayDecisionSource(StrEnum):
+    """Offline replay source, not a Bank evidence attestation."""
+
+    GASHA_DECISION = "gasha_decision"
+    INCUMBENT_SCORE_SIMULATION = "incumbent_score_simulation"
+    OTHER_OFFLINE_BACKEND = "other_offline_backend"
+
+
 class MissingTenantPolicyError(ValueError):
     """Raised when a replay event has no policy for its tenant."""
 
@@ -127,6 +137,7 @@ class ReplayedEventResult:
     evaluation_ended_at: datetime | None = None
     processing_latency: timedelta | None = None
     reconciled_outcome: OutcomeRecord | None = None
+    decision_source: ReplayDecisionSource = ReplayDecisionSource.GASHA_DECISION
 
 
 @dataclass(frozen=True)
@@ -232,6 +243,14 @@ def replay_historical(
                 decision,
                 evaluation_started_at=evaluation_started_at,
                 evaluation_ended_at=evaluation_ended_at,
+                decision_source=(
+                    ReplayDecisionSource.GASHA_DECISION
+                    if type(service) is DecisionService
+                    else ReplayDecisionSource.INCUMBENT_SCORE_SIMULATION
+                    if getattr(service, "replay_decision_source", None)
+                    == ReplayDecisionSource.INCUMBENT_SCORE_SIMULATION
+                    else ReplayDecisionSource.OTHER_OFFLINE_BACKEND
+                ),
             )
         )
 
@@ -289,6 +308,7 @@ def _result(
     *,
     evaluation_started_at: datetime | None = None,
     evaluation_ended_at: datetime | None = None,
+    decision_source: ReplayDecisionSource = ReplayDecisionSource.GASHA_DECISION,
 ) -> ReplayedEventResult:
     alerted = decision.action in _ALERT_ACTIONS
     label = event.label
@@ -313,6 +333,7 @@ def _result(
         evaluation_started_at=evaluation_started_at,
         evaluation_ended_at=evaluation_ended_at,
         processing_latency=processing_latency,
+        decision_source=decision_source,
     )
 
 

@@ -2,7 +2,7 @@
 
 ``IncumbentControlOutcome`` is provider-neutral by design; this module is the
 adapter layer that maps NetGuardians vocabulary into it. The normalized export
-contract (``event_id``, ``risk_score``, ``verdict``) is what Gasha requires —
+contract (``tenant_id``, ``event_id``, ``risk_score``, ``verdict``) is what Gasha requires —
 the extraction job that produces these rows from the bank's actual NG export
 (API, report, or message feed) is deployment-specific work pending a real
 export sample.
@@ -68,6 +68,7 @@ def map_netguardians_outcome(raw_verdict: str) -> IncumbentControlOutcome:
 class NetGuardiansOutcomeRecord:
     """One normalized incumbent outcome joined to a canonical event."""
 
+    tenant_id: str
     event_id: UUID
     risk_score: float
     outcome: IncumbentControlOutcome
@@ -81,10 +82,10 @@ def normalize_netguardians_export(
 ) -> tuple[NetGuardiansOutcomeRecord, ...]:
     """Validates an NG export into normalized outcome records.
 
-    Each row must carry ``event_id`` (UUID or parseable string),
+    Each row must carry nonblank ``tenant_id`` and ``event_id`` (UUID),
     ``risk_score`` (finite number scaled by ``score_max`` into ``[0, 1]``),
     and ``verdict`` (mapped fail-closed by :func:`map_netguardians_outcome`).
-    Duplicate event identifiers and empty input are rejected — a comparison
+    Duplicate tenant/event pairs and empty input are rejected — a comparison
     against a partial incumbent export would overstate the challenger.
     """
     if not isinstance(score_max, float) or not isfinite(score_max) or score_max <= 0:
@@ -93,13 +94,18 @@ def normalize_netguardians_export(
         raise NetGuardiansExportRejected("NetGuardians export is empty")
 
     records: list[NetGuardiansOutcomeRecord] = []
-    seen: set[UUID] = set()
+    seen: set[tuple[str, UUID]] = set()
     for index, row in enumerate(rows):
-        for key in ("event_id", "risk_score", "verdict"):
+        for key in ("tenant_id", "event_id", "risk_score", "verdict"):
             if key not in row:
                 raise NetGuardiansExportRejected(
                     f"NetGuardians export row {index} missing {key!r}"
                 )
+        tenant = row["tenant_id"]
+        if not isinstance(tenant, str) or not tenant.strip() or tenant != tenant.strip():
+            raise NetGuardiansExportRejected(
+                f"NetGuardians export row {index} has an invalid tenant id"
+            )
         raw_id = row["event_id"]
         try:
             event_id = raw_id if isinstance(raw_id, UUID) else UUID(str(raw_id))
@@ -107,10 +113,9 @@ def normalize_netguardians_export(
             raise NetGuardiansExportRejected(
                 f"NetGuardians export row {index} has a malformed event id"
             ) from None
-        if event_id in seen:
-            raise NetGuardiansExportRejected(
-                f"duplicate NetGuardians outcome for event {event_id}"
-            )
+        record_key = (tenant, event_id)
+        if record_key in seen:
+            raise NetGuardiansExportRejected("duplicate tenant-scoped NetGuardians outcome")
         raw_score = row["risk_score"]
         if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
             raise NetGuardiansExportRejected(
@@ -126,9 +131,10 @@ def normalize_netguardians_export(
             raise NetGuardiansExportRejected(
                 f"NetGuardians export row {index} has a blank verdict"
             )
-        seen.add(event_id)
+        seen.add(record_key)
         records.append(
             NetGuardiansOutcomeRecord(
+                tenant_id=tenant,
                 event_id=event_id,
                 risk_score=score,
                 outcome=map_netguardians_outcome(raw_verdict),

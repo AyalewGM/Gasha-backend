@@ -196,6 +196,88 @@ def test_allow_and_monitor_do_not_open_alerts(installation, score):
         assert len(connection.execute("SELECT * FROM shadow_evaluations").fetchall()) == 1
 
 
+
+def test_restricted_policy_reader_can_save_and_exactly_replay(installation):
+    """#42/#148: policy installations are SELECT-only for the runtime login.
+
+    Exercise the *complete* atomic synthetic writer under a different LOGIN.
+    A privileged fixture account installs the policy but never performs the
+    restricted save/replay. Bank-specific grants and RLS remain out of scope.
+    """
+    import psycopg
+    from psycopg import sql
+    from psycopg.rows import dict_row
+
+    name = "gasha_policy_reader_" + uuid4().hex[:12]
+    password = uuid4().hex + uuid4().hex
+    ident, namespace = sql.Identifier(name), sql.Identifier(installation)
+    grants = (
+        ("fraud_decision_audit", "SELECT, INSERT, UPDATE"),
+        ("shadow_evaluations", "SELECT, INSERT, UPDATE"),
+        ("evaluation_alerts", "SELECT, INSERT, UPDATE"),
+        ("analyst_case_events", "SELECT, INSERT"),
+        ("security_audit_events", "INSERT"),
+        ("tenant_alert_policy_installations", "SELECT"),
+        ("evaluation_alert_policy_provenance", "SELECT, INSERT"),
+    )
+    with psycopg.connect(DSN, autocommit=True) as owner:
+        owner.execute(sql.SQL(
+            "CREATE ROLE {} LOGIN PASSWORD {} "
+            "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
+        ).format(ident, sql.Literal(password)))
+        try:
+            owner.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                namespace, ident,
+            ))
+            for table, privileges in grants:
+                owner.execute(sql.SQL("GRANT " + privileges + " ON TABLE {}.{} TO {}").format(
+                    namespace, sql.Identifier(table), ident,
+                ))
+
+            with psycopg.connect(
+                DSN, user=name, password=password, row_factory=dict_row,
+            ) as runtime:
+                runtime.execute(sql.SQL("SET search_path TO {}").format(namespace))
+                runtime.commit()
+                assert runtime.execute("SELECT current_user").fetchone()["current_user"] == name
+                for table in (
+                    "tenant_alert_policy_installations",
+                    "evaluation_alert_policy_provenance",
+                ):
+                    assert runtime.execute(
+                        "SELECT has_table_privilege(current_user, %s, 'UPDATE') AS allowed",
+                        (table,),
+                    ).fetchone()["allowed"] is False
+
+                for score in (0.91, 0.1):
+                    sample = event(score=score)
+                    writer = PostgresEvaluationAlertWriter(
+                        sample.tenant_id, ALERT_POLICY, principal(tenant=sample.tenant_id),
+                    )
+                    workflow = ShadowOrchestrator(
+                        {sample.tenant_id: POLICY},
+                        persistence=PostgresEvaluationPersistence(runtime, alerts=writer),
+                    )
+                    first = workflow.evaluate(sample)
+                    assert first.effective_action is DecisionAction.NO_ACTION_SHADOW
+                    assert workflow.evaluate(sample) == first
+
+            with connect(installation) as check:
+                for table, expected in (
+                    ("fraud_decision_audit", 2),
+                    ("shadow_evaluations", 2),
+                    ("evaluation_alert_policy_provenance", 2),
+                    ("evaluation_alerts", 1),
+                    ("analyst_case_events", 1),
+                ):
+                    assert check.execute(
+                        f"SELECT count(*) AS n FROM {table}"
+                    ).fetchone()["n"] == expected
+        finally:
+            owner.execute(sql.SQL("DROP OWNED BY {}").format(ident))
+            owner.execute(sql.SQL("DROP ROLE {}").format(ident))
+
+
 def test_wrong_service_tenant_cannot_create_or_attach(installation):
     writer = PostgresEvaluationAlertWriter("tenant-a", ALERT_POLICY, principal(tenant="tenant-b"))
     with pytest.raises(AuthorizationRejected):
