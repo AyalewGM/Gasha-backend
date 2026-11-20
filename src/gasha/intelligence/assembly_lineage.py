@@ -218,13 +218,22 @@ def context_matches(
         bound_transaction = context.transaction_digest == transaction_digest(transaction)
     except (ValueError, TypeError):
         return False
+    # Frozen dataclass annotations do not validate nested runtime values.
+    # Reject malformed snapshots before reading or hashing any policy role.
+    if (
+        type(context.policy_snapshots) is not tuple
+        or len(context.policy_snapshots) != 5
+        or not all(
+            type(item) is EffectivePolicySnapshot and type(item.role) is str
+            for item in context.policy_snapshots
+        )
+    ):
+        return False
     return (
         context.tenant_id == transaction.tenant_id
         and context.event_id == transaction.event_id
         and context.occurred_at.astimezone(UTC) == transaction.occurred_at.astimezone(UTC)
         and bound_transaction
-        and type(context.policy_snapshots) is tuple
-        and len(context.policy_snapshots) == 5
         and {p.role for p in context.policy_snapshots}
             == {"assembly", "social", "graph", "session", "journey"}
         and context.received_at.astimezone(UTC) >= context.occurred_at.astimezone(UTC)
