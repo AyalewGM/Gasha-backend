@@ -38,6 +38,13 @@ def _instant(value: object) -> datetime:
     return value.astimezone(UTC)
 
 
+def _lineage_ref(payload: dict[str, object]) -> str:
+    normalized = dict(payload)
+    normalized["decision_as_of"] = _instant(payload["decision_as_of"]).isoformat()
+    normalized["event_id"] = str(payload["event_id"])
+    return _digest(["gasha-synthetic-feature-evidence-content-v1", normalized])
+
+
 class SyntheticFeatureEvidenceV1(BaseModel):
     """Opaque source/decision binding; no raw observation or customer payload."""
 
@@ -52,6 +59,7 @@ class SyntheticFeatureEvidenceV1(BaseModel):
     feature_set_version: str
     canonical_transaction_fingerprint: str
     assessed_event_fingerprint: str
+    lineage_ref: str
     eligible_observations: int
     late_observations: int
     nonprior_observations: int
@@ -89,12 +97,16 @@ class SyntheticFeatureEvidenceV1(BaseModel):
                 for name in (
                     "source_fingerprint", "computation_fingerprint",
                     "canonical_transaction_fingerprint",
-                    "assessed_event_fingerprint",
+                    "assessed_event_fingerprint", "lineage_ref",
                 )
             )
         ):
             raise ValueError("invalid synthetic feature evidence")
         _instant(self.decision_as_of)
+        if self.lineage_ref != _lineage_ref(
+            self.model_dump(mode="python", exclude={"lineage_ref"})
+        ):
+            raise ValueError("synthetic feature evidence digest mismatch")
         return self
 
     @classmethod
@@ -102,7 +114,7 @@ class SyntheticFeatureEvidenceV1(BaseModel):
         if type(assessment) is not FeatureAssessmentV1:
             raise ValueError("trusted synthetic feature assessment required")
         event = assessment.assessed_envelope
-        evidence = cls(
+        fields: dict[str, object] = dict(
             version=ASSESSMENT_VERSION,
             tenant_id=assessment.tenant_id,
             event_id=assessment.event_id,
@@ -122,6 +134,7 @@ class SyntheticFeatureEvidenceV1(BaseModel):
             nonprior_observations=assessment.nonprior_observations,
             unavailable_signals=assessment.unavailable_signals,
         )
+        evidence = cls(**fields, lineage_ref=_lineage_ref(fields))
         evidence.assert_matches_event(event)
         return evidence
 
