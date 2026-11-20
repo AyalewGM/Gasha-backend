@@ -5,9 +5,10 @@ broker/Bank isolation or source authenticity. No Bank feed or payment actions.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 from json import dumps
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 import test_postgres_evaluation_alerts as alerts
@@ -222,3 +223,231 @@ def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
         ).fetchone()["n"] == 2
     assert bank_path == netguardians_path
     assert len(bank_path) == 3
+
+
+@pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+@pytest.mark.parametrize(
+    "fault",
+    ("absent", "tenant", "event", "source", "cutoff", "foreign_observation"),
+)
+def test_post_ack_provider_rejection_retries_without_partial_shadow_evidence(
+    installation, fault: str,
+) -> None:
+    """Actual PostgreSQL: a bad in-process history source cannot commit evidence.
+
+    Recovery after a corrected fixture must succeed from the pending ledger,
+    without another transport delivery and without duplicate audit/cases.
+    """
+    alerts.install_policy(installation, workflow.ALERT_POLICY)
+    with workflow.connect(installation) as db:
+        for migration in (
+            "005_create_dead_letters.sql",
+            "007_create_pending_evaluations.sql",
+            "008_pending_lease_fencing.sql",
+            "009_pending_terminal_state.sql",
+        ):
+            db.execute((alerts.MIGRATIONS / migration).read_text())
+
+    copy = _synthetic_copy()
+    wire = dumps(copy.model_dump(mode="json")).encode()
+    incoming, batch, initial_dlq = make_consumer([FakeRecord(wire, 1)])
+
+    def unavailable(_event: FraudEventEnvelope, _policy=None):
+        raise TimeoutError("Gasha evaluator unavailable; bank not involved")
+
+    with workflow.connect(installation) as db:
+        failed = IngestionWorker(
+            incoming,
+            IngestionService(
+                {"synthetic-shadow-copy": SyntheticShadowCopyAdapter()},
+                dead_letters=initial_dlq,
+            ),
+            evaluate=unavailable,
+            pending=PostgresPendingEvaluationStore(
+                db, tenant_ids=(TENANT,), worker_id="provider-initial",
+            ),
+            policy_for=lambda _tenant: POLICY,
+            worker_id="provider-initial", tenant_ids=(TENANT,),
+            retry_backoff=timedelta(0), max_evaluation_attempts=3,
+            dead_letters=initial_dlq,
+        )
+        assert failed.run_once(max_events=1) == 1
+        assert batch.commits == 1 and initial_dlq.records == ()
+        assert db.execute(
+            "SELECT attempts FROM pending_evaluations"
+        ).fetchone()["attempts"] == 1
+
+    good_snapshot = snapshot_for_copy(copy)
+    bad_snapshot = good_snapshot
+    if fault == "tenant":
+        bad_snapshot = replace(good_snapshot, tenant_id="tenant-b")
+    elif fault == "event":
+        bad_snapshot = replace(good_snapshot, event_id=uuid4())
+    elif fault == "source":
+        bad_snapshot = replace(good_snapshot, source_system="forged-source")
+    elif fault == "cutoff":
+        bad_snapshot = replace(
+            good_snapshot, receipt_cutoff=good_snapshot.receipt_cutoff + timedelta(seconds=1),
+        )
+    elif fault == "foreign_observation":
+        observation = replace(good_snapshot.observations[0], tenant_id="tenant-b")
+        bad_snapshot = replace(
+            good_snapshot,
+            observations=(observation, *good_snapshot.observations[1:]),
+        )
+    bad_source = SyntheticFixtures(()) if fault == "absent" else SyntheticFixtures((bad_snapshot,))
+
+    def make_recovery(db, *, worker_id: str, source: SyntheticFixtures):
+        writer = PostgresEvaluationAlertWriter(
+            TENANT, workflow.ALERT_POLICY,
+            principal(caps=frozenset({Capability.CASE_CREATE})),
+        )
+        orchestrator = ShadowOrchestrator(
+            {TENANT: POLICY},
+            persistence=PostgresEvaluationPersistence(
+                db, tenant_ids=(TENANT,), require_lease=True, alerts=writer,
+            ),
+        )
+        transport, transport_batch, dlq = make_consumer([])
+        worker = IngestionWorker(
+            transport,
+            IngestionService({"synthetic-shadow-copy": SyntheticShadowCopyAdapter()}),
+            evaluate=SyntheticShadowWorkerEvaluator(
+                orchestrator, history_source=source,
+            ),
+            pending=PostgresPendingEvaluationStore(
+                db, tenant_ids=(TENANT,), worker_id=worker_id,
+            ),
+            worker_id=worker_id, tenant_ids=(TENANT,),
+            retry_backoff=timedelta(0), max_evaluation_attempts=3,
+            dead_letters=dlq,
+        )
+        return worker, transport_batch, dlq
+
+    with workflow.connect(installation) as db:
+        worker, empty_batch, dlq = make_recovery(
+            db, worker_id="provider-invalid", source=bad_source,
+        )
+        assert worker.run_once(max_events=1) == 0
+        assert empty_batch.commits == 0 and dlq.records == ()
+        assert db.execute(
+            "SELECT attempts FROM pending_evaluations"
+        ).fetchone()["attempts"] == 2
+        for table in (
+            "shadow_evaluations", "fraud_decision_audit",
+            "evaluation_alerts", "analyst_case_events", "security_audit_events",
+        ):
+            assert db.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] == 0
+
+    # A new process/connection fixes the configured provider, not the input JSON.
+    with workflow.connect(installation) as db:
+        worker, empty_batch, dlq = make_recovery(
+            db, worker_id="provider-recovered",
+            source=SyntheticFixtures((good_snapshot,)),
+        )
+        assert worker.run_once(max_events=1) == 0
+        assert worker.run_once(max_events=1) == 0
+        assert empty_batch.commits == 0 and dlq.records == ()
+        assert db.execute("SELECT count(*) AS n FROM pending_evaluations").fetchone()["n"] == 0
+        assert db.execute("SELECT count(*) AS n FROM shadow_evaluations").fetchone()["n"] == 1
+        assert db.execute("SELECT count(*) AS n FROM evaluation_alerts").fetchone()["n"] == 1
+        assert db.execute("SELECT count(*) AS n FROM analyst_case_events").fetchone()["n"] == 1
+        assert db.execute("SELECT count(*) AS n FROM fraud_decision_audit").fetchone()["n"] == 1
+        assert db.execute(
+            "SELECT count(*) AS n FROM security_audit_events "
+            "WHERE action='alert.generate'"
+        ).fetchone()["n"] == 1
+        record = PostgresShadowEvaluationRepository(db, tenant_ids=(TENANT,)).get(
+            TENANT, good_snapshot.event_id,
+        )
+        assert record is not None and record.feature_evidence is not None
+        assert record.feature_evidence.tenant_id == good_snapshot.tenant_id
+        assert record.feature_evidence.event_id == good_snapshot.event_id
+        assert record.feature_evidence.decision_as_of == good_snapshot.receipt_cutoff
+        assert record.effective_action is DecisionAction.NO_ACTION_SHADOW
+
+
+@pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+def test_post_ack_missing_provider_terminal_dlq_is_idempotent(installation) -> None:
+    """Two failed post-ACK attempts terminalize exactly once without fraud evidence."""
+    alerts.install_policy(installation, workflow.ALERT_POLICY)
+    with workflow.connect(installation) as db:
+        for migration in (
+            "005_create_dead_letters.sql",
+            "007_create_pending_evaluations.sql",
+            "008_pending_lease_fencing.sql",
+            "009_pending_terminal_state.sql",
+        ):
+            db.execute((alerts.MIGRATIONS / migration).read_text())
+
+    copy = _synthetic_copy()
+    incoming, batch, dlq = make_consumer([
+        FakeRecord(dumps(copy.model_dump(mode="json")).encode(), 1),
+    ])
+
+    with workflow.connect(installation) as db:
+        writer = PostgresEvaluationAlertWriter(
+            TENANT, workflow.ALERT_POLICY,
+            principal(caps=frozenset({Capability.CASE_CREATE})),
+        )
+        orchestrator = ShadowOrchestrator(
+            {TENANT: POLICY},
+            persistence=PostgresEvaluationPersistence(
+                db, tenant_ids=(TENANT,), require_lease=True, alerts=writer,
+            ),
+        )
+        first = IngestionWorker(
+            incoming,
+            IngestionService({"synthetic-shadow-copy": SyntheticShadowCopyAdapter()}),
+            evaluate=SyntheticShadowWorkerEvaluator(orchestrator, history_source=None),
+            pending=PostgresPendingEvaluationStore(
+                db, tenant_ids=(TENANT,), worker_id="missing-provider-first",
+            ),
+            policy_for=lambda _tenant: POLICY,
+            worker_id="missing-provider-first", tenant_ids=(TENANT,),
+            max_evaluation_attempts=2, retry_backoff=timedelta(0), dead_letters=dlq,
+        )
+        assert first.run_once(max_events=1) == 1
+        assert batch.commits == 1
+        assert db.execute(
+            "SELECT attempts, terminal FROM pending_evaluations"
+        ).fetchone() == {"attempts": 1, "terminal": False}
+
+    with workflow.connect(installation) as db:
+        writer = PostgresEvaluationAlertWriter(
+            TENANT, workflow.ALERT_POLICY,
+            principal(caps=frozenset({Capability.CASE_CREATE})),
+        )
+        orchestrator = ShadowOrchestrator(
+            {TENANT: POLICY},
+            persistence=PostgresEvaluationPersistence(
+                db, tenant_ids=(TENANT,), require_lease=True, alerts=writer,
+            ),
+        )
+        empty, empty_batch, next_dlq = make_consumer([])
+        worker = IngestionWorker(
+            empty,
+            IngestionService({"synthetic-shadow-copy": SyntheticShadowCopyAdapter()}),
+            evaluate=SyntheticShadowWorkerEvaluator(orchestrator, history_source=None),
+            pending=PostgresPendingEvaluationStore(
+                db, tenant_ids=(TENANT,), worker_id="missing-provider-second",
+            ),
+            worker_id="missing-provider-second", tenant_ids=(TENANT,),
+            max_evaluation_attempts=2, retry_backoff=timedelta(0),
+            dead_letters=next_dlq,
+        )
+        assert worker.run_once(max_events=1) == 0
+        assert worker.run_once(max_events=1) == 0
+        assert empty_batch.commits == 0
+        row = db.execute(
+            "SELECT attempts, terminal, leased_by, lease_token FROM pending_evaluations"
+        ).fetchone()
+        assert row == {
+            "attempts": 2, "terminal": True, "leased_by": None, "lease_token": None,
+        }
+        assert db.execute("SELECT count(*) AS n FROM dead_letters").fetchone()["n"] == 1
+        assert db.execute("SELECT count(*) AS n FROM shadow_evaluations").fetchone()["n"] == 0
+        assert db.execute("SELECT count(*) AS n FROM fraud_decision_audit").fetchone()["n"] == 0
+        assert db.execute("SELECT count(*) AS n FROM evaluation_alerts").fetchone()["n"] == 0
+        assert db.execute("SELECT count(*) AS n FROM analyst_case_events").fetchone()["n"] == 0
+        assert db.execute("SELECT count(*) AS n FROM security_audit_events").fetchone()["n"] == 0
