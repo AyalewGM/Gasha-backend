@@ -139,6 +139,7 @@ class SyntheticFeatureEvidenceV1(BaseModel):
         return evidence
 
     def assert_matches_event(self, event: FraudEventEnvelope) -> None:
+        self.validate_shape()
         if type(event) is not FraudEventEnvelope:
             raise ValueError("invalid synthetic evidence event")
         transaction = event.canonical_transaction
