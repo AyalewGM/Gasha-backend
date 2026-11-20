@@ -128,6 +128,7 @@ def assess_synthetic_shadow_features(
         for item in observations
     )
     unavailable = list(features.missing)
+    reasons: tuple[str, ...]
     if features.beneficiary_unique_senders_1h is None:
         # Never turn missing beneficiary telemetry into a measured zero-risk signal.
         unavailable.append("beneficiary_unique_senders_1h")
