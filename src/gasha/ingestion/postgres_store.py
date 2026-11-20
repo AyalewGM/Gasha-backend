@@ -254,15 +254,33 @@ def _restored_pending_clock(
     return value
 
 
-def _restored_pending_record(raw: str) -> PendingEvaluationRecord:
+def _restored_pending_record(
+    raw: str, *, tenant_id: str, event_id: str,
+    adapter_type: str | None, adapter_schema_version: str | None,
+) -> PendingEvaluationRecord:
+    """Bind mutable pending JSON to SQL identity and enqueue-time adapter policy.
+
+    Older rows lacking an independently stored adapter contract fail closed;
+    self-asserted JSON metadata must never activate naive clock permission.
+    """
     record = PendingEvaluationRecord.model_validate_json(raw)
     event = record.event
     transaction = event.canonical_transaction
+    if (
+        not adapter_type or not adapter_schema_version
+        or event.adapter.adapter_type != adapter_type
+        or event.adapter.schema_version != adapter_schema_version
+        or event.tenant_id != tenant_id
+        or str(event.event_id) != event_id
+        or transaction.tenant_id != tenant_id
+        or str(transaction.event_id) != event_id
+    ):
+        raise ValueError("persisted pending identity or adapter mismatch")
     received = _restored_pending_clock(
         event.received_at, optional=True,
         allow_naive=(
-            event.adapter.adapter_type == "reference-json"
-            and event.adapter.schema_version == "1.0"
+            adapter_type == "reference-json"
+            and adapter_schema_version == "1.0"
         ),
     )
     occurred = _restored_pending_clock(transaction.occurred_at)
@@ -327,16 +345,19 @@ class PostgresPendingEvaluationStore:
                 """
                 INSERT INTO pending_evaluations (
                     tenant_id, event_id, record_json,
+                    adapter_type, adapter_schema_version,
                     attempts, next_attempt_at, enqueued_at,
                     leased_by, leased_until, lease_token
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (tenant_id, event_id) DO NOTHING
                 """,
                 (
                     event.tenant_id,
                     str(event.event_id),
                     record.model_dump_json(),
+                    event.adapter.adapter_type,
+                    event.adapter.schema_version,
                     0,
                     enqueued_at,
                     enqueued_at,
@@ -383,6 +404,7 @@ class PostgresPendingEvaluationStore:
                         FOR UPDATE SKIP LOCKED
                     )
                     RETURNING pe.tenant_id, pe.event_id, pe.record_json,
+                              pe.adapter_type, pe.adapter_schema_version,
                               pe.leased_by, pe.leased_until, pe.lease_token,
                               pe.terminal
                     """,
@@ -396,14 +418,18 @@ class PostgresPendingEvaluationStore:
                     event_id = str(row["event_id"])
                     require_tenant(tenant_id, self._tenant_ids)
                     try:
-                        record = _restored_pending_record(str(row["record_json"]))
-                        if (
-                            record.event.tenant_id != tenant_id
-                            or str(record.event.event_id) != event_id
-                            or record.event.canonical_transaction.tenant_id != tenant_id
-                            or str(record.event.canonical_transaction.event_id) != event_id
-                        ):
-                            raise ValueError("persisted pending identity mismatch")
+                        record = _restored_pending_record(
+                            str(row["record_json"]),
+                            tenant_id=tenant_id, event_id=event_id,
+                            adapter_type=(
+                                str(row["adapter_type"])
+                                if row["adapter_type"] is not None else None
+                            ),
+                            adapter_schema_version=(
+                                str(row["adapter_schema_version"])
+                                if row["adapter_schema_version"] is not None else None
+                            ),
+                        )
                     except (ValueError, TypeError):
                         # The database row identity is authoritative for this
                         # *synthetic* ledger; never trust the corrupt JSON for
@@ -550,7 +576,8 @@ class PostgresPendingEvaluationStore:
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT record_json, leased_by, leased_until, lease_token, terminal
+                SELECT record_json, adapter_type, adapter_schema_version,
+                       leased_by, leased_until, lease_token, terminal
                 FROM pending_evaluations
                 WHERE tenant_id = %s AND event_id = %s
                 """ + (" FOR UPDATE" if lock else ""),
@@ -560,7 +587,16 @@ class PostgresPendingEvaluationStore:
         if row is None:
             return None
         return _restored_pending_record(
-            str(row["record_json"])
+            str(row["record_json"]), tenant_id=tenant_id,
+            event_id=str(event_id),
+            adapter_type=(
+                str(row["adapter_type"])
+                if row["adapter_type"] is not None else None
+            ),
+            adapter_schema_version=(
+                str(row["adapter_schema_version"])
+                if row["adapter_schema_version"] is not None else None
+            ),
         ).model_copy(
             update={"leased_by": row["leased_by"], "leased_until": row["leased_until"], "claim_token": str(row["lease_token"]) if row["lease_token"] is not None else None, "terminal": bool(row["terminal"])}
         )
