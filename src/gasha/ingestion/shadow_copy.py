@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from typing import NoReturn
 from datetime import UTC, datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -78,7 +79,7 @@ class SyntheticShadowCopyAdapter:
 
     def _reject(
         self, event: InboundBankEvent, reason: RejectionReason, detail: str
-    ) -> None:
+    ) -> NoReturn:
         # Never echo raw payloads, identifiers, free text, or exception messages.
         raise EventRejection(
             RejectionRecord(
