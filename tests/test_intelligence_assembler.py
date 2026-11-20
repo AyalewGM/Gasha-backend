@@ -26,9 +26,11 @@ from gasha.intelligence.assembler import (
     IntelligenceAssembler,
 )
 from gasha.intelligence.assembly_lineage import (
+    EffectivePolicySnapshot,
     OriginalDecisionContext,
     ProviderEvidence,
     context_identity,
+    context_matches,
     evidence_identity,
     payload_digest,
     policy_snapshot,
@@ -265,6 +267,81 @@ def test_context_mismatch_untrusted_replay_and_forgery_rejected() -> None:
         service.assemble(tx(), decision_context=replace(context(), received_at=RECEIVED.replace(tzinfo=None)))
     with pytest.raises(AssemblyRejected):
         service.assemble(object(), decision_context=context())  # type: ignore[arg-type]
+
+
+class UnexpectedPolicySnapshotSubclass(EffectivePolicySnapshot):
+    pass
+
+
+class CountingAuthority(Authority):
+    def __init__(self) -> None:
+        self.context_calls = 0
+        self.evidence_calls = 0
+
+    def verify_context(self, ctx: OriginalDecisionContext) -> bool:
+        self.context_calls += 1
+        return super().verify_context(ctx)
+
+    def verify_evidence(
+        self, item: ProviderEvidence, ctx: OriginalDecisionContext
+    ) -> bool:
+        self.evidence_calls += 1
+        return super().verify_evidence(item, ctx)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda snaps: (None,) * 5,
+    lambda snaps: (object(), *snaps[1:]),
+    lambda snaps: ("untrusted-policy", *snaps[1:]),
+    lambda snaps: (
+        UnexpectedPolicySnapshotSubclass(
+            snaps[0].role, snaps[0].schema, snaps[0].version,
+            snaps[0].content, snaps[0].digest,
+        ),
+        *snaps[1:],
+    ),
+    lambda snaps: (replace(snaps[0], role=["assembly"]), *snaps[1:]),
+    lambda snaps: (replace(snaps[0], role=None), *snaps[1:]),
+    lambda snaps: (replace(snaps[0], role="social"), *snaps[1:]),
+    lambda snaps: (replace(snaps[0], role="foreign"), *snaps[1:]),
+    lambda snaps: snaps[:-1],
+    lambda snaps: (snaps[0], snaps[1], snaps[2], snaps[3], "journey"),
+], ids=[
+    "five-nones", "arbitrary-object", "string-entry", "subclass-entry",
+    "unhashable-role", "none-role", "duplicate-role", "foreign-role",
+    "missing-role", "malformed-final-role",
+])
+def test_malformed_policy_snapshots_fail_before_authority_or_providers(
+    mutate,
+) -> None:
+    valid = context()
+    malformed = replace(valid, policy_snapshots=mutate(valid.policy_snapshots))
+    assert context_matches(malformed, tx()) is False
+    authority = CountingAuthority()
+    service, h, g, j = assembler(authority=authority, include_journey=True)
+    for _ in range(2):
+        with pytest.raises(AssemblyRejected, match="original-decision identity/clock mismatch"):
+            service.assemble(tx(), decision_context=malformed)
+    assert authority.context_calls == authority.evidence_calls == 0
+    assert h.received == g.received == j.received == []
+
+
+def test_valid_policy_snapshot_structure_retains_signed_replay() -> None:
+    valid = context()
+    assert context_matches(valid, tx()) is True
+    authority = CountingAuthority()
+    service, h, g, j = assembler(
+        history=issued("history", HistoryFeatures(account_transfers_1h=5)),
+        authority=authority, include_journey=True,
+    )
+    original = service.assemble(tx(), decision_context=valid)
+    assert original == service.assemble(tx(), decision_context=valid)
+    assert original.snapshot.velocity_risk > 0
+    assert original.reason_codes
+    assert "history" in dict(original.provider_digests)
+    assert authority.context_calls == 2
+    assert authority.evidence_calls == 2
+    assert h.received == g.received == j.received == [RECEIVED, RECEIVED]
 
 
 @pytest.mark.parametrize("mutation", [
