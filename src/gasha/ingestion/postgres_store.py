@@ -383,6 +383,8 @@ class PostgresPendingEvaluationStore:
                         if (
                             record.event.tenant_id != tenant_id
                             or str(record.event.event_id) != event_id
+                            or record.event.canonical_transaction.tenant_id != tenant_id
+                            or str(record.event.canonical_transaction.event_id) != event_id
                         ):
                             raise ValueError("persisted pending identity mismatch")
                     except (ValueError, TypeError):
