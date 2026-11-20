@@ -501,3 +501,121 @@ def test_reference_naive_receipt_survives_enqueue_and_fresh_pending_claim(
         assert db.execute(
             "SELECT count(*) AS n FROM pending_evaluations WHERE terminal"
         ).fetchone()["n"] == 0
+
+
+@pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+@pytest.mark.parametrize(
+    "tamper",
+    ("outer-tenant", "outer-event", "nested-tenant", "nested-event", "adapter-only"),
+)
+def test_conflicting_pending_enqueue_readback_checks_sql_identity_and_adapter(
+    installation, tamper: str,
+) -> None:
+    """An existing poisoned SQL key must never be returned to the caller."""
+    with workflow.connect(installation) as db:
+        for migration in (
+            "005_create_dead_letters.sql",
+            "007_create_pending_evaluations.sql",
+            "008_pending_lease_fencing.sql",
+            "009_pending_terminal_state.sql",
+            "020_pending_adapter_contract.sql",
+        ):
+            db.execute((alerts.MIGRATIONS / migration).read_text())
+    ingested = IngestionService({
+        "synthetic-shadow-copy": SyntheticShadowCopyAdapter(),
+    }).ingest(_synthetic_copy())
+    assert ingested.envelope is not None
+    original = ingested.envelope
+    stale = datetime.now(UTC) - timedelta(minutes=10)
+
+    with workflow.connect(installation) as db:
+        pending = PostgresPendingEvaluationStore(
+            db, tenant_ids=(TENANT,), worker_id="readback-seed",
+            lease_ttl=timedelta(seconds=1),
+        )
+        pending.enqueue(original, enqueued_at=stale, policy=POLICY)
+        row = db.execute(
+            "SELECT record_json FROM pending_evaluations "
+            "WHERE tenant_id=%s AND event_id=%s",
+            (TENANT, str(original.event_id)),
+        ).fetchone()
+        assert row is not None
+        corrupt = loads(str(row["record_json"]))
+        if tamper == "outer-tenant":
+            corrupt["event"]["tenant_id"] = "tenant-b"
+        elif tamper == "outer-event":
+            corrupt["event"]["event_id"] = "00000000-0000-4000-8000-000000000042"
+        elif tamper == "nested-tenant":
+            corrupt["event"]["canonical_transaction"]["tenant_id"] = "tenant-b"
+        elif tamper == "nested-event":
+            corrupt["event"]["canonical_transaction"]["event_id"] = (
+                "00000000-0000-4000-8000-000000000042"
+            )
+        else:
+            corrupt["event"]["adapter"]["adapter_type"] = "reference-json"
+        db.execute(
+            "UPDATE pending_evaluations SET record_json=%s "
+            "WHERE tenant_id=%s AND event_id=%s",
+            (dumps(corrupt), TENANT, str(original.event_id)),
+        )
+        db.commit()
+        with pytest.raises(ValueError, match="persisted pending identity or adapter mismatch"):
+            pending.enqueue(original, enqueued_at=stale, policy=POLICY)
+        assert db.execute(
+            "SELECT count(*) AS n FROM shadow_evaluations"
+        ).fetchone()["n"] == 0
+        # The same SQL-keyed poison is then safely quarantined by the due worker.
+        claimed = PostgresPendingEvaluationStore(
+            db, tenant_ids=(TENANT,), worker_id="readback-recovered",
+        ).due(datetime.now(UTC))
+        assert claimed == ()
+        assert db.execute(
+            "SELECT count(*) AS n FROM pending_evaluations WHERE terminal"
+        ).fetchone()["n"] == 1
+        assert db.execute(
+            "SELECT count(*) AS n FROM dead_letters"
+        ).fetchone()["n"] == 1
+
+
+@pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+def test_legacy_unbound_adapter_contract_is_not_inferred_from_pending_json(
+    installation,
+) -> None:
+    """Pre-migration rows without independently bound adapter policy fail closed."""
+    with workflow.connect(installation) as db:
+        for migration in (
+            "005_create_dead_letters.sql",
+            "007_create_pending_evaluations.sql",
+            "008_pending_lease_fencing.sql",
+            "009_pending_terminal_state.sql",
+            "020_pending_adapter_contract.sql",
+        ):
+            db.execute((alerts.MIGRATIONS / migration).read_text())
+    receipt = IngestionService({
+        "synthetic-shadow-copy": SyntheticShadowCopyAdapter(),
+    }).ingest(_synthetic_copy())
+    assert receipt.envelope is not None
+    with workflow.connect(installation) as db:
+        pending = PostgresPendingEvaluationStore(
+            db, tenant_ids=(TENANT,), worker_id="legacy-seed",
+            lease_ttl=timedelta(seconds=1),
+        )
+        pending.enqueue(
+            receipt.envelope,
+            enqueued_at=datetime.now(UTC) - timedelta(minutes=10),
+            policy=POLICY,
+        )
+        db.execute(
+            "UPDATE pending_evaluations "
+            "SET adapter_type=NULL, adapter_schema_version=NULL "
+            "WHERE tenant_id=%s AND event_id=%s",
+            (TENANT, str(receipt.envelope.event_id)),
+        )
+        db.commit()
+        assert pending.due(datetime.now(UTC)) == ()
+        assert db.execute(
+            "SELECT count(*) AS n FROM pending_evaluations WHERE terminal"
+        ).fetchone()["n"] == 1
+        assert db.execute(
+            "SELECT count(*) AS n FROM dead_letters"
+        ).fetchone()["n"] == 1
