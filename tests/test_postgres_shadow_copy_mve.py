@@ -7,7 +7,7 @@ No payment action is dispatched; the synthetic incumbent is never modified.
 from __future__ import annotations
 
 from datetime import timedelta
-from json import dumps
+from json import dumps, loads
 from uuid import uuid4
 
 import pytest
@@ -22,7 +22,7 @@ from test_postgres_case_writer_bridge import (
     IngressAudit,
     principal,
 )
-from test_postgres_evaluations import envelope, inbound_for
+from test_postgres_evaluations import POLICY, envelope, inbound_for
 
 from gasha.api.main import app
 from gasha.cases.evaluation_alerts import (
@@ -429,7 +429,7 @@ def test_receipt_feature_evidence_is_atomic_with_shadow_alert_and_case(installat
     )
     with workflow.connect(installation) as db:
         orchestrator = ShadowOrchestrator(
-            {TENANT: workflow.POLICY},
+            {TENANT: POLICY},
             persistence=PostgresEvaluationPersistence(db, alerts=writer),
         )
         result = orchestrator.evaluate(
@@ -484,7 +484,7 @@ def test_receipt_feature_evidence_is_atomic_with_shadow_alert_and_case(installat
             "WHERE tenant_id = %s AND event_id = %s",
             (TENANT, assessment.event_id),
         ).fetchone()["record_json"]
-        tampered = dict(original) if isinstance(original, dict) else __import__("json").loads(original)
+        tampered = dict(original) if isinstance(original, dict) else loads(original)
         tampered["feature_evidence"]["source_fingerprint"] = "0" * 64
         with pytest.raises(ValueError, match="digest mismatch"):
             ShadowEvaluationRecord.model_validate(tampered)
