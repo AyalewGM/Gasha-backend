@@ -51,7 +51,7 @@ def test_evidence_is_atomic_record_content_not_a_free_form_analyst_claim():
 
 @pytest.mark.parametrize("change", [
     "wrong_tenant", "wrong_event", "wrong_cutoff", "altered_envelope",
-    "altered_source_digest", "altered_lineage_ref", "enforcing_mode",
+    "altered_lineage_ref", "enforcing_mode",
 ])
 def test_untrusted_lineage_substitution_rejected_before_evaluation(change):
     assessment = _assessed()
@@ -67,14 +67,6 @@ def test_untrusted_lineage_substitution_rejected_before_evaluation(change):
         )
     elif change == "altered_envelope":
         event = event.model_copy(update={"evidence_reason_codes": ("FORGED",)})
-    elif change == "altered_source_digest":
-        candidate = replace(assessment, source_fingerprint="0" * 64)
-        # A fabricated assessment can only be detected when an independent
-        # verified source snapshot is supplied. This check asserts internal
-        # field-binding, not Bank attestation.
-        forged = SyntheticFeatureEvidenceV1.from_assessment(candidate)
-        assert forged.source_fingerprint != assessment.source_fingerprint
-        return
     elif change == "altered_lineage_ref":
         original = SyntheticFeatureEvidenceV1.from_assessment(assessment)
         edited = original.model_copy(update={"lineage_ref": "0" * 64})
@@ -88,6 +80,22 @@ def test_untrusted_lineage_substitution_rejected_before_evaluation(change):
     with pytest.raises(ValueError, match="mismatch|untrusted|invalid"):
         workflow.evaluate(event, feature_assessment=candidate)
     assert workflow.evaluations.get(assessment.tenant_id, assessment.event_id) is None
+
+
+def test_forged_in_process_source_digest_is_not_bank_attestation():
+    """Content consistency cannot authenticate a forged in-process assessment.
+
+    The configured synthetic provider snapshot must supply source authority;
+    caller-controlled hashes, however internally consistent, are not proof.
+    """
+    assessment = _assessed()
+    fabricated = replace(assessment, source_fingerprint="0" * 64)
+    forged = SyntheticFeatureEvidenceV1.from_assessment(fabricated)
+    honest = SyntheticFeatureEvidenceV1.from_assessment(assessment)
+    assert forged.source_fingerprint != honest.source_fingerprint
+    assert forged.lineage_ref != honest.lineage_ref
+    # A self-consistent fabricated hash alone cannot be rejected here.
+    # Do not use this component in isolation as a Bank-trusted source check.
 
 
 def test_changed_receipt_or_available_source_changes_lineage_identity():
