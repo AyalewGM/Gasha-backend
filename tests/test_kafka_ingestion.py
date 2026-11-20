@@ -799,7 +799,7 @@ def test_json_wire_shadow_copy_receipt_offset_survives_worker(
     assert len(seen) == 1
     assert seen[0].received_at == datetime(2026, 11, 20, 12, tzinfo=UTC)
     assert seen[0].operating_mode is OperatingMode.SHADOW
-    assert seen[0].intelligence.transaction_risk is None
+    assert seen[0].intelligence.transaction_risk == 0.0
     assert dead_letters.records == ()
 
 
