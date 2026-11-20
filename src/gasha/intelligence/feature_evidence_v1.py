@@ -67,6 +67,10 @@ class SyntheticFeatureEvidenceV1(BaseModel):
 
     @model_validator(mode="after")
     def validate_shape(self) -> Self:
+        self._require_valid()
+        return self
+
+    def _require_valid(self) -> None:
         if (
             self.version != ASSESSMENT_VERSION
             or type(self.tenant_id) is not str
@@ -107,7 +111,6 @@ class SyntheticFeatureEvidenceV1(BaseModel):
             self.model_dump(mode="python", exclude={"lineage_ref"})
         ):
             raise ValueError("synthetic feature evidence digest mismatch")
-        return self
 
     @classmethod
     def from_assessment(cls, assessment: FeatureAssessmentV1) -> Self:
@@ -134,12 +137,12 @@ class SyntheticFeatureEvidenceV1(BaseModel):
             "nonprior_observations": assessment.nonprior_observations,
             "unavailable_signals": assessment.unavailable_signals,
         }
-        evidence = cls(**fields, lineage_ref=_lineage_ref(fields))
+        evidence = cls.model_validate({**fields, "lineage_ref": _lineage_ref(fields)})
         evidence.assert_matches_event(event)
         return evidence
 
     def assert_matches_event(self, event: FraudEventEnvelope) -> None:
-        self.validate_shape()
+        self._require_valid()
         if type(event) is not FraudEventEnvelope:
             raise ValueError("invalid synthetic evidence event")
         transaction = event.canonical_transaction
