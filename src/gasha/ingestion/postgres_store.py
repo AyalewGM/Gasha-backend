@@ -431,9 +431,36 @@ class PostgresPendingEvaluationStore:
                             ),
                         )
                     except (ValueError, TypeError):
-                        # The database row identity is authoritative for this
-                        # *synthetic* ledger; never trust the corrupt JSON for
-                        # scope, event identity, raw details or provenance.
+                        # A crash after the atomic evaluation commit but before
+                        # pending.complete() can leave a stale pending row.
+                        # Migration 020 deliberately left older adapter columns
+                        # NULL, so do NOT deserialize/execute that row. If the
+                        # same SQL tenant/event already has a committed
+                        # evaluation, retire only the fenced pending entry.
+                        # Never turn a successful evaluation into a false DLQ
+                        # or block a healthy neighbor's claim.
+                        cursor.execute(
+                            """
+                            DELETE FROM pending_evaluations AS pe
+                            WHERE pe.tenant_id = %s AND pe.event_id = %s
+                              AND pe.leased_by = %s AND pe.lease_token = %s
+                              AND NOT pe.terminal
+                              AND EXISTS (
+                                  SELECT 1 FROM shadow_evaluations AS se
+                                  WHERE se.tenant_id = pe.tenant_id
+                                    AND se.event_id = pe.event_id
+                              )
+                            """,
+                            (
+                                tenant_id, event_id, self._worker_id,
+                                str(row["lease_token"]),
+                            ),
+                        )
+                        if cursor.rowcount == 1:
+                            continue
+                        # For an unevaluated malformed record the database row
+                        # identity is authoritative. Minimize rejection
+                        # evidence; never trust its corrupt JSON for provenance.
                         cursor.execute(
                             """
                             UPDATE pending_evaluations AS pe
