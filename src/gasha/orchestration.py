@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Protocol, Self
 from uuid import UUID
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from gasha.decision.audit import (
     DecisionAuditRecord,
@@ -38,7 +38,10 @@ class ShadowEvaluationRecord(BaseModel):
     evaluation: DecisionEnvelope
     persisted_at: datetime
     journey: JourneyAssessment | None = None
-    feature_evidence: SyntheticFeatureEvidenceV1 | None = None
+    # Keep pre-existing serialized evaluation/content digests byte-stable.
+    feature_evidence: SyntheticFeatureEvidenceV1 | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def validate_feature_evidence(self) -> Self:
