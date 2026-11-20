@@ -45,7 +45,7 @@ def tx(*, tenant: str = "tenant-a", channel: str = "mobile") -> CanonicalTransac
         occurred_at=datetime(2026, 1, 1, 9, tzinfo=UTC),
         channel=channel,
         transaction_type="transfer",
-        amount=Decimal("500"),
+        amount=Decimal(500),
         currency="ETB",
         sender_customer_id="customer-1",
         sender_account_id="account-1",
