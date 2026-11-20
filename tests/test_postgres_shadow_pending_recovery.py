@@ -56,6 +56,7 @@ def test_acknowledged_shadow_copy_recovers_from_postgres_without_broker_redelive
             "007_create_pending_evaluations.sql",
             "008_pending_lease_fencing.sql",
             "009_pending_terminal_state.sql",
+            "020_pending_adapter_contract.sql",
         ):
             db.execute((alerts.MIGRATIONS / migration).read_text())
 
@@ -271,6 +272,8 @@ def test_pending_clock_fails_closed_before_any_custom_timezone_callback() -> Non
         "tenant-substitution",
         "nested-tenant-substitution",
         "nested-event-id-substitution",
+        "adapter-only-relabel",
+        "adapter-and-naive-clock-relabel",
     ],
 )
 @pytest.mark.parametrize("forced_dlq_failure", [False, True])
@@ -289,6 +292,7 @@ def test_poison_pending_row_is_quarantined_without_blocking_healthy_recovery(
             "007_create_pending_evaluations.sql",
             "008_pending_lease_fencing.sql",
             "009_pending_terminal_state.sql",
+            "020_pending_adapter_contract.sql",
         ):
             db.execute((alerts.MIGRATIONS / migration).read_text())
 
@@ -325,6 +329,11 @@ def test_poison_pending_row_is_quarantined_without_blocking_healthy_recovery(
             malformed["event"]["canonical_transaction"]["event_id"] = (
                 "00000000-0000-4000-8000-000000000042"
             )
+        elif tamper in ("adapter-only-relabel", "adapter-and-naive-clock-relabel"):
+            malformed["event"]["adapter"]["adapter_type"] = "reference-json"
+            malformed["event"]["adapter"]["schema_version"] = "1.0"
+            if tamper == "adapter-and-naive-clock-relabel":
+                malformed["event"]["received_at"] = "2026-11-20T12:15:00"
         else:
             pytest.fail(f"unknown synthetic tamper case: {tamper}")
         db.execute(
@@ -441,6 +450,7 @@ def test_reference_naive_receipt_survives_enqueue_and_fresh_pending_claim(
             "007_create_pending_evaluations.sql",
             "008_pending_lease_fencing.sql",
             "009_pending_terminal_state.sql",
+            "020_pending_adapter_contract.sql",
         ):
             db.execute((alerts.MIGRATIONS / migration).read_text())
 
@@ -465,6 +475,15 @@ def test_reference_naive_receipt_survives_enqueue_and_fresh_pending_claim(
         )
         assert saved.event.received_at == naive
         assert saved.event.received_at.tzinfo is None
+        contract = db.execute(
+            "SELECT adapter_type, adapter_schema_version FROM pending_evaluations "
+            "WHERE tenant_id=%s AND event_id=%s",
+            (TENANT, str(receipt.envelope.event_id)),
+        ).fetchone()
+        assert contract is not None
+        assert (contract["adapter_type"], contract["adapter_schema_version"]) == (
+            "reference-json", "1.0",
+        )
 
     with workflow.connect(installation) as db:
         pending = PostgresPendingEvaluationStore(
