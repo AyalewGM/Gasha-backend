@@ -20,8 +20,8 @@ T = datetime(2026, 11, 14, 12, tzinfo=UTC)
 POLICY = InternalGraphPolicy(policy_version="synthetic-graph-v1")
 
 
-def normalized(*, tenant="synthetic-a", device="device-x"):
-    event_id = str(uuid4())
+def normalized(*, tenant="synthetic-a", device="device-x", source="synthetic-shadow-copy", event_id=None):
+    event_id = str(event_id or uuid4())
     raw = {
         "event_id": event_id,
         "occurred_at": T.isoformat(),
@@ -39,11 +39,11 @@ def normalized(*, tenant="synthetic-a", device="device-x"):
     if device is not None:
         raw["device_id"] = device
     copy = InboundBankEvent(
-        tenant_id=tenant, source_system="synthetic-shadow-copy",
+        tenant_id=tenant, source_system=source,
         schema_version=SHADOW_COPY_SCHEMA, payload=raw,
         received_at=T + timedelta(seconds=1),
     )
-    return SyntheticShadowCopyAdapter().adapt(copy)
+    return SyntheticShadowCopyAdapter(source_system=source).adapt(copy)
 
 
 def history(*, tenant="synthetic-a"):
@@ -124,6 +124,67 @@ def test_other_cutoff_event_policy_and_tenant_produce_separate_identity():
     other_policy = InternalGraphPolicy(policy_version="synthetic-graph-v2")
     updated = assess_synthetic_shadow_features(event, history(), policy=other_policy)
     assert updated.computation_fingerprint != first.computation_fingerprint
+
+
+
+def test_configured_source_is_bound_to_both_fingerprints_without_attestation():
+    same_event_id = uuid4()
+    source_a = normalized(source="synthetic-source-a", event_id=same_event_id)
+    source_b = normalized(source="synthetic-source-b", event_id=same_event_id)
+    assert source_a.canonical_transaction == source_b.canonical_transaction
+    assert source_a.received_at == source_b.received_at
+    first = assess(source_a, history())
+    second = assess(source_b, history())
+    assert first.feature_set == second.feature_set
+    assert first.source_fingerprint != second.source_fingerprint
+    assert first.computation_fingerprint != second.computation_fingerprint
+    malformed = source_a.model_copy(update={
+        "adapter": source_a.adapter.model_copy(update={"source_system": "unbounded/source"}),
+    })
+    with pytest.raises(ValueError, match="untrusted"):
+        assess(malformed, history())
+
+
+def test_incomplete_graph_coverage_is_unavailable_not_a_measured_zero():
+    event = normalized()
+    complete = assess_synthetic_shadow_features(
+        event, (), policy=POLICY, relationship_history_complete=True,
+    )
+    assert complete.feature_set.beneficiary_unique_senders_1h == 0
+    assert complete.assessed_envelope.evidence_reason_codes == ("NO_INTERNAL_GRAPH_SIGNAL",)
+    assert "beneficiary_unique_senders_1h" not in complete.unavailable_signals
+
+    incomplete = assess_synthetic_shadow_features(
+        event, (), policy=POLICY, relationship_history_complete=False,
+    )
+    assert incomplete.feature_set.beneficiary_unique_senders_1h is None
+    assert "beneficiary_unique_senders_1h" in incomplete.feature_set.missing
+    assert "beneficiary_unique_senders_1h" in incomplete.unavailable_signals
+    assert incomplete.assessed_envelope.evidence_reason_codes == (
+        "UNAVAILABLE_BENEFICIARY_FAN_IN",
+    )
+    assert incomplete.assessed_envelope.intelligence == IntelligenceSnapshot()
+    assert incomplete.computation_fingerprint != complete.computation_fingerprint
+    assert (
+        incomplete.feature_set.computation_fingerprint
+        != complete.feature_set.computation_fingerprint
+    )
+
+    # Non-empty partial history is not a complete cohort or a safe zero.
+    partial = assess_synthetic_shadow_features(
+        event, history(), policy=POLICY, relationship_history_complete=False,
+    )
+    confirmed = assess_synthetic_shadow_features(
+        event, history(), policy=POLICY, relationship_history_complete=True,
+    )
+    assert partial.feature_set.beneficiary_unique_senders_1h is None
+    assert partial.assessed_envelope.evidence_reason_codes == (
+        "UNAVAILABLE_BENEFICIARY_FAN_IN",
+    )
+    assert confirmed.feature_set.beneficiary_unique_senders_1h == 5
+    assert confirmed.assessed_envelope.intelligence.network_risk == 0.86
+    assert partial.source_fingerprint == confirmed.source_fingerprint
+    assert partial.computation_fingerprint != confirmed.computation_fingerprint
 
 
 def test_missing_optional_device_is_explicit_not_a_measured_zero():
