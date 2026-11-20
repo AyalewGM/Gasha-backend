@@ -16,7 +16,11 @@ from gasha.domain.models import (
 )
 from gasha.ingestion.contracts import InboundBankEvent
 from gasha.ingestion.errors import EventRejection, RejectionReason
-from gasha.ingestion.service import IngestionOutcome, IngestionService
+from gasha.ingestion.service import (
+    IngestionOutcome,
+    IngestionService,
+    InMemoryDeadLetterSink,
+)
 from gasha.ingestion.shadow_copy import (
     SHADOW_COPY_SCHEMA,
     SyntheticShadowCopyAdapter,
@@ -188,3 +192,54 @@ def test_no_event_or_bank_access_occurs_on_ingestion_failure() -> None:
     assert result.outcome is IngestionOutcome.REJECTED
     assert result.envelope is None
     assert result.rejection is not None
+
+
+@pytest.mark.parametrize(
+    "changes,marker,reason",
+    [
+        (
+            {"event_id": "sensitiveaccount123"},
+            "sensitiveaccount123",
+            RejectionReason.INVALID_SCHEMA,
+        ),
+        (
+            {"beneficiary_type": "sensitivebeneficiary123"},
+            "sensitivebeneficiary123",
+            RejectionReason.INVALID_SCHEMA,
+        ),
+        (
+            {
+                "beneficiary_id": "sensitivebeneficiary123",
+                "destination_institution_id": None,
+            },
+            "sensitivebeneficiary123",
+            RejectionReason.NORMALIZATION_FAILURE,
+        ),
+    ],
+)
+def test_invalid_copy_identifiers_never_leak_to_rejection_dead_letter_or_audit(
+    changes: dict[str, object], marker: str, reason: RejectionReason
+) -> None:
+    # Exercise token-valid values that previously reached reference normalization.
+    # Its general-purpose rejector echoes raw values; the synthetic boundary must
+    # not let those values escape through any returned or stored error record.
+    dead_letters = InMemoryDeadLetterSink()
+    ingestion = IngestionService(
+        {"synthetic-shadow-copy": SyntheticShadowCopyAdapter()},
+        dead_letters=dead_letters,
+    )
+    result = ingestion.ingest(inbound(fields=payload(**changes)))
+    assert result.outcome is IngestionOutcome.REJECTED
+    assert result.envelope is None
+    assert result.rejection is not None
+    assert result.rejection.reason is reason
+    assert result.rejection.event_id is None
+    assert len(dead_letters.records) == 1
+    assert dead_letters.records[0] == result.rejection
+    # These are the serializable error and audit/dead-letter representations.
+    for evidence in (
+        result.rejection.model_dump_json(),
+        dead_letters.records[0].model_dump_json(),
+        repr(dead_letters.records[0]),
+    ):
+        assert marker not in evidence
