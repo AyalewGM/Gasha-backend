@@ -1,10 +1,13 @@
 """Issue #147 inert tenant configuration kernel tests; never bank authority."""
 
 from dataclasses import replace
+from json import dumps, loads
 from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any
 
 import pytest
+
+from gasha.domain.models import DecisionPolicy
 
 from gasha.configuration.kernel import (
     ConfigKind,
@@ -354,3 +357,154 @@ def test_nonfinite_stored_json_rejected_even_with_matching_digest() -> None:
     row["content_digest"] = content_digest(ConfigKind.DECISION_POLICY, content)
     with pytest.raises(TenantConfigRejected):
         decode_row(row)
+
+
+def test_legacy_and_default_off_expanded_policy_keep_distinct_stable_digests() -> None:
+    legacy = canonical_content(ConfigKind.DECISION_POLICY, POLICY)
+    assert legacy == dumps(POLICY, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    original = draft()
+    assert original.content_json == legacy
+    assert original.content_digest == content_digest(ConfigKind.DECISION_POLICY, legacy)
+    assert decode_row(row_of(original)) == original
+
+    expanded = DecisionPolicy(
+        configuration_version="cfg-1", policy_version="policy-1", rule_version="rules-1"
+    ).model_dump(mode="json")
+    assert expanded["challenge_threshold"] is None
+    assert expanded["challenge_supported_channels"] == []
+    assert expanded["challenge_policy_ref"] is None
+    copy = draft(payload=expanded)
+    assert loads(copy.content_json) == expanded
+    assert copy.content_digest != original.content_digest
+    assert decode_row(row_of(copy)) == copy
+    assert draft().content_json == original.content_json
+    assert draft().content_digest == original.content_digest
+
+
+def test_enabled_challenge_policy_draft_activation_retirement_and_replay_identity() -> None:
+    expanded = DecisionPolicy(
+        configuration_version="cfg-2", policy_version="policy-2", rule_version="rules-2",
+        challenge_threshold=0.6,
+        challenge_supported_channels=("atm", "mobile"),
+        challenge_policy_ref="policy-lineage:step-up-v1",
+    ).model_dump(mode="json")
+    old = draft()
+    _, v1 = activate(old)
+    new = draft(2, payload=expanded)
+    assert loads(new.content_json) == expanded
+    assert new.content_digest == content_digest(ConfigKind.DECISION_POLICY, new.content_json)
+    retired_v1, v2 = plan_activation(
+        candidate=new, incumbent=v1, at=NOW + timedelta(hours=2)
+    )
+    assert retired_v1 is not None
+    assert retired_v1.content_json == old.content_json
+    assert retired_v1.content_digest == old.content_digest
+    assert decode_row(row_of(retired_v1)) == retired_v1
+    assert decode_row(row_of(v2)) == v2
+    rows = [row_of(retired_v1), row_of(v2)]
+    for instant, expected in (
+        (NOW + timedelta(hours=1), retired_v1),
+        (NOW + timedelta(hours=2), v2),
+        (NOW + timedelta(hours=3), v2),
+    ):
+        resolved = resolve_active(
+            rows, tenant_id="tenant-a", config_kind=ConfigKind.DECISION_POLICY,
+            at=instant, horizon=NOW + timedelta(hours=3),
+        )
+        assert resolved.content_digest == expected.content_digest
+        assert resolved.version == expected.version
+    retired_v2 = plan_retirement(entry=v2, at=NOW + timedelta(hours=4))
+    assert decode_row(row_of(retired_v2)) == retired_v2
+    with pytest.raises(TenantConfigRejected):
+        resolve_active(
+            [row_of(retired_v1), row_of(retired_v2)], tenant_id="tenant-a",
+            config_kind=ConfigKind.DECISION_POLICY, at=NOW + timedelta(hours=4),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("challenge_threshold", True),
+        ("challenge_threshold", "0.6"),
+        ("challenge_threshold", float("nan")),
+        ("challenge_threshold", float("inf")),
+        ("challenge_threshold", 10**400),
+        ("challenge_threshold", 0.5),
+        ("challenge_threshold", 0.7),
+        ("challenge_supported_channels", None),
+        ("challenge_supported_channels", ("mobile",)),
+        ("challenge_supported_channels", "mobile"),
+        ("challenge_supported_channels", ["mobile", "atm"]),
+        ("challenge_supported_channels", ["mobile", "mobile"]),
+        ("challenge_supported_channels", [""]),
+        ("challenge_supported_channels", [" mobile"]),
+        ("challenge_supported_channels", ["mobile bank"]),
+        ("challenge_supported_channels", [1]),
+        ("challenge_supported_channels", []),
+        ("challenge_supported_channels", [f"channel{i:02d}" for i in range(33)]),
+        ("challenge_policy_ref", None),
+        ("challenge_policy_ref", ""),
+        ("challenge_policy_ref", " ref"),
+        ("challenge_policy_ref", 7),
+    ],
+)
+def test_enabled_challenge_rejects_invalid_field(field: str, invalid: object) -> None:
+    valid = DecisionPolicy(
+        configuration_version="cfg-2", policy_version="policy-2", rule_version="rules-2",
+        challenge_threshold=0.6, challenge_supported_channels=("mobile",),
+        challenge_policy_ref="step-up-v1",
+    ).model_dump(mode="json")
+    valid[field] = invalid
+    with pytest.raises(TenantConfigRejected):
+        canonical_content(ConfigKind.DECISION_POLICY, valid)
+    with pytest.raises(TenantConfigRejected):
+        draft(payload=valid)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"challenge_threshold": None, "challenge_supported_channels": ["mobile"],
+         "challenge_policy_ref": None},
+        {"challenge_threshold": None, "challenge_supported_channels": [],
+         "challenge_policy_ref": "step-up-v1"},
+        {"challenge_threshold": 0.6, "challenge_supported_channels": [],
+         "challenge_policy_ref": "step-up-v1"},
+        {"challenge_threshold": 0.6, "challenge_supported_channels": ["mobile"],
+         "challenge_policy_ref": None},
+    ],
+)
+def test_expanded_policy_rejects_contradictory_optional_state(
+    invalid: dict[str, object],
+) -> None:
+    full = {**POLICY, **invalid}
+    with pytest.raises(TenantConfigRejected):
+        canonical_content(ConfigKind.DECISION_POLICY, full)
+
+
+def test_expanded_policy_rejects_partial_fields_and_unknown_keys() -> None:
+    expanded = DecisionPolicy(
+        configuration_version="cfg-1", policy_version="policy-1", rule_version="rules-1"
+    ).model_dump(mode="json")
+    for field in (
+        "challenge_threshold", "challenge_supported_channels", "challenge_policy_ref"
+    ):
+        partial = dict(expanded)
+        partial.pop(field)
+        with pytest.raises(TenantConfigRejected):
+            canonical_content(ConfigKind.DECISION_POLICY, partial)
+    with pytest.raises(TenantConfigRejected):
+        canonical_content(ConfigKind.DECISION_POLICY, {**expanded, "bank_approved": True})
+    # A payload cannot quietly replace a legacy entry with enabled fields,
+    # even if its stored digest was recomputed to match the substituted content.
+    original = draft()
+    bad = row_of(original)
+    bad["content_json"] = canonical_content(ConfigKind.DECISION_POLICY, expanded)
+    bad["content_digest"] = content_digest(
+        ConfigKind.DECISION_POLICY, bad["content_json"]
+    )
+    assert decode_row(bad) != original
+    bad["content_digest"] = original.content_digest
+    with pytest.raises(TenantConfigRejected):
+        decode_row(bad)
