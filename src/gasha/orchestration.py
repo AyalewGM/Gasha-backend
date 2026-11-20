@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from gasha.decision.audit import (
     DecisionAuditRecord,
@@ -14,8 +14,10 @@ from gasha.decision.audit import (
     audit_record,
 )
 from gasha.decision.mode import DecisionEnvelope, ModeAwareDecisionService
-from gasha.domain.models import DecisionPolicy
+from gasha.domain.models import DecisionAction, DecisionPolicy, OperatingMode
 from gasha.ingestion.contracts import FraudEventEnvelope
+from gasha.intelligence.feature_assessment_v1 import FeatureAssessmentV1
+from gasha.intelligence.feature_evidence_v1 import SyntheticFeatureEvidenceV1
 from gasha.journey.detector import JourneyAssessment
 from gasha.journey.provider import JourneyIntelligence
 from gasha.observability.metrics import MetricsRegistry
@@ -36,6 +38,18 @@ class ShadowEvaluationRecord(BaseModel):
     evaluation: DecisionEnvelope
     persisted_at: datetime
     journey: JourneyAssessment | None = None
+    feature_evidence: SyntheticFeatureEvidenceV1 | None = None
+
+    @model_validator(mode="after")
+    def validate_feature_evidence(self):
+        if self.feature_evidence is not None:
+            self.feature_evidence.assert_matches_event(self.event)
+            if (
+                self.evaluation.operating_mode is not OperatingMode.SHADOW
+                or self.evaluation.effective_action is not DecisionAction.NO_ACTION_SHADOW
+            ):
+                raise ValueError("feature evidence requires a non-enforcing shadow evaluation")
+        return self
 
 
 class ShadowEvaluationRepository(Protocol):
@@ -129,9 +143,23 @@ class ShadowOrchestrator:
         self,
         event: FraudEventEnvelope,
         policy: DecisionPolicy | None = None,
+        *,
+        feature_assessment: FeatureAssessmentV1 | None = None,
     ) -> DecisionEnvelope:
         """Evaluate under ``policy`` when given (pinned replay snapshot)
         else the tenant's currently registered policy."""
+        # Explicit trusted in-process synthetic assessment only. Neither JSON
+        # nor protected API can supply lineage or select an enforcing mode.
+        feature_evidence = None
+        if feature_assessment is not None:
+            if (
+                type(feature_assessment) is not FeatureAssessmentV1
+                or event != feature_assessment.assessed_envelope
+            ):
+                raise ValueError("synthetic feature assessment mismatch")
+            feature_evidence = SyntheticFeatureEvidenceV1.from_assessment(
+                feature_assessment
+            )
         resolved = policy or self._policies.get(event.tenant_id)
         if resolved is None:
             raise MissingTenantPolicyError(
@@ -179,6 +207,7 @@ class ShadowOrchestrator:
             evaluation=evaluation,
             persisted_at=self._clock(),
             journey=assessment,
+            feature_evidence=feature_evidence,
         )
         audit = audit_record(
             evaluation.decision,
