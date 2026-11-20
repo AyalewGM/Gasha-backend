@@ -114,25 +114,25 @@ class SyntheticFeatureEvidenceV1(BaseModel):
         if type(assessment) is not FeatureAssessmentV1:
             raise ValueError("trusted synthetic feature assessment required")
         event = assessment.assessed_envelope
-        fields: dict[str, object] = dict(
-            version=ASSESSMENT_VERSION,
-            tenant_id=assessment.tenant_id,
-            event_id=assessment.event_id,
-            decision_as_of=assessment.decision_as_of,
-            source_fingerprint=assessment.source_fingerprint,
-            computation_fingerprint=assessment.computation_fingerprint,
-            feature_set_version=assessment.feature_set.version,
-            canonical_transaction_fingerprint=_digest([
+        fields: dict[str, object] = {
+            "version": ASSESSMENT_VERSION,
+            "tenant_id": assessment.tenant_id,
+            "event_id": assessment.event_id,
+            "decision_as_of": assessment.decision_as_of,
+            "source_fingerprint": assessment.source_fingerprint,
+            "computation_fingerprint": assessment.computation_fingerprint,
+            "feature_set_version": assessment.feature_set.version,
+            "canonical_transaction_fingerprint": _digest([
                 "gasha-synthetic-canonical-transaction-v1",
                 event.canonical_transaction.model_dump(mode="json"),
             ]),
-            assessed_event_fingerprint=_digest([
+            "assessed_event_fingerprint": _digest([
                 "gasha-synthetic-assessed-envelope-v1", event.model_dump(mode="json"),
             ]),
-            eligible_observations=assessment.eligible_observations,
-            late_observations=assessment.late_observations,
-            nonprior_observations=assessment.nonprior_observations,
-            unavailable_signals=assessment.unavailable_signals,
+            "eligible_observations": assessment.eligible_observations,
+            "late_observations": assessment.late_observations,
+            "nonprior_observations": assessment.nonprior_observations,
+            "unavailable_signals": assessment.unavailable_signals,
         )
         evidence = cls(**fields, lineage_ref=_lineage_ref(fields))
         evidence.assert_matches_event(event)
