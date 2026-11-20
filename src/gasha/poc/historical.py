@@ -22,9 +22,11 @@ from gasha.domain.models import (
 )
 from gasha.poc.outcomes import IncumbentControlOutcome, OutcomeRecord
 
+# Step-up recommendation is friction, not an observed analyst alert or
+# confirmed fraud intervention. Missing Bank execution/settlement evidence
+# cannot receive TP/alert credit during offline replay.
 ALERT_ACTIONS = frozenset(
     {
-        DecisionAction.CHALLENGE,
         DecisionAction.REVIEW,
         DecisionAction.HOLD,
         DecisionAction.BLOCK,

@@ -79,6 +79,12 @@ class DecisionPolicy(BaseModel):
     rule_version: str = Field(min_length=1)
     model_version: str | None = None
     monitor_threshold: RiskScore = 0.50
+    # A CHALLENGE is a recommendation, never Bank execution authority.
+    # All three fields default off. The reference is configuration lineage,
+    # NOT proof of a Bank signature, permission or executed step-up.
+    challenge_threshold: RiskScore | None = None
+    challenge_supported_channels: tuple[str, ...] = ()
+    challenge_policy_ref: str | None = None
     review_threshold: RiskScore = 0.70
     hold_threshold: RiskScore = 0.85
     block_threshold: RiskScore = 0.95
@@ -93,6 +99,24 @@ class DecisionPolicy(BaseModel):
         )
         if thresholds != tuple(sorted(thresholds)) or len(set(thresholds)) != len(thresholds):
             raise ValueError("decision thresholds must be strictly increasing")
+        challenge = self.challenge_threshold
+        channels = self.challenge_supported_channels
+        approval_ref = self.challenge_policy_ref
+        if challenge is None:
+            if channels or approval_ref is not None:
+                raise ValueError("challenge configuration requires an explicit threshold")
+        else:
+            if not self.monitor_threshold < challenge < self.review_threshold:
+                raise ValueError("challenge threshold must sit strictly between monitor and review")
+            if not channels or not approval_ref:
+                raise ValueError("challenge requires supported channels and policy reference")
+            if (
+                tuple(sorted(set(channels))) != channels
+                or any(not channel or channel != channel.strip() for channel in channels)
+            ):
+                raise ValueError("challenge channels must be unique, sorted and nonblank")
+            if approval_ref != approval_ref.strip():
+                raise ValueError("challenge policy reference must be trimmed")
         return self
 
 

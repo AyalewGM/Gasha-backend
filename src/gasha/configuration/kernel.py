@@ -24,6 +24,8 @@ from zoneinfo import ZoneInfo
 _TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _REF = re.compile(r"[0-9a-f]{64}\Z")
 _SCHEMA = "gasha-tenant-config-v1"
+# Both shapes remain valid, so existing eight-field persisted bytes and
+# their historical content digests never change on re-read.
 _DECISION_POLICY_KEYS = frozenset(
     {
         "configuration_version",
@@ -36,6 +38,14 @@ _DECISION_POLICY_KEYS = frozenset(
         "block_threshold",
     }
 )
+_CHALLENGE_POLICY_KEYS = frozenset(
+    {
+        "challenge_threshold",
+        "challenge_supported_channels",
+        "challenge_policy_ref",
+    }
+)
+_EXPANDED_DECISION_POLICY_KEYS = _DECISION_POLICY_KEYS | _CHALLENGE_POLICY_KEYS
 _POLICY_VERSION_FIELDS = (
     "configuration_version",
     "policy_version",
@@ -124,9 +134,12 @@ def _number(name: str, value: object) -> float:
 
 
 def _validate_decision_policy(payload: object) -> None:
-    if type(payload) is not dict or frozenset(payload) != _DECISION_POLICY_KEYS:
+    if type(payload) is not dict:
+        raise TenantConfigRejected("decision_policy must be a plain JSON object")
+    fields = frozenset(payload)
+    if fields not in (_DECISION_POLICY_KEYS, _EXPANDED_DECISION_POLICY_KEYS):
         raise TenantConfigRejected(
-            "decision_policy content must carry exactly the DecisionPolicy fields"
+            "decision_policy content must carry exactly the legacy or expanded fields"
         )
     for field in _POLICY_VERSION_FIELDS:
         _tag(field, payload[field])
@@ -136,6 +149,33 @@ def _validate_decision_policy(payload: object) -> None:
     thresholds = [_number(name, payload[name]) for name in _THRESHOLD_FIELDS]
     if thresholds != sorted(thresholds) or len(set(thresholds)) != len(thresholds):
         raise TenantConfigRejected("decision thresholds must be strictly increasing")
+
+    if fields == _DECISION_POLICY_KEYS:
+        # The old schema has no step-up capability. Preserve its canonical bytes.
+        return
+
+    # Pydantic's DecisionPolicy.model_dump(mode="json") emits a JSON list for
+    # tuple[str, ...]. This inert kernel validates its on-disk representation;
+    # it does not grant bank approval, route a challenge or select a runtime policy.
+    challenge = payload["challenge_threshold"]
+    channels = payload["challenge_supported_channels"]
+    policy_ref = payload["challenge_policy_ref"]
+    if type(channels) is not list or len(channels) > 32:
+        raise TenantConfigRejected("challenge channels must be a bounded JSON array")
+    for channel in channels:
+        _tag("challenge channel", channel)
+    if channels != sorted(set(channels)):
+        raise TenantConfigRejected("challenge channels must be sorted and unique")
+    if challenge is None:
+        if channels or policy_ref is not None:
+            raise TenantConfigRejected("disabled challenge requires empty channels and no reference")
+        return
+    score = _number("challenge_threshold", challenge)
+    if not thresholds[0] < score < thresholds[1]:
+        raise TenantConfigRejected("challenge threshold must be between monitor and review")
+    if not channels:
+        raise TenantConfigRejected("enabled challenge requires supported channels")
+    _tag("challenge_policy_ref", policy_ref)
 
 
 def _scalar(name: str, value: object) -> None:

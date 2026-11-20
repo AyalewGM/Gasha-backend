@@ -60,7 +60,13 @@ def replay(policy: DecisionPolicy, cases: tuple[SyntheticReplayCase, ...]) -> Re
             case.intelligence,
             evidence_reason_codes=case.evidence_reason_codes,
         )
-        alerted = decision.action not in {DecisionAction.ALLOW, DecisionAction.MONITOR}
+        # A CHALLENGE recommendation is neither an analyst alert nor proof
+        # of a Bank-executed step-up.
+        alerted = decision.action in {
+            DecisionAction.REVIEW,
+            DecisionAction.HOLD,
+            DecisionAction.BLOCK,
+        }
         if alerted and case.expected_fraud:
             tp += 1
         elif alerted:

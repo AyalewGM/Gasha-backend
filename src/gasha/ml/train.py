@@ -92,6 +92,7 @@ def _operating_thresholds(
     y = [bool(label) for label in labels]
     review, _ = threshold_for_fpr(scores, y, target_fpr)
     monitor, _ = threshold_for_fpr(scores, y, min(1.0, target_fpr * 4.0))
+    challenge, _ = threshold_for_fpr(scores, y, min(1.0, target_fpr * 2.0))
     hold, _ = threshold_for_fpr(scores, y, target_fpr / 4.0)
     block, _ = threshold_for_fpr(scores, y, target_fpr / 16.0)
     if not 0.0 < review < 1.0:
@@ -104,8 +105,14 @@ def _operating_thresholds(
         block = review + 2.0 * (1.0 - review) / 3.0
     if monitor >= review or review >= hold or hold >= block:
         raise TrainingRejected("operating thresholds are not realizable")
+    # The suggested intermediate point cannot activate step-up: the
+    # server-selected DecisionPolicy still requires channel + policy lineage.
+    challenge_suggestion = (
+        min(1.0, challenge) if monitor < challenge < review else None
+    )
     thresholds = OperatingThresholds(
         monitor_threshold=min(1.0, monitor),
+        challenge_threshold=challenge_suggestion,
         review_threshold=min(1.0, review),
         hold_threshold=min(1.0, hold),
         block_threshold=min(1.0, block),

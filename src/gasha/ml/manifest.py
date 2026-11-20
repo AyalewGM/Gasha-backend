@@ -29,6 +29,8 @@ class OperatingThresholds(BaseModel):
     """Suggested ``DecisionPolicy`` thresholds derived at training time."""
 
     monitor_threshold: RiskScore
+    # Training output is advisory only; it cannot enable a tenant/channel.
+    challenge_threshold: RiskScore | None = None
     review_threshold: RiskScore
     hold_threshold: RiskScore
     block_threshold: RiskScore
@@ -45,6 +47,11 @@ class OperatingThresholds(BaseModel):
             thresholds
         ):
             raise ValueError("operating thresholds must be strictly increasing")
+        challenge = self.challenge_threshold
+        if challenge is not None and not (
+            self.monitor_threshold < challenge < self.review_threshold
+        ):
+            raise ValueError("challenge threshold must sit strictly between monitor and review")
         return self
 
 
