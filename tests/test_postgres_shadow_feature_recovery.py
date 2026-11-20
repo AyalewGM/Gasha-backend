@@ -5,7 +5,7 @@ broker/Bank isolation or source authenticity. No Bank feed or payment actions.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from json import dumps
 from uuid import UUID
 
@@ -40,6 +40,7 @@ from gasha.postgres_evaluations import (
 )
 from gasha.security.access import Capability
 
+schema = alerts.schema
 installation = workflow.installation
 
 
