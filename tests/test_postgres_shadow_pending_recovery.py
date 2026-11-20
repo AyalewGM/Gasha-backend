@@ -342,11 +342,11 @@ def test_poison_pending_row_is_quarantined_without_blocking_healthy_recovery(
             # terminalization and the healthy row's lease claim.
             db.execute("""
                 CREATE FUNCTION reject_synthetic_dead_letter()
-                RETURNS trigger LANGUAGE plpgsql AS $
+                RETURNS trigger LANGUAGE plpgsql AS $gasha_test$
                 BEGIN
                     RAISE EXCEPTION 'synthetic dead-letter write failure';
                 END;
-                $;
+                $gasha_test$;
             """)
             db.execute("""
                 CREATE TRIGGER reject_synthetic_dead_letter
