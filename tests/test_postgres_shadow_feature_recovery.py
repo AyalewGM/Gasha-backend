@@ -454,3 +454,124 @@ def test_post_ack_missing_provider_terminal_dlq_is_idempotent(installation) -> N
         assert db.execute("SELECT count(*) AS n FROM evaluation_alerts").fetchone()["n"] == 0
         assert db.execute("SELECT count(*) AS n FROM analyst_case_events").fetchone()["n"] == 0
         assert db.execute("SELECT count(*) AS n FROM security_audit_events").fetchone()["n"] == 0
+
+
+@pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+def test_post_ack_worker_audit_outage_rolls_back_lineage_then_recovers(installation) -> None:
+    """A failed alert audit cannot partially commit a recovered worker evaluation.
+
+    The pending event remains retryable after the rejected transaction. Once
+    the synthetic audit outage is lifted, one evidence/alert/case is committed.
+    """
+    alerts.install_policy(installation, workflow.ALERT_POLICY)
+    with workflow.connect(installation) as db:
+        for migration in (
+            "005_create_dead_letters.sql",
+            "007_create_pending_evaluations.sql",
+            "008_pending_lease_fencing.sql",
+            "009_pending_terminal_state.sql",
+        ):
+            db.execute((alerts.MIGRATIONS / migration).read_text())
+
+    copy = _synthetic_copy()
+    incoming, batch, initial_dlq = make_consumer([
+        FakeRecord(dumps(copy.model_dump(mode="json")).encode(), 1),
+    ])
+
+    def outage(_event: FraudEventEnvelope, _policy=None):
+        raise TimeoutError("synthetic evaluator unavailable")
+
+    with workflow.connect(installation) as db:
+        first = IngestionWorker(
+            incoming,
+            IngestionService({"synthetic-shadow-copy": SyntheticShadowCopyAdapter()}),
+            evaluate=outage,
+            pending=PostgresPendingEvaluationStore(
+                db, tenant_ids=(TENANT,), worker_id="audit-initial",
+            ),
+            policy_for=lambda _tenant: POLICY,
+            worker_id="audit-initial", tenant_ids=(TENANT,),
+            max_evaluation_attempts=3, retry_backoff=timedelta(0),
+            dead_letters=initial_dlq,
+        )
+        assert first.run_once(max_events=1) == 1
+        assert batch.commits == 1 and initial_dlq.records == ()
+
+    def recovered_worker(db, worker_id: str):
+        writer = PostgresEvaluationAlertWriter(
+            TENANT, workflow.ALERT_POLICY,
+            principal(caps=frozenset({Capability.CASE_CREATE})),
+        )
+        orchestrator = ShadowOrchestrator(
+            {TENANT: POLICY},
+            persistence=PostgresEvaluationPersistence(
+                db, tenant_ids=(TENANT,), require_lease=True, alerts=writer,
+            ),
+        )
+        empty, empty_batch, dlq = make_consumer([])
+        worker = IngestionWorker(
+            empty,
+            IngestionService({"synthetic-shadow-copy": SyntheticShadowCopyAdapter()}),
+            evaluate=SyntheticShadowWorkerEvaluator(
+                orchestrator,
+                history_source=SyntheticFixtures((snapshot_for_copy(copy),)),
+            ),
+            pending=PostgresPendingEvaluationStore(
+                db, tenant_ids=(TENANT,), worker_id=worker_id,
+            ),
+            worker_id=worker_id, tenant_ids=(TENANT,),
+            max_evaluation_attempts=3, retry_backoff=timedelta(0),
+            dead_letters=dlq,
+        )
+        return worker, empty_batch, dlq
+
+    with workflow.connect(installation) as db:
+        db.execute(
+            "ALTER TABLE security_audit_events ADD CONSTRAINT "
+            "recovered_feature_audit_outage "
+            "CHECK (action <> 'alert.generate') NOT VALID"
+        )
+    with workflow.connect(installation) as db:
+        worker, empty_batch, dlq = recovered_worker(db, "audit-denied")
+        assert worker.run_once(max_events=1) == 0
+        assert empty_batch.commits == 0 and dlq.records == ()
+        assert db.execute(
+            "SELECT attempts, terminal FROM pending_evaluations"
+        ).fetchone() == {"attempts": 2, "terminal": False}
+        for table in (
+            "shadow_evaluations", "fraud_decision_audit", "evaluation_alerts",
+            "analyst_case_events", "evaluation_alert_policy_provenance",
+            "security_audit_events", "dead_letters",
+        ):
+            assert db.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] == 0
+        db.execute(
+            "ALTER TABLE security_audit_events "
+            "DROP CONSTRAINT recovered_feature_audit_outage"
+        )
+
+    with workflow.connect(installation) as db:
+        worker, empty_batch, dlq = recovered_worker(db, "audit-recovered")
+        assert worker.run_once(max_events=1) == 0
+        assert worker.run_once(max_events=1) == 0
+        assert empty_batch.commits == 0 and dlq.records == ()
+        assert db.execute(
+            "SELECT count(*) AS n FROM pending_evaluations"
+        ).fetchone()["n"] == 0
+        for table in (
+            "shadow_evaluations", "fraud_decision_audit",
+            "evaluation_alerts", "analyst_case_events",
+            "evaluation_alert_policy_provenance",
+        ):
+            assert db.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] == 1
+        assert db.execute(
+            "SELECT count(*) AS n FROM security_audit_events "
+            "WHERE action='alert.generate'"
+        ).fetchone()["n"] == 1
+        saved = PostgresShadowEvaluationRepository(db, tenant_ids=(TENANT,)).get(
+            TENANT, UUID(str(copy.payload["event_id"])),
+        )
+        assert saved is not None and saved.feature_evidence is not None
+        assert saved.evaluation.effective_action is DecisionAction.NO_ACTION_SHADOW
+        assert db.execute(
+            "SELECT count(*) AS n FROM dead_letters"
+        ).fetchone()["n"] == 0
