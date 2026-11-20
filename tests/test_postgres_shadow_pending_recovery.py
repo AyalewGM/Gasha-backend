@@ -29,8 +29,8 @@ from gasha.ingestion.postgres_store import (
     PostgresPendingEvaluationStore,
     _restored_pending_clock,
 )
-from gasha.ingestion.service import IngestionService
 from gasha.ingestion.reference import ReferenceJsonAdapter
+from gasha.ingestion.service import IngestionService
 from gasha.ingestion.shadow_copy import SyntheticShadowCopyAdapter
 from gasha.ingestion.worker import IngestionWorker
 from gasha.security.access import Capability
@@ -448,7 +448,7 @@ def test_reference_naive_receipt_survives_enqueue_and_fresh_pending_claim(
     inbound = inbound_for(envelope(TENANT)).model_copy(
         update={"received_at": naive}
     )
-    receipt = IngestionService({"reference-json": ReferenceJsonAdapter()}).ingest(
+    receipt = IngestionService({inbound.source_system: ReferenceJsonAdapter()}).ingest(
         inbound
     )
     assert receipt.envelope is not None
