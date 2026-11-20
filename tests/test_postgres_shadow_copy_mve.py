@@ -7,12 +7,14 @@ No payment action is dispatched; the synthetic incumbent is never modified.
 from __future__ import annotations
 
 from datetime import timedelta
+from json import dumps
 from uuid import uuid4
 
 import pytest
 import test_postgres_evaluation_alerts as alerts
 import test_postgres_synthetic_fraud_workflow as workflow
 from fastapi.testclient import TestClient
+from test_kafka_ingestion import FakeRecord, make_consumer
 from test_postgres_case_writer_bridge import (
     ASSIGNEE,
     CAPABILITIES,
@@ -33,9 +35,10 @@ from gasha.cases.postgres_writer_bridge import ExplicitPostgresCaseTransitionWri
 from gasha.cases.synthetic_ranking import SyntheticPostgresRankingSource
 from gasha.cases.timeline import VerifiedEvaluation
 from gasha.domain.models import DecisionAction, OperatingMode
-from gasha.ingestion.contracts import InboundBankEvent
+from gasha.ingestion.contracts import FraudEventEnvelope, InboundBankEvent
 from gasha.ingestion.service import IngestionOutcome, IngestionService
 from gasha.ingestion.shadow_copy import SHADOW_COPY_SCHEMA, SyntheticShadowCopyAdapter
+from gasha.ingestion.worker import IngestionWorker
 from gasha.intelligence.feature_set_v1 import ObservedTransfer, compute_feature_set
 from gasha.intelligence.internal_graph import (
     InternalGraphDetector,
@@ -71,7 +74,10 @@ def _computed_graph_event(copy: InboundBankEvent):
     assert receipt.outcome is IngestionOutcome.ACCEPTED
     assert ingestion.ingest(copy).outcome is IngestionOutcome.DUPLICATE
     assert receipt.envelope is not None
-    normalized = receipt.envelope
+    return _computed_graph_from_normalized(receipt.envelope)
+
+
+def _computed_graph_from_normalized(normalized: FraudEventEnvelope) -> FraudEventEnvelope:
     assert normalized.operating_mode is OperatingMode.SHADOW
     assert normalized.intelligence.transaction_risk == 0.0
     occurred = normalized.canonical_transaction.occurred_at
@@ -79,19 +85,19 @@ def _computed_graph_event(copy: InboundBankEvent):
     assert occurred <= receipt_as_of
     tx = normalized.canonical_transaction
     target = ObservedTransfer(
-        copy.tenant_id, str(tx.event_id), tx.sender_account_id,
+        normalized.tenant_id, str(tx.event_id), tx.sender_account_id,
         tx.beneficiary_id, tx.device_id, occurred, receipt_as_of,
     )
     history = tuple(
         ObservedTransfer(
-            copy.tenant_id, f"prior-{n}", f"prior-account-{n}",
+            normalized.tenant_id, f"prior-{n}", f"prior-account-{n}",
             tx.beneficiary_id, None,
             occurred - timedelta(minutes=n), occurred - timedelta(minutes=n),
         ) for n in range(1, 6)
     )
     # A past transaction observed after the receipt cutoff cannot contribute.
     late_observation = ObservedTransfer(
-        copy.tenant_id, "late-after-receipt", "late-sender",
+        normalized.tenant_id, "late-after-receipt", "late-sender",
         tx.beneficiary_id, None, occurred - timedelta(minutes=10),
         receipt_as_of + timedelta(seconds=1),
     )
@@ -244,6 +250,96 @@ def test_copy_to_durable_deduped_alert_authenticated_case_and_feedback(
 
     with workflow.connect(installation) as db:
         assert db.execute("SELECT count(*) AS n FROM analyst_case_events").fetchone()["n"] == 6
+
+
+
+@pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+def test_json_wire_worker_to_durable_shadow_alert_case_with_replay_and_scope(
+    installation,
+) -> None:
+    """A complete synthetic wire-to-PostgreSQL path, not a Bank/broker test.
+
+    The copy arrives through JSON/Pydantic, not a direct-object adapter.
+    Features are computed within Gasha before the durable alert is committed.
+    Neither the wire payload nor the worker selects an enforcing mode.
+    """
+    alerts.install_policy(installation, workflow.ALERT_POLICY)
+    copies = (_synthetic_copy(), _synthetic_copy())
+    wire = [dumps(copy.model_dump(mode="json")).encode() for copy in copies]
+    consumer, batch, dead_letters = make_consumer([
+        FakeRecord(wire[0], 20),
+        FakeRecord(wire[1], 21),
+        FakeRecord(wire[0], 22),  # at-least-once transport replay
+    ])
+    ingestion = IngestionService(
+        {"synthetic-shadow-copy": SyntheticShadowCopyAdapter()},
+        dead_letters=dead_letters,
+    )
+    evaluated: list[str] = []
+
+    def evaluate_normalized(
+        normalized: FraudEventEnvelope, _policy=None,
+    ) -> None:
+        assert batch.commits == 0  # no ack before durable evaluation
+        assessed = _computed_graph_from_normalized(normalized)
+        result = alerts.evaluate(
+            installation, assessed,
+            writer=PostgresEvaluationAlertWriter(
+                TENANT, workflow.ALERT_POLICY,
+                principal(caps=frozenset({Capability.CASE_CREATE})),
+            ),
+        )
+        assert result.decision.action is DecisionAction.HOLD
+        assert result.effective_action is DecisionAction.NO_ACTION_SHADOW
+        evaluated.append(str(normalized.event_id))
+
+    worker = IngestionWorker(
+        consumer, ingestion, evaluate=evaluate_normalized,
+        dead_letters=dead_letters, tenant_ids=(TENANT,),
+    )
+    assert worker.run_once(max_events=3) == 3
+    assert batch.commits == 1
+    assert len(set(evaluated)) == 2
+    assert dead_letters.records == ()
+
+    with workflow.connect(installation) as db:
+        rows = db.execute(
+            "SELECT tenant_id, event_id, case_id, context_ref "
+            "FROM evaluation_alerts"
+        ).fetchall()
+        assert len(rows) == 2
+        assert {row["tenant_id"] for row in rows} == {TENANT}
+        assert len({row["case_id"] for row in rows}) == 1
+        assert len({row["context_ref"] for row in rows}) == 2
+        assert db.execute(
+            "SELECT count(*) AS n FROM shadow_evaluations"
+        ).fetchone()["n"] == 2
+        assert db.execute(
+            "SELECT count(*) AS n FROM analyst_case_events"
+        ).fetchone()["n"] == 1
+        assert db.execute(
+            "SELECT count(*) AS n FROM security_audit_events "
+            "WHERE action='alert.generate'"
+        ).fetchone()["n"] == 2
+
+    # A worker configured for tenant A never evaluates or acks tenant B,
+    # even if an unauthenticated synthetic transport supplies that identifier.
+    foreign = dumps(_synthetic_copy("tenant-b").model_dump(mode="json")).encode()
+    other_consumer, other_batch, other_dead_letters = make_consumer([
+        FakeRecord(foreign, 23),
+    ])
+    other_worker = IngestionWorker(
+        other_consumer, ingestion, evaluate=evaluate_normalized,
+        dead_letters=other_dead_letters, tenant_ids=(TENANT,),
+    )
+    with pytest.raises(PermissionError, match="tenant outside authorized"):
+        other_worker.run_once(max_events=1)
+    assert other_batch.commits == 0
+    assert len(evaluated) == 2
+    with workflow.connect(installation) as db:
+        assert db.execute(
+            "SELECT count(*) AS n FROM evaluation_alerts"
+        ).fetchone()["n"] == 2
 
 
 def test_synthetic_incumbent_continues_when_separate_gasha_copy_consumer_fails() -> None:
