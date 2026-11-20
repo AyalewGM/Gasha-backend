@@ -13,9 +13,10 @@ import re
 from collections.abc import Mapping
 from datetime import UTC, datetime, timezone
 from typing import NoReturn
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from gasha.domain.models import IntelligenceSnapshot, OperatingMode
+from gasha.domain.models import BeneficiaryType, IntelligenceSnapshot, OperatingMode
 from gasha.ingestion.contracts import (
     AdapterMetadata,
     FraudEventEnvelope,
@@ -113,6 +114,17 @@ class SyntheticShadowCopyAdapter:
             value = raw[field]
             if type(value) is not str or _TOKEN.fullmatch(value) is None:
                 self._reject(event, RejectionReason.INVALID_SCHEMA, "invalid copy identifier")
+        # Validate exact downstream types before delegating, including identifiers
+        # which the general bounded-token grammar deliberately allows.
+        try:
+            UUID(raw["event_id"])
+        except ValueError:
+            self._reject(event, RejectionReason.INVALID_SCHEMA, "invalid copy event id")
+        try:
+            BeneficiaryType(raw["beneficiary_type"])
+        except ValueError:
+            self._reject(event, RejectionReason.INVALID_SCHEMA, "invalid beneficiary category")
+
         for field in _OPTIONAL:
             value = raw.get(field)
             if value is not None and (
@@ -154,16 +166,26 @@ class SyntheticShadowCopyAdapter:
         # were excluded above; this copy cannot install a mode or risk score.
         mapped = dict(raw)
         mapped["operating_mode"] = OperatingMode.SHADOW.value
-        normalized = self._reference.adapt(
-            InboundBankEvent(
-                tenant_id=event.tenant_id,
-                source_system=event.source_system,
-                schema_version="1.0",
-                payload=mapped,
-                received_at=received,
-                correlation_id=event.correlation_id,
+        try:
+            normalized = self._reference.adapt(
+                InboundBankEvent(
+                    tenant_id=event.tenant_id,
+                    source_system=event.source_system,
+                    schema_version="1.0",
+                    payload=mapped,
+                    received_at=received,
+                    correlation_id=event.correlation_id,
+                )
             )
-        )
+        except EventRejection as rejection:
+            # The general reference adapter can echo raw payload values in its
+            # error message and event_id. Never pass such evidence to dead letters,
+            # audit records, or the caller of the synthetic-only boundary.
+            self._reject(
+                event,
+                rejection.record.reason,
+                "synthetic copy normalization rejected",
+            )
         return FraudEventEnvelope(
             tenant_id=normalized.tenant_id,
             event_id=normalized.event_id,
