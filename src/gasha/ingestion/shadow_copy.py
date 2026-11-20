@@ -117,11 +117,11 @@ class SyntheticShadowCopyAdapter:
         # Validate exact downstream types before delegating, including identifiers
         # which the general bounded-token grammar deliberately allows.
         try:
-            UUID(raw["event_id"])
+            UUID(str(raw["event_id"]))
         except ValueError:
             self._reject(event, RejectionReason.INVALID_SCHEMA, "invalid copy event id")
         try:
-            BeneficiaryType(raw["beneficiary_type"])
+            BeneficiaryType(str(raw["beneficiary_type"]))
         except ValueError:
             self._reject(event, RejectionReason.INVALID_SCHEMA, "invalid beneficiary category")
 
