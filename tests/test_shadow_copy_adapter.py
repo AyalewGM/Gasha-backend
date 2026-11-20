@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from uuid import UUID
 
 import pytest
@@ -243,3 +243,19 @@ def test_invalid_copy_identifiers_never_leak_to_rejection_dead_letter_or_audit(
         repr(dead_letters.records[0]),
     ):
         assert marker not in evidence
+
+
+def test_shadow_copy_rejects_custom_timezone_without_invoking_callbacks() -> None:
+    class UntrustedTimezone(tzinfo):
+        def utcoffset(self, dt: datetime | None) -> timedelta | None:
+            raise AssertionError("untrusted timezone callback executed")
+
+        def dst(self, dt: datetime | None) -> timedelta | None:
+            raise AssertionError("untrusted timezone callback executed")
+
+    received = datetime(2026, 11, 20, 12, tzinfo=UntrustedTimezone())
+    result = service().ingest(inbound(received=received))
+    assert result.outcome is IngestionOutcome.REJECTED
+    assert result.rejection is not None
+    assert result.rejection.reason is RejectionReason.INVALID_TIMESTAMP
+    assert result.envelope is None
