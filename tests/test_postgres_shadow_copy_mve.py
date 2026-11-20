@@ -514,15 +514,14 @@ def test_feature_evidence_alert_audit_failure_rolls_back_all(installation) -> No
             "feature_evidence_audit_guard "
             "CHECK (action <> 'alert.generate') NOT VALID"
         )
-    with pytest.raises(CheckViolation):
-        with workflow.connect(installation) as db:
-            orchestrator = ShadowOrchestrator(
-                {TENANT: POLICY},
-                persistence=PostgresEvaluationPersistence(db, alerts=writer),
-            )
-            orchestrator.evaluate(
-                assessment.assessed_envelope, feature_assessment=assessment,
-            )
+    with pytest.raises(CheckViolation), workflow.connect(installation) as db:
+        orchestrator = ShadowOrchestrator(
+            {TENANT: POLICY},
+            persistence=PostgresEvaluationPersistence(db, alerts=writer),
+        )
+        orchestrator.evaluate(
+            assessment.assessed_envelope, feature_assessment=assessment,
+        )
     with workflow.connect(installation) as db:
         for table in (
             "shadow_evaluations", "fraud_decision_audit",
