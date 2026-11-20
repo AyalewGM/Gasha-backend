@@ -20,8 +20,6 @@ from gasha.intelligence.synthetic_shadow_provider import (
 )
 from gasha.orchestration import ShadowOrchestrator
 
-
-
 DECISION_POLICY = DecisionPolicy(
     configuration_version="synthetic-config-1",
     policy_version="synthetic-decision-1",
