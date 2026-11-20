@@ -13,6 +13,10 @@ from gasha.ingestion.errors import RejectionReason
 from gasha.ingestion.kafka_json import JsonEventConsumer
 from gasha.ingestion.pending import InMemoryPendingEvaluationStore
 from gasha.ingestion.reference import ReferenceJsonAdapter
+from gasha.ingestion.shadow_copy import (
+    SHADOW_COPY_SCHEMA,
+    SyntheticShadowCopyAdapter,
+)
 from gasha.ingestion.service import (
     IngestionOutcome,
     IngestionService,
@@ -761,3 +765,82 @@ def test_worker_respects_operating_mode(mode: OperatingMode) -> None:
     worker.run_once(max_events=1)
     assert seen[0].operating_mode == mode
 
+
+@pytest.mark.parametrize(
+    "wire_received",
+    ["2026-11-20T12:00:00Z", "2026-11-20T15:00:00+03:00"],
+)
+def test_json_wire_shadow_copy_receipt_offset_survives_worker(
+    wire_received: str,
+) -> None:
+    """Exercise real JSON decoding, not the direct-datetime adapter fixture."""
+    body = json.loads(event_json())
+    body["source_system"] = "synthetic-shadow-copy"
+    body["schema_version"] = SHADOW_COPY_SCHEMA
+    body["payload"]["occurred_at"] = "2026-11-20T12:00:00+00:00"
+    body["received_at"] = wire_received
+    consumer, batch, dead_letters = make_consumer(
+        [FakeRecord(json.dumps(body).encode(), 9)]
+    )
+    seen: list[FraudEventEnvelope] = []
+    ingestion = IngestionService(
+        {"synthetic-shadow-copy": SyntheticShadowCopyAdapter()},
+        dead_letters=dead_letters,
+    )
+    worker = IngestionWorker(
+        consumer,
+        ingestion,
+        evaluate=lambda envelope, policy=None: seen.append(envelope),
+        dead_letters=dead_letters,
+    )
+
+    assert worker.run_once(max_events=1) == 1
+    assert batch.commits == 1
+    assert len(seen) == 1
+    assert seen[0].received_at == datetime(2026, 11, 20, 12, tzinfo=UTC)
+    assert seen[0].operating_mode is OperatingMode.SHADOW
+    assert seen[0].intelligence.transaction_risk is None
+    assert dead_letters.records == ()
+
+
+@pytest.mark.parametrize(
+    ("wire_received", "reason"),
+    [
+        ("2026-11-20T12:00:00", RejectionReason.INVALID_TIMESTAMP),
+        ("2026-11-20T11:59:59Z", RejectionReason.INVALID_TIMESTAMP),
+        ("not-a-receipt", RejectionReason.INVALID_SCHEMA),
+    ],
+)
+def test_json_wire_shadow_copy_bad_receipt_is_redacted_and_not_evaluated(
+    wire_received: str, reason: RejectionReason
+) -> None:
+    body = json.loads(event_json())
+    body["source_system"] = "synthetic-shadow-copy"
+    body["schema_version"] = SHADOW_COPY_SCHEMA
+    body["payload"]["occurred_at"] = "2026-11-20T12:00:00Z"
+    body["payload"]["beneficiary_id"] = "sensitive-identifier-999"
+    body["received_at"] = wire_received
+    consumer, batch, dead_letters = make_consumer(
+        [FakeRecord(json.dumps(body).encode(), 10)]
+    )
+    seen: list[FraudEventEnvelope] = []
+    ingestion = IngestionService(
+        {"synthetic-shadow-copy": SyntheticShadowCopyAdapter()},
+        dead_letters=dead_letters,
+    )
+    worker = IngestionWorker(
+        consumer,
+        ingestion,
+        evaluate=lambda envelope, policy=None: seen.append(envelope),
+        dead_letters=dead_letters,
+    )
+
+    assert worker.run_once(max_events=1) == 1
+    assert batch.commits == 1
+    assert not seen
+    assert len(dead_letters.records) == 1
+    rejection = dead_letters.records[0]
+    assert rejection.reason is reason
+    assert rejection.event_id is None
+    assert "sensitive-identifier-999" not in rejection.model_dump_json()
+    assert "sensitive-identifier-999" not in repr(rejection)
