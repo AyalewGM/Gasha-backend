@@ -221,7 +221,9 @@ def _as_datetime(value: object) -> datetime:
     raise TypeError(f"expected datetime, got {type(value).__name__}")
 
 
-def _restored_pending_clock(value: datetime | None, *, optional: bool = False) -> datetime | None:
+def _restored_pending_clock(
+    value: datetime | None, *, optional: bool = False, allow_naive: bool = False
+) -> datetime | None:
     """Recover a fixed-offset DB JSON clock without executing arbitrary tzinfo.
 
     Pydantic v2 decodes persisted JSON offsets into its exact `TzInfo` type.
@@ -231,7 +233,16 @@ def _restored_pending_clock(value: datetime | None, *, optional: bool = False) -
     """
     if value is None and optional:
         return None
-    if type(value) is not datetime or type(value.tzinfo) not in (timezone, TzInfo):
+    if type(value) is not datetime:
+        raise ValueError("invalid persisted pending timestamp")
+    if value.tzinfo is None:
+        # Only the legacy synthetic reference adapter may preserve a naive
+        # inbound receipt clock. Never reinterpret it as UTC or allow it on
+        # the strict synthetic-shadow-copy receipt-time feature path.
+        if allow_naive:
+            return value
+        raise ValueError("invalid persisted pending timestamp")
+    if type(value.tzinfo) not in (timezone, TzInfo):
         raise ValueError("invalid persisted pending timestamp")
     if type(value.tzinfo) is TzInfo:
         try:
@@ -247,7 +258,13 @@ def _restored_pending_record(raw: str) -> PendingEvaluationRecord:
     record = PendingEvaluationRecord.model_validate_json(raw)
     event = record.event
     transaction = event.canonical_transaction
-    received = _restored_pending_clock(event.received_at, optional=True)
+    received = _restored_pending_clock(
+        event.received_at, optional=True,
+        allow_naive=(
+            event.adapter.adapter_type == "reference-json"
+            and event.adapter.schema_version == "1.0"
+        ),
+    )
     occurred = _restored_pending_clock(transaction.occurred_at)
     normalized = _restored_pending_clock(event.adapter.normalized_at)
     restored = event.model_copy(update={
