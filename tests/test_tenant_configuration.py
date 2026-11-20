@@ -1,13 +1,11 @@
 """Issue #147 inert tenant configuration kernel tests; never bank authority."""
 
 from dataclasses import replace
-from json import dumps, loads
 from datetime import UTC, datetime, timedelta, tzinfo
+from json import dumps, loads
 from typing import Any
 
 import pytest
-
-from gasha.domain.models import DecisionPolicy
 
 from gasha.configuration.kernel import (
     ConfigKind,
@@ -22,6 +20,7 @@ from gasha.configuration.kernel import (
     plan_retirement,
     resolve_active,
 )
+from gasha.domain.models import DecisionPolicy
 
 NOW = datetime(2026, 11, 14, 12, 0, tzinfo=UTC)
 PROVISIONER = "a" * 64
@@ -496,8 +495,8 @@ def test_expanded_policy_rejects_partial_fields_and_unknown_keys() -> None:
             canonical_content(ConfigKind.DECISION_POLICY, partial)
     with pytest.raises(TenantConfigRejected):
         canonical_content(ConfigKind.DECISION_POLICY, {**expanded, "bank_approved": True})
-    # A payload cannot quietly replace a legacy entry with enabled fields,
-    # even if its stored digest was recomputed to match the substituted content.
+    # Replacing content and deliberately recomputing the digest produces a
+    # different identity; keeping the old digest cannot pass revalidation.
     original = draft()
     bad = row_of(original)
     bad["content_json"] = canonical_content(ConfigKind.DECISION_POLICY, expanded)
