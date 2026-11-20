@@ -15,7 +15,7 @@ import test_postgres_synthetic_fraud_workflow as workflow
 from pydantic import TypeAdapter
 from test_kafka_ingestion import FakeRecord, make_consumer
 from test_postgres_case_writer_bridge import principal
-from test_postgres_evaluations import POLICY
+from test_postgres_evaluations import POLICY, envelope, inbound_for
 from test_postgres_shadow_copy_mve import (
     TENANT,
     _computed_graph_from_normalized,
@@ -30,6 +30,7 @@ from gasha.ingestion.postgres_store import (
     _restored_pending_clock,
 )
 from gasha.ingestion.service import IngestionService
+from gasha.ingestion.reference import ReferenceJsonAdapter
 from gasha.ingestion.shadow_copy import SyntheticShadowCopyAdapter
 from gasha.ingestion.worker import IngestionWorker
 from gasha.security.access import Capability
@@ -415,4 +416,69 @@ def test_poison_pending_row_is_quarantined_without_blocking_healthy_recovery(
         ).fetchone()["n"] == 1
         assert db.execute(
             "SELECT count(*) AS n FROM shadow_evaluations"
+        ).fetchone()["n"] == 0
+
+
+def test_reference_receipt_clock_can_remain_naive_without_weakening_shadow_clock() -> None:
+    """Legacy reference-json is not a receipt-time synthetic feature provider."""
+    legacy = TypeAdapter(datetime).validate_json(dumps("2026-11-20T12:15:00"))
+    assert legacy.tzinfo is None
+    assert _restored_pending_clock(legacy, allow_naive=True) is legacy
+    with pytest.raises(ValueError, match="invalid persisted pending timestamp"):
+        _restored_pending_clock(legacy)
+    with pytest.raises(ValueError, match="invalid persisted pending timestamp"):
+        _restored_pending_clock(None, allow_naive=True)
+
+
+@pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+def test_reference_naive_receipt_survives_enqueue_and_fresh_pending_claim(
+    installation,
+) -> None:
+    """The shared ledger must not poison a valid reference-json receipt clock."""
+    with workflow.connect(installation) as db:
+        for migration in (
+            "005_create_dead_letters.sql",
+            "007_create_pending_evaluations.sql",
+            "008_pending_lease_fencing.sql",
+            "009_pending_terminal_state.sql",
+        ):
+            db.execute((alerts.MIGRATIONS / migration).read_text())
+
+    naive = datetime(2026, 11, 20, 12, 15)
+    inbound = inbound_for(envelope(TENANT)).model_copy(
+        update={"received_at": naive}
+    )
+    receipt = IngestionService({"reference-json": ReferenceJsonAdapter()}).ingest(
+        inbound
+    )
+    assert receipt.envelope is not None
+    assert receipt.envelope.received_at == naive
+    assert receipt.envelope.received_at.tzinfo is None
+    stale = datetime.now(UTC) - timedelta(minutes=10)
+    with workflow.connect(installation) as db:
+        seeder = PostgresPendingEvaluationStore(
+            db, tenant_ids=(TENANT,), worker_id="reference-seeder",
+            lease_ttl=timedelta(seconds=1),
+        )
+        saved = seeder.enqueue(
+            receipt.envelope, enqueued_at=stale, policy=POLICY,
+        )
+        assert saved.event.received_at == naive
+        assert saved.event.received_at.tzinfo is None
+
+    with workflow.connect(installation) as db:
+        pending = PostgresPendingEvaluationStore(
+            db, tenant_ids=(TENANT,), worker_id="reference-recovered",
+        )
+        claimed = pending.due(datetime.now(UTC))
+        assert len(claimed) == 1
+        assert claimed[0].event.event_id == receipt.envelope.event_id
+        assert claimed[0].event.adapter.adapter_type == "reference-json"
+        assert claimed[0].event.received_at == naive
+        assert claimed[0].event.received_at.tzinfo is None
+        assert db.execute(
+            "SELECT count(*) AS n FROM dead_letters"
+        ).fetchone()["n"] == 0
+        assert db.execute(
+            "SELECT count(*) AS n FROM pending_evaluations WHERE terminal"
         ).fetchone()["n"] == 0
