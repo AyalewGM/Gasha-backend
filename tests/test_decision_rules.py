@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
-from uuid import UUID
 from typing import Any
+from uuid import UUID
 
 import pytest
 
@@ -73,7 +73,7 @@ def ruleset(*rules: PolicyRule, version: str = "tenant-rules-v1") -> RuleSet:
     return RuleSet(tenant_id="tenant-a", rule_set_version=version, rules=rules)
 
 
-def service(
+def make_service(
     policy: DecisionPolicy, authored: RuleSet, backend: Any = None
 ) -> RulesAwareDecisionService:
     return RulesAwareDecisionService(
@@ -137,7 +137,7 @@ def test_untaggable_ids_rejected() -> None:
 
 
 def test_min_score_floors_the_decision() -> None:
-    service = service(
+    service = make_service(
         POLICY,
         ruleset(
             rule(
@@ -154,7 +154,7 @@ def test_min_score_floors_the_decision() -> None:
 
 
 def test_force_action_escalates_beyond_mapped() -> None:
-    service = service(
+    service = make_service(
         POLICY,
         ruleset(
             rule(
@@ -171,7 +171,7 @@ def test_force_action_escalates_beyond_mapped() -> None:
 
 
 def test_rules_never_downgrade() -> None:
-    service = service(
+    service = make_service(
         POLICY,
         ruleset(
             rule(
@@ -186,7 +186,7 @@ def test_rules_never_downgrade() -> None:
 
 
 def test_strongest_force_wins() -> None:
-    service = service(
+    service = make_service(
         POLICY,
         ruleset(
             rule(
@@ -207,7 +207,7 @@ def test_strongest_force_wins() -> None:
 
 
 def test_and_predicates_all_required() -> None:
-    service = service(
+    service = make_service(
         POLICY,
         ruleset(
             rule(
@@ -228,7 +228,7 @@ def test_and_predicates_all_required() -> None:
 
 
 def test_in_operator_and_signal_field() -> None:
-    service = service(
+    service = make_service(
         POLICY,
         ruleset(
             rule(
@@ -250,7 +250,7 @@ def test_in_operator_and_signal_field() -> None:
 
 
 def test_missing_optional_field_never_matches() -> None:
-    service = service(
+    service = make_service(
         POLICY,
         ruleset(
             rule(
@@ -271,7 +271,7 @@ def test_missing_optional_field_never_matches() -> None:
 
 
 def test_disabled_rules_do_not_fire() -> None:
-    service = service(
+    service = make_service(
         POLICY,
         ruleset(
             rule(
@@ -287,7 +287,7 @@ def test_disabled_rules_do_not_fire() -> None:
 
 def test_version_binding_enforced() -> None:
     with pytest.raises(RuleValidationError, match="rule_version"):
-        service(
+        make_service(
             POLICY, ruleset(version="other-rules-v9")
         )
 
@@ -295,12 +295,12 @@ def test_version_binding_enforced() -> None:
 def test_injected_backend_is_respected() -> None:
     class DenyBackend:
         def decide(self, transaction, intelligence, evidence_reason_codes=()):
-            base = service(
+            base = make_service(
                 POLICY, ruleset()
             ).decide(transaction, intelligence, evidence_reason_codes)
             return base.model_copy(update={"action": DecisionAction.BLOCK, "risk_score": 1.0})
 
-    service = service(
+    service = make_service(
         POLICY,
         ruleset(
             rule(
@@ -327,7 +327,7 @@ def test_predicate_rejects_bool_before_coercion(bad: object) -> None:
 def test_rule_floor_preserves_stronger_upstream_action(original: DecisionAction) -> None:
     class StrongBackend:
         def decide(self, transaction, intelligence, evidence_reason_codes=()):
-            base = service(POLICY, ruleset()).decide(
+            base = make_service(POLICY, ruleset()).decide(
                 transaction, intelligence, evidence_reason_codes
             )
             return base.model_copy(update={"action": original, "risk_score": 0.1})
@@ -335,7 +335,7 @@ def test_rule_floor_preserves_stronger_upstream_action(original: DecisionAction)
     authored = ruleset(rule(
         "low_floor", [{"field": "amount", "op": "gt", "value": 1}], min_score=0.2
     ))
-    result = service(POLICY, authored, backend=StrongBackend()).decide(
+    result = make_service(POLICY, authored, backend=StrongBackend()).decide(
         tx(), IntelligenceSnapshot()
     )
     assert result.action is original
@@ -357,13 +357,13 @@ def test_rejects_foreign_backend_provenance_or_shadow(
 ) -> None:
     class ForeignBackend:
         def decide(self, transaction, intelligence, evidence_reason_codes=()):
-            base = service(POLICY, ruleset()).decide(
+            base = make_service(POLICY, ruleset()).decide(
                 transaction, intelligence, evidence_reason_codes
             )
             return base.model_copy(update=changed)
 
     with pytest.raises(RuleValidationError):
-        service(POLICY, ruleset(), backend=ForeignBackend()).decide(
+        make_service(POLICY, ruleset(), backend=ForeignBackend()).decide(
             tx(), IntelligenceSnapshot()
         )
 
@@ -377,7 +377,7 @@ def test_tenant_and_digest_binding_rejects_substitution() -> None:
         ),),
     )
     with pytest.raises(RuleValidationError, match="tenant"):
-        service(POLICY, foreign)
+        make_service(POLICY, foreign)
     correct = ruleset()
     with pytest.raises(RuleValidationError, match="digest"):
         RulesAwareDecisionService(
@@ -385,7 +385,7 @@ def test_tenant_and_digest_binding_rejects_substitution() -> None:
             expected_ruleset_digest=rule_set_digest(foreign),
         )
     with pytest.raises(RuleValidationError, match="tenant"):
-        service(POLICY, correct).decide(
+        make_service(POLICY, correct).decide(
             tx(tenant_id="tenant-b"), IntelligenceSnapshot()
         )
 
@@ -394,7 +394,7 @@ def test_rule_snapshot_resists_mutation_of_authored_object() -> None:
     authored = ruleset(rule(
         "only_low", [{"field": "amount", "op": "gt", "value": 1}], min_score=0.6
     ))
-    guarded = service(POLICY, authored)
+    guarded = make_service(POLICY, authored)
     authored.rules[0].effect.min_score = 1.0
     result = guarded.decide(tx(), IntelligenceSnapshot())
     assert result.risk_score == pytest.approx(0.6)
@@ -406,4 +406,4 @@ def test_challenge_force_rejects_missing_channel_policy() -> None:
         force_action=DecisionAction.CHALLENGE,
     ))
     with pytest.raises(RuleValidationError, match="CHALLENGE"):
-        service(POLICY, authored).decide(tx(), IntelligenceSnapshot())
+        make_service(POLICY, authored).decide(tx(), IntelligenceSnapshot())
