@@ -11,9 +11,9 @@ from hashlib import sha256
 from json import dumps, loads
 
 import pytest
+import test_postgres_evaluation_alerts as alerts
 from test_evaluation_context_legacy import _record
 from test_postgres_case_writer_bridge import DSN, connect, principal
-import test_postgres_evaluation_alerts as alerts
 
 installation = alerts.installation
 
@@ -83,10 +83,10 @@ def test_persisted_null_inclusive_context_survives_real_pg_replay_and_queue(
     Neither the model serializer nor the legacy digest is changed after setup.
     Confirm real saved context and history are not rewritten during replay.
     """
-    import gasha.cases.evaluation_alerts as evidence
-
     from fastapi.testclient import TestClient
     from test_postgres_synthetic_ranking import SyntheticVerifier
+
+    import gasha.cases.evaluation_alerts as evidence
     from gasha.api.main import app
     from gasha.cases.postgres_history_reader import ExplicitPostgresCaseHistoryReader
     from gasha.cases.postgres_queue_reader import ExplicitPostgresCaseQueueReader
