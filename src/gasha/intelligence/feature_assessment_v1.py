@@ -72,6 +72,7 @@ def assess_synthetic_shadow_features(
     *,
     policy: InternalGraphPolicy,
     relationship_history_complete: bool = True,
+    beneficiary_window_complete: bool | None = None,
 ) -> FeatureAssessmentV1:
     """Assess a normalized synthetic copy using only receipt-available history.
 
@@ -85,6 +86,18 @@ def assess_synthetic_shadow_features(
         or type(policy) is not InternalGraphPolicy
     ):
         raise ValueError("invalid synthetic assessment inputs")
+    # Bounded one-hour coverage can prove a beneficiary fan-in count while
+    # still being insufficient to prove a first-ever sender relationship.
+    # Only a configured synthetic producer may assert this coverage. The
+    # Redis adapter's seal is NOT independently attested Bank provenance.
+    if beneficiary_window_complete is None:
+        beneficiary_window_complete = relationship_history_complete
+    if (
+        type(relationship_history_complete) is not bool
+        or type(beneficiary_window_complete) is not bool
+        or (relationship_history_complete and not beneficiary_window_complete)
+    ):
+        raise ValueError("invalid synthetic feature coverage claims")
     tx = normalized.canonical_transaction
     cutoff = normalized.received_at
     if (
@@ -124,7 +137,7 @@ def assess_synthetic_shadow_features(
     # Incomplete source coverage cannot establish a measured graph zero (or
     # an authoritative fan-in count). Keep the core feature engine reusable;
     # this synthetic assessment conservatively marks its graph signal absent.
-    if not relationship_history_complete and target.beneficiary_ref is not None:
+    if not beneficiary_window_complete and target.beneficiary_ref is not None:
         features = replace(
             features,
             beneficiary_unique_senders_1h=None,
@@ -182,6 +195,9 @@ def assess_synthetic_shadow_features(
         policy.model_dump(mode="json"), assessment_intelligence.model_dump(mode="json"),
         reasons, missing, eligible, late, nonprior,
         relationship_history_complete,
+        *((("bounded_beneficiary_window_complete",) if (
+            beneficiary_window_complete and not relationship_history_complete
+        ) else ())),
     ])
     # Risk is computed by Gasha; the synthetic JSON adapter cannot supply it.
     assessed = normalized.model_copy(update={
