@@ -22,8 +22,8 @@ from gasha.cases.postgres_history_reader import authorized_case_read
 from gasha.cases.postgres_timeline import PostgresCaseTimelineService
 from gasha.cases.timeline import CaseRejected, CaseSourceUnavailable
 from gasha.domain.models import DecisionAction, OperatingMode
-from gasha.postgres import Connection
 from gasha.orchestration import ShadowEvaluationRecord
+from gasha.postgres import Connection
 from gasha.security.access import TrustedPrincipal
 
 # Never echo an unconstrained persisted string as a browser-visible signal.
