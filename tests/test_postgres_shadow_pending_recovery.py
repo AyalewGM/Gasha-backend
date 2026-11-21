@@ -222,6 +222,7 @@ def test_acknowledged_shadow_copy_recovers_from_postgres_without_broker_redelive
             ),
             worker_id="synthetic-recovered", tenant_ids=(TENANT,),
             dead_letters=recovery_dead_letters,
+            policy_for=lambda _tenant: POLICY,
         )
         assert recovered_worker.run_once(max_events=1) == 1
         # FIRST event recovers without broker redelivery from PostgreSQL.
