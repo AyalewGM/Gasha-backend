@@ -7,7 +7,9 @@ connection lifecycle and independent installation approval remain external.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from datetime import datetime
+from typing import Protocol
 
 from gasha.postgres import Connection
 from gasha.security.access import SecurityAuditEvent
@@ -45,21 +47,51 @@ def _validate_redacted_event(event: SecurityAuditEvent) -> None:
         raise ValueError("redacted event/context references required")
 
 
-class PostgresSecurityAuditSink:
-    """Single-connection append-only API adapter; never a bank-ready default.
+class ClosableAuditConnection(Connection, Protocol):
+    """Connection owned by one append; always closed when the append terminates."""
 
-    A bank installation must supply a dedicated, least-privilege connection
-    and manage its lifecycle/concurrency separately. No update/delete API is
-    exposed. PostgreSQL durability follows successful transaction commit.
+    def close(self) -> None: ...
+
+
+class PostgresSecurityAuditSink:
+    """Append-only redacted audit with a legacy or an isolated connection mode.
+
+    A shared connection remains supported for historical/internal callers, but
+    MUST NOT back the protected case-feature HTTP route. For that route, an
+    explicitly installed factory supplies a fresh, owned connection for EACH
+    audit event. The sink commits or rolls back that event, then always closes
+    its connection before the API may disclose evidence.
+
+    The factory is a trusted installation dependency, never supplied by HTTP.
+    This boundary does not certify Bank database privileges or connection pools.
     """
 
-    def __init__(self, connection: Connection) -> None:
+    def __init__(
+        self,
+        connection: Connection | None = None,
+        *,
+        connections: Callable[[], ClosableAuditConnection] | None = None,
+    ) -> None:
+        if (connection is None) == (connections is None):
+            raise ValueError("exactly one audit connection mode required")
         self._connection = connection
+        self._connections = connections
+
+    @property
+    def per_append_connection(self) -> bool:
+        """Expose the fail-closed feature-read installation prerequisite."""
+        return self._connections is not None
 
     def append(self, event: SecurityAuditEvent) -> None:
         _validate_redacted_event(event)
+        # Each call owns its connection in factory mode; no mutable PG
+        # transaction/rollback may be shared between concurrent requests.
+        owned = self._connections() if self._connections is not None else None
+        connection = owned if owned is not None else self._connection
+        if connection is None:
+            raise RuntimeError("security audit connection unavailable")
         try:
-            with self._connection.cursor() as cursor:
+            with connection.cursor() as cursor:
                 cursor.execute(
                     """
                     INSERT INTO security_audit_events (
@@ -79,9 +111,12 @@ class PostgresSecurityAuditSink:
                         event.context_ref,
                     ),
                 )
-            self._connection.commit()
+            connection.commit()
         except Exception:
-            # The protected API converts append errors to a fail-closed 503.
-            # Do not suppress commit/insert failure or emit event identifiers.
-            self._connection.rollback()
+            # A failure must not lead to a successful HTTP evidence response.
+            # Roll back this call's transaction, never another request's.
+            connection.rollback()
             raise
+        finally:
+            if owned is not None:
+                owned.close()

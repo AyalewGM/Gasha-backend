@@ -340,14 +340,18 @@ async def assign_attempt_ref(
     # request.url.path includes deployment prefixes and can miss routed /v1/ endpoints.
     # Client-provided X-Forwarded-Prefix/role/tenant headers are not route authority.
     route_path = get_route_path(request.scope)
-    # The only new feature-evidence route requires the existing committed
-    # PostgreSQL security audit adapter, never a process-local test sink.
-    # This check precedes authentication and any database reader invocation.
+    # The opt-in synthetic evidence route requires a concrete PostgreSQL sink
+    # with a separately owned transaction/connection for every audit event.
+    # A legacy shared-connection sink can interleave concurrent tenant writes
+    # and rollbacks; reject it before authentication or any evidence read.
+    audit = getattr(request.app.state, "security_audit", None)
     if (
         route_path.startswith("/v1/tenants/")
         and route_path.endswith("/feature-evidence")
-        and type(getattr(request.app.state, "security_audit", None))
-        is not PostgresSecurityAuditSink
+        and (
+            type(audit) is not PostgresSecurityAuditSink
+            or not audit.per_append_connection
+        )
     ):
         return JSONResponse(
             status_code=503, content={"detail": "security audit unavailable"},

@@ -83,75 +83,90 @@ def test_protected_case_feature_read_and_denial_have_committed_redacted_audit(
     verifier = SyntheticVerifier()
     monkeypatch.setattr(app.state, "identity_verifier", verifier)
     monkeypatch.setattr(app.state, "case_feature_reader", reader)
-    with workflow.connect(installation) as audit_connection:
-        monkeypatch.setattr(
-            app.state, "security_audit", PostgresSecurityAuditSink(audit_connection),
+    audit_connections = []
+
+    def audit_factory():
+        connection = workflow.connect(installation)
+        audit_connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        app.state, "security_audit", PostgresSecurityAuditSink(connections=audit_factory),
+    )
+    with TestClient(app) as client:
+        good = client.get(path(case_id), headers=auth())
+        assert good.status_code == 200, good.text
+        payload = good.json()
+        assert payload["feature_evidence"]["scope"] == "case_creation_source_only"
+        assert payload["feature_evidence"]["source_assurance"] == "synthetic_unattested"
+        assert payload["feature_evidence"]["context_ref"] == context_ref
+        assert payload["feature_evidence"]["eligible_observations"] == 5
+        assert payload["bank_source_attested"] is False
+        assert payload["enforcement_activated"] is False
+        assert str(event_id) not in good.text
+        assert "synthetic-analyst" not in good.text
+        assert factory_calls[0] == 1
+
+        tests = (
+            (path(case_id), {}, 401),
+            (path(case_id), auth("revoked"), 401),
+            (path(case_id), auth("expired"), 401),
+            (path(case_id), auth("outage"), 503),
+            (path(case_id), auth("no-read"), 403),
+            (path(case_id), auth("wrong-tenant"), 404),
+            (path(case_id, tenant="tenant-b"), auth(), 404),
         )
-        with TestClient(app) as client:
-            good = client.get(path(case_id), headers=auth())
-            assert good.status_code == 200, good.text
-            payload = good.json()
-            assert payload["feature_evidence"]["scope"] == "case_creation_source_only"
-            assert payload["feature_evidence"]["source_assurance"] == "synthetic_unattested"
-            assert payload["feature_evidence"]["context_ref"] == context_ref
-            assert payload["feature_evidence"]["eligible_observations"] == 5
-            assert payload["bank_source_attested"] is False
-            assert payload["enforcement_activated"] is False
-            assert str(event_id) not in good.text
-            assert "synthetic-analyst" not in good.text
-            assert factory_calls[0] == 1
-
-            tests = (
-                (path(case_id), {}, 401),
-                (path(case_id), auth("revoked"), 401),
-                (path(case_id), auth("expired"), 401),
-                (path(case_id), auth("outage"), 503),
-                (path(case_id), auth("no-read"), 403),
-                (path(case_id), auth("wrong-tenant"), 404),
-                (path(case_id, tenant="tenant-b"), auth(), 404),
+        for target, headers, expected_status in tests:
+            result = client.get(
+                target, headers={
+                    **headers, "X-Tenant-Id": "tenant-b", "X-Role": "admin",
+                },
             )
-            for target, headers, expected_status in tests:
-                result = client.get(
-                    target, headers={
-                        **headers, "X-Tenant-Id": "tenant-b", "X-Role": "admin",
-                    },
-                )
-                assert result.status_code == expected_status, result.text
-                assert "feature_evidence" not in result.text
-            assert factory_calls[0] == 1  # no data access on rejected credentials/role
+            assert result.status_code == expected_status, result.text
+            assert "feature_evidence" not in result.text
+        assert factory_calls[0] == 1  # no data access on rejected credentials/role
 
-            verifier.revoked = True
-            assert client.get(path(case_id), headers=auth()).status_code == 401
-            verifier.revoked = False
-            missing = client.get(path(uuid4()), headers=auth())
-            assert missing.status_code == 503
-            assert "feature_evidence" not in missing.text
-            assert factory_calls[0] == 2
+        verifier.revoked = True
+        assert client.get(path(case_id), headers=auth()).status_code == 401
+        verifier.revoked = False
+        missing = client.get(path(uuid4()), headers=auth())
+        assert missing.status_code == 503
+        assert "feature_evidence" not in missing.text
+        assert factory_calls[0] == 2
 
-            rows = audit_rows(installation)
-            case_rows = [row for row in rows if row["action"] == "case.read"]
-            assert [row["result"] for row in case_rows[:2]] == [
-                "authorized", "succeeded",
-            ]
-            assert case_rows[1]["context_ref"] == context_ref
-            assert case_rows[-2]["result"] == "authorized"
-            assert case_rows[-1]["result"] == "failed"
-            assert case_rows[-1]["reason"] == "case_feature_unavailable"
-            assert len({row["attempt_ref"] for row in case_rows[:2]}) == 1
-            assert all(
-                len(row["attempt_ref"]) == 32 and len(row["tenant_ref"]) == 64
-                for row in rows
-            )
-            assert "tenant-a" not in str(rows) and "tenant-b" not in str(rows)
-            assert "synthetic-analyst" not in str(rows)
-            assert "synthetic-only" not in str(rows)
-            assert audit_rows(installation) == rows
+        rows = audit_rows(installation)
+        case_rows = [row for row in rows if row["action"] == "case.read"]
+        assert [row["result"] for row in case_rows[:2]] == [
+            "authorized", "succeeded",
+        ]
+        assert case_rows[1]["context_ref"] == context_ref
+        assert case_rows[-2]["result"] == "authorized"
+        assert case_rows[-1]["result"] == "failed"
+        assert case_rows[-1]["reason"] == "case_feature_unavailable"
+        assert len({row["attempt_ref"] for row in case_rows[:2]}) == 1
+        assert all(
+            len(row["attempt_ref"]) == 32 and len(row["tenant_ref"]) == 64
+            for row in rows
+        )
+        assert "tenant-a" not in str(rows) and "tenant-b" not in str(rows)
+        assert "synthetic-analyst" not in str(rows)
+        assert "synthetic-only" not in str(rows)
+        assert audit_rows(installation) == rows
 
-            audit_connection.close()
-            refused = client.get(path(case_id), headers=auth())
-            assert refused.status_code == 503
-            assert "feature_evidence" not in refused.text
-            assert factory_calls[0] == 2
+        # Every audit append has closed its own PG connection.
+        assert audit_connections and all(connection.closed for connection in audit_connections)
+
+        def failing_audit_factory():
+            raise RuntimeError("synthetic audit connection outage")
+
+        monkeypatch.setattr(
+            app.state, "security_audit",
+            PostgresSecurityAuditSink(connections=failing_audit_factory),
+        )
+        refused = client.get(path(case_id), headers=auth())
+        assert refused.status_code == 503
+        assert "feature_evidence" not in refused.text
+        assert factory_calls[0] == 2
 
 
 def test_default_and_non_durable_audit_never_expose_synthetic_features(
@@ -184,6 +199,20 @@ def test_default_and_non_durable_audit_never_expose_synthetic_features(
         assert "feature_evidence" not in response.text
         assert calls == [0]
 
+        # Even a concrete PostgreSQL sink is unsafe here when it holds one
+        # mutable connection across concurrently served tenants/requests.
+        with workflow.connect(installation) as shared:
+            monkeypatch.setattr(
+                app.state, "security_audit", PostgresSecurityAuditSink(shared),
+            )
+            before = audit_rows(installation)
+            refused = client.get(path(case_id), headers=auth())
+            assert refused.status_code == 503
+            assert refused.json() == {"detail": "security audit unavailable"}
+            assert "feature_evidence" not in refused.text
+            assert calls == [0]
+            assert audit_rows(installation) == before
+
 
 def test_protected_feature_route_is_default_off_even_with_postgres_audit(
     installation, monkeypatch,
@@ -192,14 +221,14 @@ def test_protected_feature_route_is_default_off_even_with_postgres_audit(
     case_id, _, _ = features._source(installation, feature=True)
     monkeypatch.setattr(app.state, "identity_verifier", SyntheticVerifier())
     monkeypatch.setattr(app.state, "case_feature_reader", None)
-    with workflow.connect(installation) as audit_connection:
-        monkeypatch.setattr(
-            app.state, "security_audit", PostgresSecurityAuditSink(audit_connection),
-        )
-        with TestClient(app) as client:
-            result = client.get(path(case_id), headers=auth())
-            assert result.status_code == 503
-            assert result.json() == {"detail": "case feature evidence unavailable"}
+    monkeypatch.setattr(
+        app.state, "security_audit",
+        PostgresSecurityAuditSink(connections=lambda: workflow.connect(installation)),
+    )
+    with TestClient(app) as client:
+        result = client.get(path(case_id), headers=auth())
+        assert result.status_code == 503
+        assert result.json() == {"detail": "case feature evidence unavailable"}
     rows = audit_rows(installation)
     case_reads = [row for row in rows if row["action"] == "case.read"]
     assert [row["result"] for row in case_reads] == ["authorized", "failed"]
