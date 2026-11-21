@@ -23,13 +23,13 @@ from test_postgres_shadow_copy_mve import (
     _synthetic_copy,
 )
 
+from gasha.api.main import app
 from gasha.cases.evaluation_alerts import (
     PostgresEvaluationAlertWriter,
     evaluation_context_ref,
 )
-from gasha.domain.models import DecisionAction
-from gasha.api.main import app
 from gasha.cases.postgres_feature_view import ExplicitPostgresCaseFeatureReader
+from gasha.domain.models import DecisionAction
 from gasha.ingestion.contracts import FraudEventEnvelope
 from gasha.ingestion.postgres_store import PostgresPendingEvaluationStore
 from gasha.ingestion.service import IngestionService
@@ -46,8 +46,7 @@ from gasha.postgres_evaluations import (
     PostgresEvaluationPersistence,
     PostgresShadowEvaluationRepository,
 )
-from gasha.security.access import Capability
-from gasha.security.access import CredentialRejected
+from gasha.security.access import Capability, CredentialRejected
 from gasha.security.postgres_audit import PostgresSecurityAuditSink
 
 schema = alerts.schema
