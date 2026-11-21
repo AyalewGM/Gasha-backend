@@ -120,7 +120,7 @@ class ExplicitPostgresCaseFeatureReader:
             except (TypeError, ValueError) as exc:
                 raise CaseSourceUnavailable("case source unavailable") from exc
             if (
-                or record.event.tenant_id != tenant_id
+                record.event.tenant_id != tenant_id
                 or record.event.event_id != creation.source_event_id
                 or record.event.canonical_transaction.tenant_id != tenant_id
                 or record.event.canonical_transaction.event_id != creation.source_event_id
