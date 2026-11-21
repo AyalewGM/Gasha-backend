@@ -514,7 +514,7 @@ def test_reader_rejects_persisted_corruption_with_transactional_rollback(
                                if key != "lineage_ref"}
                     lineage["event_id"] = UUID(str(lineage["event_id"]))
                     lineage["decision_as_of"] = datetime.fromisoformat(
-                        str(lineage["decision_as_of"]).replace("Z", "+00:00")
+                        str(lineage["decision_as_of"])
                     )
                     feature["lineage_ref"] = _lineage_ref(lineage)
                     accepted = ShadowEvaluationRecord.model_validate_json(dumps(raw))
