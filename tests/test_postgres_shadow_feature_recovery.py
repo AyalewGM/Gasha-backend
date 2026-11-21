@@ -15,7 +15,7 @@ import test_postgres_evaluation_alerts as alerts
 import test_postgres_synthetic_fraud_workflow as workflow
 from fastapi.testclient import TestClient
 from test_kafka_ingestion import FakeRecord, make_consumer
-from test_postgres_case_writer_bridge import principal
+from test_postgres_case_writer_bridge import ASSIGNEE, AssigneeDirectory, principal
 from test_postgres_evaluations import POLICY
 from test_postgres_shadow_copy_mve import (
     TENANT,
@@ -29,6 +29,11 @@ from gasha.cases.evaluation_alerts import (
     evaluation_context_ref,
 )
 from gasha.cases.postgres_feature_view import ExplicitPostgresCaseFeatureReader
+from gasha.cases.postgres_history_reader import ExplicitPostgresCaseHistoryReader
+from gasha.cases.postgres_queue_reader import ExplicitPostgresCaseQueueReader
+from gasha.cases.postgres_writer_bridge import ExplicitPostgresCaseTransitionWriter
+from gasha.cases.synthetic_ranking import SyntheticPostgresRankingSource
+from gasha.cases.timeline import VerifiedEvaluation
 from gasha.domain.models import DecisionAction
 from gasha.ingestion.contracts import FraudEventEnvelope
 from gasha.ingestion.postgres_store import PostgresPendingEvaluationStore
@@ -336,6 +341,206 @@ def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
 
     assert bank_path == netguardians_path
     assert len(bank_path) == 3
+
+    # #45/Frontend #9 integration contract: exercise analyst transitions
+    # against the very same recovered and deduplicated founding case.
+    # This still uses FastAPI TestClient, not a browser/BFF/CSRF installation.
+    analyst_caps = frozenset({
+        Capability.CASE_READ, Capability.CASE_TRIAGE, Capability.CASE_ASSIGN,
+        Capability.CASE_DISPOSITION, Capability.CASE_FEEDBACK,
+    })
+
+    class SyntheticInvestigatorIdentity:
+        def verify(self, bearer: str):
+            if bearer == "synthetic-investigator":
+                return principal(caps=analyst_caps)
+            if bearer == "synthetic-foreign-investigator":
+                return principal(tenant="tenant-b", caps=analyst_caps)
+            if bearer == "synthetic-read-only":
+                return principal(caps=frozenset({Capability.CASE_READ}))
+            if bearer == "synthetic-expired":
+                return replace(
+                    principal(caps=analyst_caps),
+                    expires_at=datetime.now(UTC) - timedelta(seconds=1),
+                )
+            raise CredentialRejected("synthetic credential refused or revoked")
+
+    class CommittedEvaluationDirectory:
+        """Synthetic lookup uses the persisted, tenant-bound evaluation, not JSON."""
+
+        def resolve(self, *, principal, tenant_id, event_id, at):
+            if tenant_id != TENANT or tenant_id not in principal.tenant_ids:
+                raise LookupError("wrong synthetic evaluation scope")
+            with workflow.connect(installation) as connection:
+                persisted = PostgresShadowEvaluationRepository(
+                    connection, tenant_ids=(TENANT,),
+                ).get(tenant_id, event_id)
+            if persisted is None or persisted.persisted_at > at:
+                raise LookupError("synthetic evaluation unavailable")
+            return VerifiedEvaluation(
+                tenant_id, event_id, evaluation_context_ref(persisted),
+            )
+
+    connections = lambda: workflow.connect(installation)
+    working_audit = PostgresSecurityAuditSink(connections=connections)
+    monkeypatch.setattr(app.state, "identity_verifier", SyntheticInvestigatorIdentity())
+    monkeypatch.setattr(app.state, "security_audit", working_audit)
+    monkeypatch.setattr(
+        app.state, "case_history_reader",
+        ExplicitPostgresCaseHistoryReader(connections=connections),
+    )
+    monkeypatch.setattr(
+        app.state, "case_queue_reader",
+        ExplicitPostgresCaseQueueReader(
+            connections=connections,
+            ranking=SyntheticPostgresRankingSource(
+                connections=connections, tenant_id=TENANT,
+                alert_policies=(workflow.ALERT_POLICY,),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        app.state, "case_transition_writer",
+        ExplicitPostgresCaseTransitionWriter(
+            connections=connections, evaluations=CommittedEvaluationDirectory(),
+            assignees=AssigneeDirectory(),
+        ),
+    )
+    full_auth = {"Authorization": "Bearer synthetic-investigator"}
+    case_id = rows[0]["case_id"]
+    case_path = f"/v1/tenants/{TENANT}/cases/{case_id}"
+    with TestClient(app) as http:
+        queue = http.get(f"/v1/tenants/{TENANT}/cases/queue", headers=full_auth)
+        assert queue.status_code == 200, queue.text
+        [selected] = queue.json()["items"]
+        assert selected["case_id"] == str(case_id)
+        assert selected["source_event_id"] == str(founding["source_event_id"])
+        assert selected["source_context_ref"] == founding["source_context_ref"]
+        assert "MM-02" in selected["scenario_ids"]
+        assert queue.json()["enforcement_activated"] is False
+        initial_history = http.get(f"{case_path}/history", headers=full_auth)
+        assert initial_history.status_code == 200, initial_history.text
+        assert [item["operation"] for item in initial_history.json()["events"]] == ["create"]
+        initial_feature = http.get(f"{case_path}/feature-evidence", headers=full_auth)
+        assert initial_feature.status_code == 200, initial_feature.text
+        assert initial_feature.json()["feature_evidence"]["context_ref"] == (
+            founding["source_context_ref"]
+        )
+
+        triage = {
+            "source_event_id": str(founding["source_event_id"]),
+            "expected_revision": 1,
+            "idempotency_key": uuid4().hex,
+            "reason_code": "analyst_triage",
+        }
+        target = f"{case_path}/transitions/triage"
+        for denied_headers, expected in (
+            ({}, 401),
+            ({"Authorization": "Bearer synthetic-revoked"}, 401),
+            ({"Authorization": "Bearer synthetic-expired"}, 401),
+            ({"Authorization": "Bearer synthetic-read-only"}, 403),
+            ({"Authorization": "Bearer synthetic-foreign-investigator"}, 404),
+        ):
+            refused = http.post(target, json=triage, headers=denied_headers)
+            assert refused.status_code == expected, refused.text
+            assert "source_context_ref" not in refused.text
+        with workflow.connect(installation) as db:
+            assert db.execute(
+                "SELECT count(*) AS n FROM analyst_case_events"
+            ).fetchone()["n"] == before_cases
+
+        def broken_audit():
+            raise RuntimeError("synthetic database audit unavailable")
+
+        monkeypatch.setattr(
+            app.state, "security_audit",
+            PostgresSecurityAuditSink(connections=broken_audit),
+        )
+        blocked = http.post(target, json=triage, headers=full_auth)
+        assert blocked.status_code == 503
+        assert "source_event_id" not in blocked.text
+        monkeypatch.setattr(app.state, "security_audit", working_audit)
+        with workflow.connect(installation) as db:
+            assert db.execute(
+                "SELECT count(*) AS n FROM analyst_case_events"
+            ).fetchone()["n"] == before_cases
+
+        commands = (
+            ("triage", triage),
+            ("assign", {
+                "source_event_id": triage["source_event_id"],
+                "expected_revision": 2,
+                "idempotency_key": uuid4().hex,
+                "reason_code": "investigation_assigned",
+                "assignee_selector": str(ASSIGNEE),
+            }),
+            ("dispose", {
+                "source_event_id": triage["source_event_id"],
+                "expected_revision": 3,
+                "idempotency_key": uuid4().hex,
+                "reason_code": "legitimate_evidence",
+                "disposition": "confirmed_legitimate",
+            }),
+            ("reconcile", {
+                "source_event_id": triage["source_event_id"],
+                "expected_revision": 4,
+                "idempotency_key": uuid4().hex,
+                "reason_code": "feedback_reconciled",
+            }),
+        )
+        for revision, (operation, body) in enumerate(commands, 1):
+            route = f"{case_path}/transitions/{operation}"
+            completed = http.post(route, json=body, headers=full_auth)
+            assert completed.status_code == 200, completed.text
+            assert completed.json()["revision"] == revision + 1
+            assert completed.json()["bank_execution"] == "unknown"
+            assert completed.json()["enforcement_activated"] is False
+            # The same idempotency key must never append another case event.
+            repeated = http.post(route, json=body, headers=full_auth)
+            assert repeated.status_code == 200, repeated.text
+            assert repeated.json() == completed.json()
+            refreshed = http.get(f"{case_path}/history", headers=full_auth)
+            assert refreshed.status_code == 200, refreshed.text
+            assert len(refreshed.json()["events"]) == revision + 1
+            assert refreshed.json()["events"][0] == initial_history.json()["events"][0]
+            evidence = http.get(f"{case_path}/feature-evidence", headers=full_auth)
+            assert evidence.status_code == 200, evidence.text
+            assert evidence.json()["feature_evidence"]["context_ref"] == (
+                founding["source_context_ref"]
+            )
+            assert evidence.json()["enforcement_activated"] is False
+        end_queue = http.get(f"/v1/tenants/{TENANT}/cases/queue", headers=full_auth)
+        assert end_queue.status_code == 200, end_queue.text
+        assert end_queue.json()["items"] == []
+
+    with workflow.connect(installation) as db:
+        assert db.execute(
+            "SELECT count(*) AS n FROM analyst_case_events"
+        ).fetchone()["n"] == before_cases + len(commands)
+        assert db.execute(
+            "SELECT count(*) AS n FROM evaluation_alerts"
+        ).fetchone()["n"] == before_alerts
+        assert db.execute(
+            "SELECT count(*) AS n FROM shadow_evaluations"
+        ).fetchone()["n"] == 2
+        event_rows = db.execute(
+            "SELECT operation, bank_execution, revision FROM analyst_case_events "
+            "WHERE tenant_id=%s AND case_id=%s ORDER BY revision",
+            (TENANT, case_id),
+        ).fetchall()
+        assert [row["operation"] for row in event_rows] == [
+            "create", "triage", "assign", "dispose", "reconcile",
+        ]
+        assert [row["revision"] for row in event_rows] == [1, 2, 3, 4, 5]
+        assert all(row["bank_execution"] == "unknown" for row in event_rows)
+        redacted = db.execute(
+            "SELECT action, tenant_ref, actor_ref FROM security_audit_events"
+        ).fetchall()
+        assert all("tenant-a" not in str(row) for row in redacted)
+        assert all("synthetic-investigator" not in str(row) for row in redacted)
+        assert sum(row["action"] == "case.triage" for row in redacted) >= 1
+
+    assert bank_path == netguardians_path
 
 
 @pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
