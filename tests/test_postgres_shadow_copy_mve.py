@@ -544,3 +544,81 @@ def test_feature_evidence_alert_audit_failure_rolls_back_all(installation) -> No
         assert db.execute(
             "SELECT count(*) AS n FROM shadow_evaluations",
         ).fetchone()["n"] == 1
+
+
+@pytest.mark.parametrize("outage", [RuntimeError, TimeoutError])
+def test_synthetic_incumbent_completes_while_shadow_copy_consumer_is_stalled(
+    outage: type[Exception],
+) -> None:
+    """#47 fixture-level isolation: a blocked Gasha copy cannot hold the primary path.
+
+    This deliberately models independently running Bank and NetGuardians loops.
+    It does not represent an installed Bank connector, network timeout guarantee,
+    production broker topology or representative latency measurement.
+    """
+    from threading import Event, Thread
+
+    shadow_entered = Event()
+    release_shadow = Event()
+    first = _synthetic_copy()
+    outcomes: list[IngestionOutcome] = []
+    accepted_by_bank: list[str] = []
+    observed_by_incumbent: list[str] = []
+    copy_outbox: list[InboundBankEvent] = []
+
+    class StalledShadowAdapter:
+        adapter_type = "synthetic-stalled-shadow"
+        adapter_version = "1.0"
+        supported_schema_versions = frozenset({SHADOW_COPY_SCHEMA})
+
+        def adapt(self, event: InboundBankEvent) -> FraudEventEnvelope:
+            shadow_entered.set()
+            # Safety bound is test-only. The primary synthetic loops do not
+            # call this adapter or wait for this event.
+            if not release_shadow.wait(timeout=5):
+                raise TimeoutError("synthetic shadow fixture deadline exceeded")
+            raise outage("synthetic shadow consumer unavailable")
+
+    failed_shadow = IngestionService({
+        "synthetic-shadow-copy": StalledShadowAdapter(),
+    })
+
+    def consume_shadow() -> None:
+        outcomes.append(failed_shadow.ingest(first).outcome)
+
+    consumer = Thread(target=consume_shadow, daemon=True)
+    consumer.start()
+    try:
+        assert shadow_entered.wait(timeout=2)
+        assert consumer.is_alive()
+        # Simulate three Bank transaction completions and corresponding
+        # incumbent observations while Gasha is still stuck processing a copy.
+        # No Gasha result/callback/decision participates in this primary path.
+        for event in (first, _synthetic_copy(), _synthetic_copy()):
+            identifier = str(event.payload["event_id"])
+            accepted_by_bank.append(identifier)
+            observed_by_incumbent.append(identifier)
+            copy_outbox.append(event)
+        assert len(set(accepted_by_bank)) == 3
+        assert accepted_by_bank == observed_by_incumbent
+        assert not outcomes
+        assert consumer.is_alive()
+    finally:
+        release_shadow.set()
+        consumer.join(timeout=2)
+
+    assert not consumer.is_alive()
+    assert outcomes == [IngestionOutcome.REJECTED]
+    assert len(copy_outbox) == 3
+    # Recovery consumes the same copies through the real synthetic normalizer.
+    # Replays do not retroactively change Bank or incumbent results.
+    recovered = IngestionService({
+        "synthetic-shadow-copy": SyntheticShadowCopyAdapter(),
+    })
+    for event in copy_outbox:
+        accepted = recovered.ingest(event)
+        assert accepted.outcome is IngestionOutcome.ACCEPTED
+        assert accepted.envelope is not None
+        assert accepted.envelope.operating_mode is OperatingMode.SHADOW
+        assert recovered.ingest(event).outcome is IngestionOutcome.DUPLICATE
+    assert accepted_by_bank == observed_by_incumbent
