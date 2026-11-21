@@ -22,7 +22,7 @@ from gasha.cases.timeline import (
     VerifiedEvaluation,
 )
 from gasha.domain.models import DecisionAction, OperatingMode
-from gasha.orchestration import ShadowEvaluationRecord
+from gasha.orchestration import ShadowEvaluationRecord, canonical_evaluation_context_payload
 from gasha.postgres import Connection
 from gasha.security.access import Capability, TrustedPrincipal, authorize, tenant_audit_ref
 
@@ -115,7 +115,7 @@ def alert_policy_digest(policy: AlertPolicy) -> str:
 
 
 def evaluation_context_ref(record: ShadowEvaluationRecord) -> str:
-    return _digest(["gasha-shadow-evaluation-v1", record.model_dump(mode="json")])
+    return _digest(["gasha-shadow-evaluation-v1", canonical_evaluation_context_payload(record)])
 
 
 def alert_group_ref(record: ShadowEvaluationRecord, policy_version: str) -> str:
