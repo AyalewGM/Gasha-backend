@@ -17,13 +17,13 @@ from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID
 
-from gasha.cases.evaluation_alerts import evaluation_context_ref
+from gasha.cases.evaluation_alerts import persisted_evaluation_context_matches
 from gasha.cases.postgres_history_reader import authorized_case_read
 from gasha.cases.postgres_timeline import PostgresCaseTimelineService
 from gasha.cases.timeline import CaseRejected, CaseSourceUnavailable
 from gasha.domain.models import DecisionAction, OperatingMode
 from gasha.postgres import Connection
-from gasha.postgres_evaluations import PostgresShadowEvaluationRepository
+from gasha.orchestration import ShadowEvaluationRecord
 from gasha.security.access import TrustedPrincipal
 
 # Never echo an unconstrained persisted string as a browser-visible signal.
@@ -102,18 +102,36 @@ class ExplicitPostgresCaseFeatureReader:
                 alert = cursor.fetchone()
             if alert is None:
                 raise CaseSourceUnavailable("case source unavailable")
-            record = PostgresShadowEvaluationRepository(
-                connection, tenant_ids=(tenant_id,),
-            ).get(tenant_id, creation.source_event_id)
+            # Verify the original serialized source, not a reserialized
+            # Pydantic object: historical explicit-null contexts legitimately
+            # differ from new canonical writes. Read exactly one durable row.
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT record_json FROM shadow_evaluations
+                       WHERE tenant_id = %s AND event_id = %s""",
+                    (tenant_id, str(creation.source_event_id)),
+                )
+                source = cursor.fetchone()
+            if source is None:
+                raise CaseSourceUnavailable("case source unavailable")
+            raw_record_json = str(source["record_json"])
+            try:
+                record = ShadowEvaluationRecord.model_validate_json(raw_record_json)
+            except (TypeError, ValueError) as exc:
+                raise CaseSourceUnavailable("case source unavailable") from exc
             if (
-                record is None
                 or record.event.tenant_id != tenant_id
                 or record.event.event_id != creation.source_event_id
                 or record.event.canonical_transaction.tenant_id != tenant_id
                 or record.event.canonical_transaction.event_id != creation.source_event_id
+                or record.event.operating_mode is not OperatingMode.SHADOW
                 or record.evaluation.operating_mode is not OperatingMode.SHADOW
                 or record.evaluation.effective_action is not DecisionAction.NO_ACTION_SHADOW
-                or evaluation_context_ref(record) != creation.source_context_ref
+                or not persisted_evaluation_context_matches(
+                    record,
+                    raw_record_json=raw_record_json,
+                    stored_context_ref=creation.source_context_ref,
+                )
             ):
                 raise CaseSourceUnavailable("case source unavailable")
             evidence = record.feature_evidence

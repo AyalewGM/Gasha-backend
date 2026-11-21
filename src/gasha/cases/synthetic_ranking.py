@@ -13,7 +13,7 @@ from gasha.cases.evaluation_alerts import (
     AlertPolicy,
     alert_evidence,
     alert_group_ref,
-    evaluation_context_ref,
+    persisted_evaluation_context_matches,
 )
 from gasha.cases.postgres_history_reader import authorized_case_read
 from gasha.cases.postgres_queue_reader import RankedCaseReference, RankedCaseSelection
@@ -141,17 +141,21 @@ class SyntheticPostgresRankingSource:
         policy = self._policies.get(str(row["policy_version"]))
         if policy is None:
             raise CaseQueueRejected("alert policy version unavailable")
-        record = ShadowEvaluationRecord.model_validate_json(str(row["record_json"]))
+        raw_record_json = str(row["record_json"])
+        record = ShadowEvaluationRecord.model_validate_json(raw_record_json)
         evidence = alert_evidence(self._tenant_id, record, policy)
         if evidence is None:
             raise CaseQueueRejected("persisted evaluation does not qualify for an alert")
         priority, scenarios = evidence
-        context_ref = evaluation_context_ref(record)
+        context_ref = row["context_ref"]
+        if type(context_ref) is not str or not persisted_evaluation_context_matches(
+            record, raw_record_json=raw_record_json, stored_context_ref=context_ref,
+        ):
+            raise CaseQueueRejected("alert and persisted evaluation disagree")
         group_ref = alert_group_ref(record, policy.version)
         decision = record.evaluation.decision
         if (
             record.event.event_id != event_id
-            or row["context_ref"] != context_ref
             or row["group_ref"] != group_ref
             or row["decision_action"] != decision.action.value
             or row["risk_score"] != decision.risk_score

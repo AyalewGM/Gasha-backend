@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
 from hashlib import sha256
-from json import dumps
+from json import dumps, loads
 from math import isfinite
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -22,7 +22,7 @@ from gasha.cases.timeline import (
     VerifiedEvaluation,
 )
 from gasha.domain.models import DecisionAction, OperatingMode
-from gasha.orchestration import ShadowEvaluationRecord
+from gasha.orchestration import ShadowEvaluationRecord, canonical_evaluation_context_payload
 from gasha.postgres import Connection
 from gasha.security.access import Capability, TrustedPrincipal, authorize, tenant_audit_ref
 
@@ -115,7 +115,43 @@ def alert_policy_digest(policy: AlertPolicy) -> str:
 
 
 def evaluation_context_ref(record: ShadowEvaluationRecord) -> str:
-    return _digest(["gasha-shadow-evaluation-v1", record.model_dump(mode="json")])
+    """The only context digest emitted by new evaluations and alerts."""
+    return _digest(["gasha-shadow-evaluation-v1", canonical_evaluation_context_payload(record)])
+
+
+def persisted_evaluation_context_matches(
+    record: ShadowEvaluationRecord, *, raw_record_json: str, stored_context_ref: str,
+) -> bool:
+    """Verify a stored historical reference without authorizing legacy writes.
+
+    A supported older serializer could persist an explicit null optional
+    feature field and hash that exact JSON shape. Only that historical shape
+    may use an alternative digest on read or replay. A missing field, present
+    evidence, or arbitrary alternative never gains a fallback.
+    """
+    if type(raw_record_json) is not str or type(stored_context_ref) is not str:
+        return False
+    if stored_context_ref == evaluation_context_ref(record):
+        return True
+    try:
+        raw_payload = loads(raw_record_json)
+    except (TypeError, ValueError):
+        return False
+    if (
+        type(raw_payload) is not dict
+        or "feature_evidence" not in raw_payload
+        or raw_payload["feature_evidence"] is not None
+        or record.feature_evidence is not None
+    ):
+        return False
+    legacy_payload = canonical_evaluation_context_payload(record)
+    legacy_payload["feature_evidence"] = None
+    # Byte-relevant semantic fields must exactly match the typed canonical
+    # record; do not bless an unverified arbitrary dict or caller hash.
+    return (
+        raw_payload == legacy_payload
+        and stored_context_ref == _digest(["gasha-shadow-evaluation-v1", raw_payload])
+    )
 
 
 def alert_group_ref(record: ShadowEvaluationRecord, policy_version: str) -> str:

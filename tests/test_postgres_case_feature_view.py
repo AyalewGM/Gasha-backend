@@ -7,22 +7,29 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
+from json import dumps, loads
 from uuid import UUID, uuid4
 
 import pytest
 import test_postgres_evaluation_alerts as alerts
+import test_postgres_explicit_null_historical_context as historical
 import test_postgres_shadow_copy_mve as copies
 import test_postgres_synthetic_fraud_workflow as workflow
 from test_postgres_case_writer_bridge import principal
 from test_postgres_evaluations import POLICY
 
-from gasha.cases.evaluation_alerts import PostgresEvaluationAlertWriter
+import gasha.cases.evaluation_alerts as evidence
+from gasha.cases.evaluation_alerts import (
+    PostgresEvaluationAlertWriter,
+    evaluation_context_ref,
+    persisted_evaluation_context_matches,
+)
 from gasha.cases.postgres_feature_view import ExplicitPostgresCaseFeatureReader
 from gasha.cases.timeline import CaseRejected, CaseSourceUnavailable
 from gasha.domain.models import DecisionAction
 from gasha.ingestion.service import IngestionService
 from gasha.ingestion.shadow_copy import SyntheticShadowCopyAdapter
-from gasha.orchestration import ShadowOrchestrator
+from gasha.orchestration import ShadowEvaluationRecord, ShadowOrchestrator
 from gasha.postgres_evaluations import (
     PostgresEvaluationPersistence,
     PostgresShadowEvaluationRepository,
@@ -206,3 +213,140 @@ def test_legacy_missing_feature_is_not_zero_and_foreign_scope_is_hidden(
             db, tenant_ids=(TENANT,),
         ).get(TENANT, event_id)
         assert persisted is not None and persisted.feature_evidence is None
+
+
+@pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+def test_historical_explicit_null_case_evidence_read_preserves_original_reference(
+    installation, monkeypatch,
+):
+    """A real old-writer record stays readable without rewriting its hash."""
+    alerts.install_policy(installation, workflow.ALERT_POLICY)
+    original_dump = ShadowEvaluationRecord.model_dump_json
+
+    def old_serializer(self, *args, **kwargs):
+        payload = loads(original_dump(self, *args, **kwargs))
+        if self.feature_evidence is None:
+            payload["feature_evidence"] = None
+        return dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    # The old serializer/digest exists ONLY while writing this synthetic row.
+    with monkeypatch.context() as patch:
+        patch.setattr(ShadowEvaluationRecord, "model_dump_json", old_serializer)
+        patch.setattr(evidence, "evaluation_context_ref", historical._historical_null_ref)
+        case_id, event_id, context_ref = _source(installation, feature=False)
+
+    with workflow.connect(installation) as db:
+        row = db.execute(
+            "SELECT record_json FROM shadow_evaluations "
+            "WHERE tenant_id=%s AND event_id=%s",
+            (TENANT, str(event_id)),
+        ).fetchone()
+        assert row is not None
+        original_raw = str(row["record_json"])
+        parsed = ShadowEvaluationRecord.model_validate_json(original_raw)
+        assert loads(original_raw)["feature_evidence"] is None
+        assert context_ref != evaluation_context_ref(parsed)
+        assert persisted_evaluation_context_matches(
+            parsed, raw_record_json=original_raw, stored_context_ref=context_ref,
+        )
+        before = tuple(
+            db.execute(f"SELECT count(*) AS n FROM {name}").fetchone()["n"]
+            for name in (
+                "shadow_evaluations", "evaluation_alerts", "analyst_case_events",
+                "fraud_decision_audit", "security_audit_events",
+            )
+        )
+
+    reader = ExplicitPostgresCaseFeatureReader(
+        connections=lambda: workflow.connect(installation),
+    )
+    first = reader.read(
+        principal=principal(caps=READ), tenant_id=TENANT,
+        case_id=case_id, at=datetime.now(UTC),
+    )
+    assert first.context_ref == context_ref
+    assert first.availability == "not_recorded"
+    assert first.eligible_observations is None
+    assert first.unavailable_signals is None
+    assert reader.read(
+        principal=principal(caps=READ), tenant_id=TENANT,
+        case_id=case_id, at=datetime.now(UTC),
+    ) == first
+    # The historical fallback must NOT accept absent-field substitution,
+    # altered stored source identity or an arbitrary claimed link.
+    for corrupted in (
+        {key: value for key, value in loads(original_raw).items()
+         if key != "feature_evidence"},
+        dict(loads(original_raw), persisted_at="2030-01-01T00:00:00Z"),
+        dict(loads(original_raw), feature_evidence={"forged": True}),
+    ):
+        altered_raw = dumps(corrupted)
+        try:
+            changed = ShadowEvaluationRecord.model_validate_json(altered_raw)
+        except ValueError:
+            continue  # Invalid source schema is already fail-closed.
+        assert not persisted_evaluation_context_matches(
+            changed, raw_record_json=altered_raw, stored_context_ref=context_ref,
+        )
+    with pytest.raises(CaseSourceUnavailable):
+        reader.read(
+            principal=principal(tenant="tenant-b", caps=READ),
+            tenant_id="tenant-b", case_id=case_id, at=datetime.now(UTC),
+        )
+    with workflow.connect(installation) as db:
+        assert str(db.execute(
+            "SELECT record_json FROM shadow_evaluations "
+            "WHERE tenant_id=%s AND event_id=%s",
+            (TENANT, str(event_id)),
+        ).fetchone()["record_json"]) == original_raw
+        assert tuple(
+            db.execute(f"SELECT count(*) AS n FROM {name}").fetchone()["n"]
+            for name in (
+                "shadow_evaluations", "evaluation_alerts", "analyst_case_events",
+                "fraud_decision_audit", "security_audit_events",
+            )
+        ) == before
+
+
+@pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+def test_feature_evidence_tamper_cannot_claim_existing_case_context(installation):
+    """Actual durable feature record; synthetic tampering never validates."""
+    alerts.install_policy(installation, workflow.ALERT_POLICY)
+    case_id, event_id, context_ref = _source(installation, feature=True)
+    with workflow.connect(installation) as db:
+        row = db.execute(
+            "SELECT record_json FROM shadow_evaluations "
+            "WHERE tenant_id=%s AND event_id=%s",
+            (TENANT, str(event_id)),
+        ).fetchone()
+        assert row is not None
+        raw = str(row["record_json"])
+    clean_record = ShadowEvaluationRecord.model_validate_json(raw)
+    assert persisted_evaluation_context_matches(
+        clean_record, raw_record_json=raw, stored_context_ref=context_ref,
+    )
+    original = loads(raw)
+    assert isinstance(original["feature_evidence"], dict)
+    assert original["feature_evidence"]["unavailable_signals"] == []
+    for field, replacement in (
+        ("lineage_ref", "0" * 64),
+        ("source_fingerprint", "0" * 64),
+        ("unavailable_signals", ["fabricated_signal"]),
+    ):
+        forged = loads(raw)
+        forged["feature_evidence"][field] = replacement
+        forged_raw = dumps(forged)
+        try:
+            changed = ShadowEvaluationRecord.model_validate_json(forged_raw)
+        except ValueError:
+            continue  # Validator refuses malformed evidence.
+        assert not persisted_evaluation_context_matches(
+            changed, raw_record_json=forged_raw, stored_context_ref=context_ref,
+        )
+    reader = ExplicitPostgresCaseFeatureReader(
+        connections=lambda: workflow.connect(installation),
+    )
+    assert reader.read(
+        principal=principal(caps=READ), tenant_id=TENANT,
+        case_id=case_id, at=datetime.now(UTC),
+    ).context_ref == context_ref

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import cast
 from uuid import UUID
 
 from gasha.cases.evaluation_alerts import (
@@ -11,7 +12,7 @@ from gasha.cases.evaluation_alerts import (
 )
 from gasha.decision.audit import DecisionAuditRecord
 from gasha.ingestion.lease import EvaluationLease, LeaseLostError, current_evaluation_lease
-from gasha.orchestration import ShadowEvaluationRecord
+from gasha.orchestration import ShadowEvaluationRecord, canonical_evaluation_context_payload
 from gasha.postgres import Connection, Cursor
 from gasha.tenant_scope import require_tenant
 
@@ -97,7 +98,7 @@ def _immutable_replay_identity(record: ShadowEvaluationRecord) -> dict[str, obje
     decision clock, evaluation latency and persistence time can differ on an
     otherwise identical retry and are not fraud-decision inputs.
     """
-    value = record.model_dump(mode="json")
+    value = canonical_evaluation_context_payload(record)
     value.pop("persisted_at", None)
     event = value["event"]
     if isinstance(event, dict):
@@ -219,7 +220,7 @@ def _verify_canonical_replay(
     from gasha.cases.evaluation_alerts import (
         alert_evidence,
         alert_group_ref,
-        evaluation_context_ref,
+        persisted_evaluation_context_matches,
     )
     from gasha.domain.models import FraudDecision
 
@@ -265,7 +266,11 @@ def _verify_canonical_replay(
             or saved_alert["priority_seed"] != qualified[0]
             or saved_alert["scenario_ids"] != list(qualified[1])
             or saved_alert["group_ref"] != alert_group_ref(canonical, alerts.policy.version)
-            or saved_alert["context_ref"] != evaluation_context_ref(canonical)
+            or not persisted_evaluation_context_matches(
+                canonical,
+                raw_record_json=str(saved_evaluation["record_json"]),
+                stored_context_ref=cast(str, saved_alert["context_ref"]),
+            )
         ):
             raise ValueError("conflicting evaluation replay: alert policy/evidence changed")
 
