@@ -350,3 +350,219 @@ def test_feature_evidence_tamper_cannot_claim_existing_case_context(installation
         principal=principal(caps=READ), tenant_id=TENANT,
         case_id=case_id, at=datetime.now(UTC),
     ).context_ref == context_ref
+
+
+@pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+@pytest.mark.parametrize("corruption", (
+    "alert_context", "alert_case", "nested_tenant", "nested_event",
+    "feature_lineage", "unknown_signal_relinked", "foreign_candidate",
+))
+def test_reader_rejects_persisted_corruption_with_transactional_rollback(
+    installation, corruption,
+):
+    """#45 PO/Security matrix: invoke the reader against actual corrupted SQL.
+
+    Test-only mutations run inside one privileged disposable-schema savepoint.
+    The same injected transaction lets the reader see those uncommitted rows,
+    and rollback restores the immutable production trigger and every source.
+    No application API or production immutability exception is introduced.
+    """
+    from contextlib import contextmanager
+
+    from gasha.intelligence.feature_evidence_v1 import _lineage_ref
+
+    alerts.install_policy(installation, workflow.ALERT_POLICY)
+    case_id, event_id, context_ref = _source(installation, feature=True)
+    other_case = None
+    if corruption == "alert_case":
+        # Force a second valid case with a different grouping device, so the
+        # wrong-case alert remains FK-valid and cannot pass the founding join.
+        from gasha.ingestion.contracts import InboundBankEvent
+
+        original_copy = copies._synthetic_copy()
+        altered_copy = InboundBankEvent.model_validate({
+            **original_copy.model_dump(),
+            "payload": {
+                **original_copy.payload,
+                "device_id": "different-synthetic-grouping-device",
+            },
+        })
+        receipt = IngestionService({
+            "synthetic-shadow-copy": SyntheticShadowCopyAdapter(),
+        }).ingest(altered_copy)
+        assert receipt.envelope is not None
+        assessment = copies._computed_graph_assessment(receipt.envelope)
+        with workflow.connect(installation) as db:
+            writer = PostgresEvaluationAlertWriter(
+                TENANT, workflow.ALERT_POLICY, principal(caps=CREATE),
+            )
+            result = ShadowOrchestrator(
+                {TENANT: POLICY},
+                persistence=PostgresEvaluationPersistence(db, alerts=writer),
+            ).evaluate(assessment.assessed_envelope, feature_assessment=assessment)
+            assert result.effective_action is DecisionAction.NO_ACTION_SHADOW
+            other = db.execute(
+                "SELECT case_id FROM evaluation_alerts WHERE tenant_id=%s AND event_id=%s",
+                (TENANT, str(assessment.event_id)),
+            ).fetchone()
+            assert other is not None
+            other_case = other["case_id"]
+            assert UUID(str(other_case)) != case_id
+
+    reader = ExplicitPostgresCaseFeatureReader(
+        connections=lambda: workflow.connect(installation),
+    )
+    baseline = reader.read(
+        principal=principal(caps=READ), tenant_id=TENANT,
+        case_id=case_id, at=datetime.now(UTC),
+    )
+    assert baseline.availability == "available"
+    assert baseline.context_ref == context_ref
+    tables = (
+        "shadow_evaluations", "evaluation_alerts", "analyst_case_events",
+        "fraud_decision_audit", "security_audit_events",
+    )
+    with workflow.connect(installation) as db:
+        def counts():
+            return tuple(
+                db.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"]
+                for table in tables
+            )
+
+        def source_rows():
+            return (
+                tuple(db.execute(
+                    "SELECT tenant_id, event_id, record_json FROM shadow_evaluations "
+                    "ORDER BY tenant_id, event_id",
+                ).fetchall()),
+                tuple(db.execute(
+                    "SELECT tenant_id, event_id, case_id, context_ref FROM evaluation_alerts "
+                    "ORDER BY tenant_id, event_id",
+                ).fetchall()),
+                tuple(db.execute(
+                    "SELECT tenant_id, case_id, revision, source_event_id, "
+                    "source_context_ref, event_json FROM analyst_case_events "
+                    "ORDER BY tenant_id, case_id, revision",
+                ).fetchall()),
+            )
+
+        original_counts, original_rows = counts(), source_rows()
+        source = db.execute(
+            "SELECT record_json FROM shadow_evaluations "
+            "WHERE tenant_id=%s AND event_id=%s",
+            (TENANT, str(event_id)),
+        ).fetchone()
+        assert source is not None
+        original_raw = str(source["record_json"])
+        raw = loads(original_raw)
+        assert raw["feature_evidence"] is not None
+
+        @contextmanager
+        def same_transaction():
+            # Unlike a psycopg Connection context, do NOT commit or close:
+            # this is a deliberately isolated read of uncommitted corruption.
+            yield db
+
+        in_transaction_reader = ExplicitPostgresCaseFeatureReader(
+            connections=same_transaction,
+        )
+        db.execute("SAVEPOINT synthetic_reader_corruption")
+        try:
+            if corruption == "alert_context":
+                db.execute(
+                    "UPDATE evaluation_alerts SET context_ref=%s "
+                    "WHERE tenant_id=%s AND event_id=%s",
+                    ("0" * 64, TENANT, str(event_id)),
+                )
+            elif corruption == "alert_case":
+                assert other_case is not None
+                db.execute(
+                    "UPDATE evaluation_alerts SET case_id=%s "
+                    "WHERE tenant_id=%s AND event_id=%s",
+                    (str(other_case), TENANT, str(event_id)),
+                )
+            else:
+                # 019 prevents even no-op UPDATE. Privileged corruption is
+                # confined to a savepoint; rollback restores trigger state.
+                db.execute(
+                    "ALTER TABLE shadow_evaluations "
+                    "DISABLE TRIGGER shadow_evaluations_immutable"
+                )
+                if corruption == "nested_tenant":
+                    raw["event"]["tenant_id"] = "tenant-b"
+                elif corruption == "nested_event":
+                    raw["event"]["event_id"] = str(uuid4())
+                elif corruption == "feature_lineage":
+                    raw["feature_evidence"]["source_fingerprint"] = "0" * 64
+                elif corruption == "foreign_candidate":
+                    # A same-event foreign row must never rescue a corrupted
+                    # local record, even with an apparently valid raw source.
+                    db.execute(
+                        "INSERT INTO shadow_evaluations "
+                        "(tenant_id, event_id, record_json, persisted_at) "
+                        "VALUES (%s, %s, %s, %s)",
+                        ("tenant-b", str(event_id), original_raw, datetime.now(UTC)),
+                    )
+                    raw["event"]["tenant_id"] = "tenant-b"
+                elif corruption == "unknown_signal_relinked":
+                    # Rebind *all* three stored links to a validly rehashed
+                    # event/evidence. The reader allowlist, not a mismatched
+                    # digest, must reject this synthetic unknown signal.
+                    feature = raw["feature_evidence"]
+                    feature["unavailable_signals"] = ["unknown_synthetic_signal"]
+                    lineage = {key: value for key, value in feature.items()
+                               if key != "lineage_ref"}
+                    lineage["event_id"] = UUID(str(lineage["event_id"]))
+                    lineage["decision_as_of"] = datetime.fromisoformat(
+                        str(lineage["decision_as_of"]).replace("Z", "+00:00")
+                    )
+                    feature["lineage_ref"] = _lineage_ref(lineage)
+                    accepted = ShadowEvaluationRecord.model_validate_json(dumps(raw))
+                    rebound = evaluation_context_ref(accepted)
+                    assert rebound != context_ref
+                    db.execute(
+                        "UPDATE evaluation_alerts SET context_ref=%s "
+                        "WHERE tenant_id=%s AND event_id=%s",
+                        (rebound, TENANT, str(event_id)),
+                    )
+                    db.execute(
+                        "UPDATE analyst_case_events "
+                        "SET source_context_ref=%s, "
+                        "event_json=jsonb_set(event_json, '{source_context_ref}', "
+                        "to_jsonb(%s::text)) "
+                        "WHERE tenant_id=%s AND case_id=%s AND revision=1",
+                        (rebound, rebound, TENANT, str(case_id)),
+                    )
+                else:
+                    raise AssertionError("unrecognized synthetic corruption")
+                db.execute(
+                    "UPDATE shadow_evaluations SET record_json=%s "
+                    "WHERE tenant_id=%s AND event_id=%s",
+                    (dumps(raw), TENANT, str(event_id)),
+                )
+                db.execute(
+                    "ALTER TABLE shadow_evaluations "
+                    "ENABLE TRIGGER shadow_evaluations_immutable"
+                )
+
+            corrupted_counts, corrupted_rows = counts(), source_rows()
+            with pytest.raises(CaseSourceUnavailable):
+                in_transaction_reader.read(
+                    principal=principal(caps=READ), tenant_id=TENANT,
+                    case_id=case_id, at=datetime.now(UTC),
+                )
+            # No projection, hidden foreign-tenant row, extra audit or write.
+            assert counts() == corrupted_counts
+            assert source_rows() == corrupted_rows
+            assert all(row["bank_execution"] == "unknown" for row in db.execute(
+                "SELECT bank_execution FROM analyst_case_events"
+            ).fetchall())
+        finally:
+            db.execute("ROLLBACK TO SAVEPOINT synthetic_reader_corruption")
+            db.execute("RELEASE SAVEPOINT synthetic_reader_corruption")
+        assert counts() == original_counts
+        assert source_rows() == original_rows
+    assert reader.read(
+        principal=principal(caps=READ), tenant_id=TENANT,
+        case_id=case_id, at=datetime.now(UTC),
+    ) == baseline
