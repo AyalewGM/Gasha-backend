@@ -134,7 +134,7 @@ def test_acknowledged_shadow_copy_recovers_from_postgres_without_broker_redelive
                     retry_backoff=timedelta(0), worker_id="synthetic-failed",
                 )
                 assert worker.run_once(max_events=1) == 1
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - propagate thread failures to test
             thread_errors.append(exc)
 
     stalled = Thread(target=run_stalled_consumer, daemon=True)
