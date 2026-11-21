@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 import pytest
 import test_postgres_evaluation_alerts as alerts
 import test_postgres_synthetic_fraud_workflow as workflow
+from fastapi.testclient import TestClient
 from test_kafka_ingestion import FakeRecord, make_consumer
 from test_postgres_case_writer_bridge import principal
 from test_postgres_evaluations import POLICY
@@ -27,6 +28,8 @@ from gasha.cases.evaluation_alerts import (
     evaluation_context_ref,
 )
 from gasha.domain.models import DecisionAction
+from gasha.api.main import app
+from gasha.cases.postgres_feature_view import ExplicitPostgresCaseFeatureReader
 from gasha.ingestion.contracts import FraudEventEnvelope
 from gasha.ingestion.postgres_store import PostgresPendingEvaluationStore
 from gasha.ingestion.service import IngestionService
@@ -44,6 +47,8 @@ from gasha.postgres_evaluations import (
     PostgresShadowEvaluationRepository,
 )
 from gasha.security.access import Capability
+from gasha.security.access import CredentialRejected
+from gasha.security.postgres_audit import PostgresSecurityAuditSink
 
 schema = alerts.schema
 installation = workflow.installation
@@ -81,7 +86,7 @@ def snapshot_for_copy(copy):
 
 @pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
 def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
-    installation,
+    installation, monkeypatch,
 ) -> None:
     """Durable pending survives failed evaluator/ACK and empty consumer recovery."""
     alerts.install_policy(installation, workflow.ALERT_POLICY)
@@ -226,6 +231,110 @@ def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
             "SELECT count(*) AS n FROM security_audit_events "
             "WHERE action='alert.generate'"
         ).fetchone()["n"] == 2
+
+    # The SAME recovered PostgreSQL case must be readable through the
+    # protected FastAPI endpoint, not merely through a direct Python adapter.
+    # This explicitly installed TestClient identity is synthetic and is NOT
+    # an approved Bank browser/BFF/session/CSRF integration.
+    with workflow.connect(installation) as db:
+        founding = db.execute(
+            "SELECT source_event_id, source_context_ref FROM analyst_case_events "
+            "WHERE tenant_id=%s AND case_id=%s AND revision=1",
+            (TENANT, rows[0]["case_id"]),
+        ).fetchone()
+        assert founding is not None
+        before_cases = db.execute(
+            "SELECT count(*) AS n FROM analyst_case_events"
+        ).fetchone()["n"]
+        before_alerts = db.execute(
+            "SELECT count(*) AS n FROM evaluation_alerts"
+        ).fetchone()["n"]
+
+    class SyntheticReadIdentity:
+        def verify(self, bearer: str):
+            if bearer == "synthetic-analyst":
+                return principal(caps=frozenset({Capability.CASE_READ}))
+            if bearer == "synthetic-foreign":
+                return principal(
+                    tenant="tenant-b", caps=frozenset({Capability.CASE_READ}),
+                )
+            if bearer == "synthetic-no-read":
+                return principal(caps=frozenset({Capability.CASE_TRIAGE}))
+            raise CredentialRejected("synthetic credential refused")
+
+    monkeypatch.setattr(app.state, "identity_verifier", SyntheticReadIdentity())
+    monkeypatch.setattr(
+        app.state,
+        "case_feature_reader",
+        ExplicitPostgresCaseFeatureReader(
+            connections=lambda: workflow.connect(installation),
+        ),
+    )
+    monkeypatch.setattr(
+        app.state,
+        "security_audit",
+        PostgresSecurityAuditSink(
+            connections=lambda: workflow.connect(installation),
+        ),
+    )
+    target = f"/v1/tenants/{TENANT}/cases/{rows[0]['case_id']}/feature-evidence"
+    auth = {"Authorization": "Bearer synthetic-analyst"}
+    with TestClient(app) as http:
+        for denied_headers, status in (
+            ({}, 401),
+            ({"Authorization": "Bearer synthetic-foreign"}, 404),
+            ({"Authorization": "Bearer synthetic-no-read"}, 403),
+        ):
+            denied = http.get(target, headers=denied_headers)
+            assert denied.status_code == status, denied.text
+            assert "feature_evidence" not in denied.text
+
+        success = http.get(target, headers=auth)
+        assert success.status_code == 200, success.text
+        projected = success.json()
+        evidence = projected["feature_evidence"]
+        assert evidence["scope"] == "case_creation_source_only"
+        assert evidence["availability"] == "available"
+        assert evidence["source_assurance"] == "synthetic_unattested"
+        assert evidence["context_ref"] == founding["source_context_ref"]
+        assert evidence["eligible_observations"] == 5
+        assert evidence["decision_as_of"] is not None
+        assert projected["enforcement_activated"] is False
+        assert projected["bank_source_attested"] is False
+        assert str(founding["source_event_id"]) not in success.text
+        assert "sender-1" not in success.text
+
+        # Failure of the mandatory per-append PostgreSQL audit connection
+        # denies the same valid analyst before reading or disclosing evidence.
+        def refused_audit_connection():
+            raise RuntimeError("synthetic audit database unavailable")
+
+        monkeypatch.setattr(
+            app.state, "security_audit",
+            PostgresSecurityAuditSink(connections=refused_audit_connection),
+        )
+        refused = http.get(target, headers=auth)
+        assert refused.status_code == 503
+        assert "feature_evidence" not in refused.text
+
+    with workflow.connect(installation) as db:
+        assert db.execute(
+            "SELECT count(*) AS n FROM analyst_case_events"
+        ).fetchone()["n"] == before_cases
+        assert db.execute(
+            "SELECT count(*) AS n FROM evaluation_alerts"
+        ).fetchone()["n"] == before_alerts
+        audits = db.execute(
+            "SELECT action, result, tenant_ref, actor_ref, attempt_ref, "
+            "context_ref FROM security_audit_events "
+            "WHERE action='case.read' ORDER BY id"
+        ).fetchall()
+        assert any(row["result"] == "succeeded" for row in audits)
+        assert any(row["result"] == "authorized" for row in audits)
+        assert any(row["result"] == "denied" for row in audits)
+        assert all(len(row["tenant_ref"]) == 64 for row in audits)
+        assert "tenant-a" not in str(audits) and "tenant-b" not in str(audits)
+
     assert bank_path == netguardians_path
     assert len(bank_path) == 3
 
