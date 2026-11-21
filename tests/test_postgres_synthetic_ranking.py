@@ -256,6 +256,53 @@ def test_legacy_null_context_and_feature_evidence_coexist_with_durable_queue_and
     assert all(set(item.scenario_ids) <= {"ATO-02", "MM-02"}
                for item in selection.items)
 
+    # Reuse the actual installed, protected synthetic API ports: ranking must
+    # revalidate both immutable case histories, not just raw SQL references.
+    from gasha.cases.postgres_history_reader import ExplicitPostgresCaseHistoryReader
+
+    reader = ExplicitPostgresCaseQueueReader(
+        connections=lambda: connect(installation), ranking=source,
+    )
+    audit = IngressAudit()
+    monkeypatch.setattr(app.state, "identity_verifier", SyntheticVerifier())
+    monkeypatch.setattr(app.state, "security_audit", audit)
+    monkeypatch.setattr(app.state, "case_queue_reader", reader)
+    monkeypatch.setattr(
+        app.state, "case_history_reader",
+        ExplicitPostgresCaseHistoryReader(connections=lambda: connect(installation)),
+    )
+    with TestClient(app) as client:
+        headers = {"Authorization": "Bearer analyst"}
+        queue_response = client.get(
+            "/v1/tenants/tenant-a/cases/queue?limit=10", headers=headers,
+        )
+        assert queue_response.status_code == 200, queue_response.text
+        queue = queue_response.json()
+        assert [item["rank"] for item in queue["items"]] == [1, 2]
+        assert queue["enforcement_activated"] is False
+        assert {item["source_event_id"] for item in queue["items"]} == {
+            str(old.event_id), str(assessment.event_id),
+        }
+        for item in selection.items:
+            detail = client.get(
+                f"/v1/tenants/tenant-a/cases/{item.case_id}/history",
+                headers=headers,
+            )
+            assert detail.status_code == 200, detail.text
+            assert detail.json()["events"][0]["source_context_ref"] == (
+                item.source_context_ref
+            )
+            assert detail.json()["events"][0]["bank_execution"] == "unknown"
+        assert client.get(
+            "/v1/tenants/tenant-a/cases/queue",
+            headers={"Authorization": "Bearer foreign"},
+        ).status_code == 404
+        assert client.get(
+            "/v1/tenants/tenant-a/cases/queue",
+            headers={"Authorization": "Bearer revoked"},
+        ).status_code == 401
+    assert all("tenant-a" not in str(e) for e in audit.events)
+
     with connect(installation) as db:
         assert db.execute(
             "SELECT count(*) AS n FROM shadow_evaluations"
