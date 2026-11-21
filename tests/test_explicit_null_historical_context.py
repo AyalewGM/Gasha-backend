@@ -15,6 +15,8 @@ from test_evaluation_context_legacy import _record
 from test_postgres_case_writer_bridge import DSN, connect, principal
 import test_postgres_evaluation_alerts as alerts
 
+installation = alerts.installation
+
 from gasha.cases.evaluation_alerts import (
     evaluation_context_ref,
     persisted_evaluation_context_matches,
@@ -206,7 +208,7 @@ def test_persisted_null_inclusive_context_survives_real_pg_replay_and_queue(
         dict(evidence_row, context_ref="0" * 64),
         dict(evidence_row, source_context_ref="0" * 64),
         dict(evidence_row, tenant_id="tenant-b"),
-        dict(evidence_row, event_id=replace(sample, event_id=alerts.event().event_id).event_id),
+        dict(evidence_row, event_id=alerts.event().event_id),
     ):
         with pytest.raises((CaseQueueRejected, ValueError)):
             source._verify(altered, at=now)
