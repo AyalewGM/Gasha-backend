@@ -16,6 +16,7 @@ from test_evaluation_context_legacy import _record
 from test_postgres_case_writer_bridge import DSN, connect, principal
 
 installation = alerts.installation
+schema = alerts.schema
 
 from gasha.cases.evaluation_alerts import (
     evaluation_context_ref,
