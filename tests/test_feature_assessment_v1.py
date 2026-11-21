@@ -187,6 +187,67 @@ def test_incomplete_graph_coverage_is_unavailable_not_a_measured_zero():
     assert partial.computation_fingerprint != confirmed.computation_fingerprint
 
 
+
+def test_sealed_bounded_window_can_count_fan_in_without_claiming_lifetime_history():
+    """A sealed one-hour cohort is not evidence of an all-time relationship."""
+    event = normalized()
+    events = history()
+    bounded = assess_synthetic_shadow_features(
+        event, events, policy=POLICY,
+        relationship_history_complete=False,
+        beneficiary_window_complete=True,
+    )
+    full = assess_synthetic_shadow_features(
+        event, events, policy=POLICY, relationship_history_complete=True,
+    )
+    unknown_window = assess_synthetic_shadow_features(
+        event, events, policy=POLICY,
+        relationship_history_complete=False, beneficiary_window_complete=False,
+    )
+    assert bounded.feature_set.beneficiary_unique_senders_1h == 5
+    assert bounded.feature_set.sender_beneficiary_seen_before is None
+    assert "sender_beneficiary_history_coverage" in bounded.feature_set.missing
+    assert "beneficiary_unique_senders_1h" not in bounded.unavailable_signals
+    assert bounded.assessed_envelope.intelligence.network_risk == 0.86
+    assert bounded.assessed_envelope.evidence_reason_codes == (
+        "INTERNAL_GRAPH_BENEFICIARY_FAN_IN",
+    )
+    assert unknown_window.feature_set.beneficiary_unique_senders_1h is None
+    assert unknown_window.assessed_envelope.intelligence == IntelligenceSnapshot()
+    assert bounded.source_fingerprint == full.source_fingerprint
+    assert bounded.computation_fingerprint != full.computation_fingerprint
+    assert bounded.computation_fingerprint != unknown_window.computation_fingerprint
+    # Verified empty one-hour history may return measured zero fan-in, but it
+    # still cannot establish that the sender and beneficiary never interacted.
+    empty = assess_synthetic_shadow_features(
+        event, (), policy=POLICY,
+        relationship_history_complete=False, beneficiary_window_complete=True,
+    )
+    assert empty.feature_set.beneficiary_unique_senders_1h == 0
+    assert empty.feature_set.sender_beneficiary_seen_before is None
+    assert empty.assessed_envelope.evidence_reason_codes == ("NO_INTERNAL_GRAPH_SIGNAL",)
+
+
+@pytest.mark.parametrize("invalid", [0, 1, "true", (), [], object()])
+def test_bounded_window_rejects_untyped_coverage(invalid):
+    event = normalized()
+    with pytest.raises(ValueError, match="coverage"):
+        assess_synthetic_shadow_features(
+            event, history(), policy=POLICY,
+            relationship_history_complete=False,
+            beneficiary_window_complete=invalid,
+        )
+
+
+def test_lifetime_history_cannot_claim_an_incomplete_window():
+    with pytest.raises(ValueError, match="coverage"):
+        assess_synthetic_shadow_features(
+            normalized(), history(), policy=POLICY,
+            relationship_history_complete=True,
+            beneficiary_window_complete=False,
+        )
+
+
 def test_missing_optional_device_is_explicit_not_a_measured_zero():
     event = normalized(device=None)
     result = assess(event, history())
