@@ -195,9 +195,9 @@ def assess_synthetic_shadow_features(
         policy.model_dump(mode="json"), assessment_intelligence.model_dump(mode="json"),
         reasons, missing, eligible, late, nonprior,
         relationship_history_complete,
-        *((("bounded_beneficiary_window_complete",) if (
+        *(("bounded_beneficiary_window_complete",) if (
             beneficiary_window_complete and not relationship_history_complete
-        ) else ())),
+        ) else ()),
     ])
     # Risk is computed by Gasha; the synthetic JSON adapter cannot supply it.
     assessed = normalized.model_copy(update={
