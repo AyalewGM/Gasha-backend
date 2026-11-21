@@ -73,7 +73,12 @@ def canonical_evaluation_context_payload(record: ShadowEvaluationRecord) -> dict
     if evidence is not None:
         if type(evidence) is not SyntheticFeatureEvidenceV1:
             raise ValueError("invalid synthetic feature evidence")
-        record.validate_feature_evidence()
+        evidence.assert_matches_event(record.event)
+        if (
+            record.evaluation.operating_mode is not OperatingMode.SHADOW
+            or record.evaluation.effective_action is not DecisionAction.NO_ACTION_SHADOW
+        ):
+            raise ValueError("feature evidence requires a non-enforcing shadow evaluation")
         payload["feature_evidence"] = evidence.model_dump(mode="json")
     return payload
 
