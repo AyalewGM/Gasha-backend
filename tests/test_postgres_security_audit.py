@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 
 import pytest
 
@@ -73,3 +75,96 @@ def test_real_postgres_invalid_record_does_not_append(pg) -> None:
     with pytest.raises(ValueError):
         PostgresSecurityAuditSink(pg).append(event)
     assert pg.execute("SELECT count(*) FROM security_audit_events").fetchone()[0] == 0
+
+
+def test_real_postgres_isolated_audit_concurrent_tenants_commit_independently(pg) -> None:
+    """Concurrent synthetic callers never share one mutable PG transaction."""
+    import psycopg
+
+    owned_connections = []
+    lock = Lock()
+
+    def connections():
+        connection = psycopg.connect(DSN)
+        with lock:
+            owned_connections.append(connection)
+        return connection
+
+    sink = PostgresSecurityAuditSink(connections=connections)
+    assert sink.per_append_connection is True
+    base = SecurityAuditEvent(
+        action="case.read", result="authorized", actor_ref="a" * 64,
+        tenant_ref=tenant_audit_ref("tenant-a"), reason="authorized",
+        at=datetime(2026, 11, 21, 12, 0, tzinfo=UTC),
+        attempt_ref="0" * 32,
+    )
+    attempts = tuple(
+        replace(
+            base,
+            tenant_ref=tenant_audit_ref(f"tenant-{i % 2}"),
+            actor_ref=f"{i + 1:064x}",
+            attempt_ref=f"{i + 1:032x}",
+        )
+        for i in range(24)
+    )
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(sink.append, attempts))
+
+    rows = pg.execute(
+        "SELECT tenant_ref, actor_ref, attempt_ref, action, result "
+        "FROM security_audit_events"
+    ).fetchall()
+    assert len(rows) == len(attempts)
+    assert set(rows) == {
+        (event.tenant_ref, event.actor_ref, event.attempt_ref, "case.read", "authorized")
+        for event in attempts
+    }
+    assert len(owned_connections) == len(attempts)
+    assert all(connection.closed for connection in owned_connections)
+    assert "tenant-a" not in str(rows) and "tenant-b" not in str(rows)
+
+
+def test_real_postgres_isolated_audit_rollback_closes_only_failed_connection(pg) -> None:
+    """Audit transaction refusal cannot poison the next successful append."""
+    import psycopg
+
+    opened = []
+
+    def read_only_connection():
+        connection = psycopg.connect(DSN)
+        connection.execute("SET TRANSACTION READ ONLY")
+        opened.append(connection)
+        return connection
+
+    event = SecurityAuditEvent(
+        action="case.read", result="denied", actor_ref="a" * 64,
+        tenant_ref=tenant_audit_ref("tenant-a"), reason="authorization_denied",
+        at=datetime(2026, 11, 21, 12, 0, tzinfo=UTC),
+        attempt_ref="f" * 32,
+    )
+    with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
+        PostgresSecurityAuditSink(connections=read_only_connection).append(event)
+    assert len(opened) == 1 and opened[0].closed
+    assert pg.execute("SELECT count(*) FROM security_audit_events").fetchone()[0] == 0
+
+    success_connections = []
+
+    def working_connection():
+        connection = psycopg.connect(DSN)
+        success_connections.append(connection)
+        return connection
+
+    sink = PostgresSecurityAuditSink(connections=working_connection)
+    sink.append(replace(event, result="authorized", reason="authorized"))
+    assert len(success_connections) == 1 and success_connections[0].closed
+    assert pg.execute("SELECT count(*) FROM security_audit_events").fetchone()[0] == 1
+
+    rejected = replace(event, reason="invalid\\nreason")
+    with pytest.raises(ValueError):
+        sink.append(rejected)
+    assert len(success_connections) == 1  # validation occurs before acquiring a DB lease
+
+
+def test_audit_connection_modes_require_exactly_one_factory_or_legacy_connection() -> None:
+    with pytest.raises(ValueError, match="exactly one"):
+        PostgresSecurityAuditSink()
