@@ -520,6 +520,12 @@ def test_reader_rejects_persisted_corruption_with_transactional_rollback(
                     accepted = ShadowEvaluationRecord.model_validate_json(dumps(raw))
                     rebound = evaluation_context_ref(accepted)
                     assert rebound != context_ref
+                    # A full internally coherent digest must reach the
+                    # reader's *separate* unavailable-signal allowlist.
+                    assert persisted_evaluation_context_matches(
+                        accepted, raw_record_json=dumps(raw),
+                        stored_context_ref=rebound,
+                    )
                     db.execute(
                         "UPDATE evaluation_alerts SET context_ref=%s "
                         "WHERE tenant_id=%s AND event_id=%s",
