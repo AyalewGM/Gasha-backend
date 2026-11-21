@@ -229,13 +229,14 @@ def test_mixed_absent_null_and_feature_contexts_rank_and_replay_in_real_postgres
     The protected queue exposes ordered top-K prefixes, not cursor/offset pages.
     Neither this fixture nor its synthetic issuer is Bank attestation.
     """
+    import test_postgres_synthetic_fraud_workflow as workflow
     from fastapi.testclient import TestClient
+    from test_postgres_case_writer_bridge import IngressAudit
     from test_postgres_evaluations import POLICY
     from test_postgres_shadow_copy_mve import _computed_graph_assessment, _synthetic_copy
     from test_postgres_synthetic_ranking import SyntheticVerifier
 
     import gasha.cases.evaluation_alerts as evidence
-    import test_postgres_synthetic_fraud_workflow as workflow
     from gasha.api.main import app
     from gasha.cases.evaluation_alerts import PostgresEvaluationAlertWriter
     from gasha.cases.postgres_history_reader import ExplicitPostgresCaseHistoryReader
@@ -244,7 +245,6 @@ def test_mixed_absent_null_and_feature_contexts_rank_and_replay_in_real_postgres
     from gasha.ingestion.shadow_copy import SyntheticShadowCopyAdapter
     from gasha.orchestration import ShadowOrchestrator
     from gasha.postgres_evaluations import PostgresEvaluationPersistence
-    from test_postgres_case_writer_bridge import IngressAudit
 
     # Different device grouping keys ensure three independently linked cases.
     absent = alerts.event(score=0.93)
