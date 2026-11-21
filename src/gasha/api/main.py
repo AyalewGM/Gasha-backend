@@ -52,7 +52,6 @@ from gasha.ingestion.outcome_ingestion import (
     OutcomeSubmission,
 )
 from gasha.poc.outcomes import OutcomeRecord
-from gasha.security.postgres_audit import PostgresSecurityAuditSink
 from gasha.security.access import (
     AuthorizationRejected,
     Capability,
@@ -67,6 +66,7 @@ from gasha.security.access import (
     tenant_audit_ref,
     utcnow,
 )
+from gasha.security.postgres_audit import PostgresSecurityAuditSink
 
 
 def _safe_version_metadata(value: object) -> bool:
