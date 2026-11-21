@@ -525,7 +525,7 @@ def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
         ).fetchone()["n"] == 2
         event_rows = db.execute(
             "SELECT event_json->>\'operation\' AS operation, bank_execution, revision "
-            "WHERE tenant_id=%s AND case_id=%s ORDER BY revision",
+            "FROM analyst_case_events WHERE tenant_id=%s AND case_id=%s ORDER BY revision",
             (TENANT, case_id),
         ).fetchall()
         assert [row["operation"] for row in event_rows] == [
