@@ -6,8 +6,12 @@ physical fault isolation. Gasha never issues or acknowledges payment actions.
 """
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from json import dumps, loads
+from pathlib import Path
+from threading import Event, Thread
+from time import perf_counter_ns
 
 import pytest
 import test_postgres_evaluation_alerts as alerts
@@ -24,13 +28,13 @@ from test_postgres_shadow_copy_mve import (
 
 from gasha.cases.evaluation_alerts import PostgresEvaluationAlertWriter
 from gasha.domain.models import DecisionAction
-from gasha.ingestion.contracts import FraudEventEnvelope
+from gasha.ingestion.contracts import FraudEventEnvelope, InboundBankEvent
 from gasha.ingestion.postgres_store import (
     PostgresPendingEvaluationStore,
     _restored_pending_clock,
 )
 from gasha.ingestion.reference import ReferenceJsonAdapter
-from gasha.ingestion.service import IngestionService
+from gasha.ingestion.service import IngestionOutcome, IngestionService
 from gasha.ingestion.shadow_copy import SyntheticShadowCopyAdapter
 from gasha.ingestion.worker import IngestionWorker
 from gasha.security.access import Capability
@@ -41,13 +45,12 @@ installation = workflow.installation
 
 @pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
 def test_acknowledged_shadow_copy_recovers_from_postgres_without_broker_redelivery(
-    installation,
+    installation, tmp_path: Path,
 ) -> None:
-    """Two wire events + replay; fail Gasha, then recover using only durable pending.
+    """Primary SQLite commits survive a stalled real PostgreSQL shadow worker.
 
-    All committed/alert/case/audit counts are independently reconciled. The
-    Bank/incumbent simulation does not call the Gasha worker and proceeds
-    through a separate list even when Gasha's evaluator is unavailable.
+    The Bank and incumbent-shaped responses are fictional and not observations
+    of NetGuardians, installed interfaces, or actual Bank performance.
     """
     alerts.install_policy(installation, workflow.ALERT_POLICY)
     with workflow.connect(installation) as db:
@@ -60,50 +63,114 @@ def test_acknowledged_shadow_copy_recovers_from_postgres_without_broker_redelive
         ):
             db.execute((alerts.MIGRATIONS / migration).read_text())
 
+    # An independently committed SQLite primary emulator and outbox exist
+    # before Gasha starts. No primary operation requests or waits on a verdict.
+    primary = sqlite3.connect(tmp_path / "synthetic-primary.sqlite3")
+    primary.executescript("""
+        CREATE TABLE bank_completions (event_id TEXT PRIMARY KEY, status TEXT NOT NULL);
+        CREATE TABLE fictional_incumbent_receipts (event_id TEXT PRIMARY KEY, status TEXT NOT NULL);
+        CREATE TABLE synthetic_copy_outbox (
+            event_id TEXT PRIMARY KEY, wire TEXT NOT NULL,
+            handed_to_worker INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    primary_latencies_ms: list[float] = []
+
+    def complete_primary(copy: InboundBankEvent) -> None:
+        start = perf_counter_ns()
+        event_id = str(copy.payload["event_id"])
+        primary.execute(
+            "INSERT INTO bank_completions VALUES (?, ?)",
+            (event_id, "synthetic_accepted"),
+        )
+        primary.execute(
+            "INSERT INTO fictional_incumbent_receipts VALUES (?, ?)",
+            (event_id, "fixture_observed_only"),
+        )
+        primary.execute(
+            "INSERT INTO synthetic_copy_outbox (event_id, wire) VALUES (?, ?)",
+            (event_id, dumps(copy.model_dump(mode="json"))),
+        )
+        primary.commit()
+        primary_latencies_ms.append((perf_counter_ns() - start) / 1_000_000)
+
     first, second = _synthetic_copy(), _synthetic_copy()
-    bank_accepted = [str(first.payload["event_id"]), str(second.payload["event_id"])]
-    incumbent_observed = list(bank_accepted)
-    frozen_primary = (tuple(bank_accepted), tuple(incumbent_observed))
+    complete_primary(first)
+    primary.execute(
+        "UPDATE synthetic_copy_outbox SET handed_to_worker=1 WHERE event_id=?",
+        (str(first.payload["event_id"]),),
+    )
+    primary.commit()
     wire_first = dumps(first.model_dump(mode="json")).encode()
-    wire_second = dumps(second.model_dump(mode="json")).encode()
-    consumer, batch, dead_letters = make_consumer([
-        FakeRecord(wire_first, 100),
-        FakeRecord(wire_second, 101),
-        FakeRecord(wire_first, 102),  # transport retry must not create another pending item
-    ])
+    consumer, batch, dead_letters = make_consumer([FakeRecord(wire_first, 100)])
     ingestion = IngestionService(
         {"synthetic-shadow-copy": SyntheticShadowCopyAdapter()},
         dead_letters=dead_letters,
     )
 
     failed_calls = 0
+    entered_shadow = Event()
+    release_shadow = Event()
+    thread_errors: list[Exception] = []
 
     def failed_evaluator(_event: FraudEventEnvelope, _policy=None) -> None:
         nonlocal failed_calls
         failed_calls += 1
-        raise TimeoutError("synthetic Gasha-only PostgreSQL evaluator outage")
+        entered_shadow.set()
+        if not release_shadow.wait(timeout=5):
+            raise TimeoutError("synthetic consumer watchdog expired")
+        raise TimeoutError("synthetic Gasha-only evaluator unavailable")
+
+    def run_stalled_consumer() -> None:
+        try:
+            with workflow.connect(installation) as db:
+                worker = IngestionWorker(
+                    consumer, ingestion, evaluate=failed_evaluator,
+                    pending=PostgresPendingEvaluationStore(
+                        db, tenant_ids=(TENANT,), worker_id="synthetic-failed",
+                    ),
+                    dead_letters=dead_letters, tenant_ids=(TENANT,),
+                    policy_for=lambda _tenant: POLICY,
+                    retry_backoff=timedelta(0), worker_id="synthetic-failed",
+                )
+                assert worker.run_once(max_events=1) == 1
+        except Exception as exc:  # noqa: BLE001 - propagate thread failures to test
+            thread_errors.append(exc)
+
+    stalled = Thread(target=run_stalled_consumer, daemon=True)
+    stalled.start()
+    try:
+        assert entered_shadow.wait(timeout=3), "worker never reached pending evaluator"
+        assert stalled.is_alive()
+        # The second fictional Bank/NG response COMMITS independently while
+        # Gasha's actual PostgreSQL pending evaluation is still blocked.
+        complete_primary(second)
+        assert primary.execute(
+            "SELECT count(*) FROM bank_completions"
+        ).fetchone()[0] == 2
+        assert primary.execute(
+            "SELECT count(*) FROM fictional_incumbent_receipts"
+        ).fetchone()[0] == 2
+        assert primary.execute(
+            "SELECT count(*) FROM synthetic_copy_outbox WHERE handed_to_worker=0"
+        ).fetchone()[0] == 1
+        assert stalled.is_alive(), "Gasha resumed before primary completed"
+    finally:
+        release_shadow.set()
+        stalled.join(timeout=10)
+    assert not stalled.is_alive(), "synthetic consumer did not exit"
+    assert not thread_errors, thread_errors
+    assert batch.commits == 1
+    assert failed_calls == 1
+    assert dead_letters.records == ()
 
     with workflow.connect(installation) as db:
-        pending = PostgresPendingEvaluationStore(
-            db, tenant_ids=(TENANT,), worker_id="synthetic-failed",
-        )
-        failed_worker = IngestionWorker(
-            consumer, ingestion, evaluate=failed_evaluator,
-            pending=pending, dead_letters=dead_letters, tenant_ids=(TENANT,),
-            policy_for=lambda _tenant: POLICY,
-            retry_backoff=timedelta(0),
-            worker_id="synthetic-failed",
-        )
-        assert failed_worker.run_once(max_events=3) == 3
-        assert batch.commits == 1  # acknowledged after durable pending writes
-        assert failed_calls == 2
-        assert dead_letters.records == ()
         rows = db.execute(
             "SELECT tenant_id, event_id, attempts, terminal FROM pending_evaluations"
         ).fetchall()
-        assert len(rows) == 2
-        assert {row["tenant_id"] for row in rows} == {TENANT}
-        assert all(row["attempts"] == 1 and not row["terminal"] for row in rows)
+        assert len(rows) == 1
+        assert rows[0]["tenant_id"] == TENANT
+        assert rows[0]["attempts"] == 1 and not rows[0]["terminal"]
         assert db.execute(
             "SELECT count(*) AS n FROM shadow_evaluations"
         ).fetchone()["n"] == 0
@@ -115,13 +182,9 @@ def test_acknowledged_shadow_copy_recovers_from_postgres_without_broker_redelive
             "WHERE action='alert.generate'"
         ).fetchone()["n"] == 0
 
-    # The primary payment/NetGuardians simulation proceeds independently of
-    # a timed-out Gasha consumer; it receives no hold, block or callback.
-    assert (tuple(bank_accepted), tuple(incumbent_observed)) == frozen_primary
-    subsequent = "independent-bank-event-during-gasha-outage"
-    bank_accepted.append(subsequent)
-    incumbent_observed.append(subsequent)
-    continued_primary = (tuple(bank_accepted), tuple(incumbent_observed))
+    # A five-second watchdog is fixture safety, NOT a Bank latency SLA.
+    assert len(primary_latencies_ms) == 2
+    assert max(primary_latencies_ms) < 5000
 
     recovered: list[str] = []
 
@@ -139,20 +202,33 @@ def test_acknowledged_shadow_copy_recovers_from_postgres_without_broker_redelive
         assert outcome.effective_action is DecisionAction.NO_ACTION_SHADOW
         recovered.append(str(normalized.event_id))
 
-    empty_consumer, empty_batch, recovery_dead_letters = make_consumer([])
+    queued_wire = primary.execute(
+        "SELECT wire FROM synthetic_copy_outbox WHERE handed_to_worker=0"
+    ).fetchone()[0]
+    assert loads(queued_wire)["payload"]["event_id"] == str(second.payload["event_id"])
+    recovery_consumer, recovery_batch, recovery_dead_letters = make_consumer([
+        FakeRecord(queued_wire.encode(), 101),
+    ])
+    recovered_ingestion = IngestionService({
+        "synthetic-shadow-copy": SyntheticShadowCopyAdapter(),
+    })
     with workflow.connect(installation) as db:
         recovered_worker = IngestionWorker(
-            empty_consumer,
-            IngestionService({"synthetic-shadow-copy": SyntheticShadowCopyAdapter()}),
+            recovery_consumer,
+            recovered_ingestion,
             evaluate=durable_evaluator,
             pending=PostgresPendingEvaluationStore(
                 db, tenant_ids=(TENANT,), worker_id="synthetic-recovered",
             ),
             worker_id="synthetic-recovered", tenant_ids=(TENANT,),
             dead_letters=recovery_dead_letters,
+            policy_for=lambda _tenant: POLICY,
         )
-        assert recovered_worker.run_once(max_events=1) == 0
-        assert empty_batch.commits == 0  # no broker redelivery was required
+        assert recovered_worker.run_once(max_events=1) == 1
+        # FIRST event recovers without broker redelivery from PostgreSQL.
+        # SECOND event is replayed from the independent SQLite copy outbox.
+        assert recovery_batch.commits == 1
+        assert recovered_ingestion.ingest(second).outcome is IngestionOutcome.DUPLICATE
         # Include sanitized failure classes/attempt counts if recovery is blocked.
         diagnostics = db.execute(
             "SELECT attempts, last_error, leased_by, terminal "
@@ -167,11 +243,12 @@ def test_acknowledged_shadow_copy_recovers_from_postgres_without_broker_redelive
             "SELECT count(*) AS n FROM pending_evaluations"
         ).fetchone()["n"] == 0
         alerts_rows = db.execute(
-            "SELECT tenant_id, event_id, case_id FROM evaluation_alerts"
+            "SELECT tenant_id, event_id, case_id, context_ref FROM evaluation_alerts"
         ).fetchall()
         assert len(alerts_rows) == 2
         assert {row["tenant_id"] for row in alerts_rows} == {TENANT}
         assert len({row["case_id"] for row in alerts_rows}) == 1
+        assert len({row["context_ref"] for row in alerts_rows}) == 2
         assert db.execute(
             "SELECT count(*) AS n FROM shadow_evaluations"
         ).fetchone()["n"] == 2
@@ -208,7 +285,26 @@ def test_acknowledged_shadow_copy_recovers_from_postgres_without_broker_redelive
             "WHERE action='alert.generate'"
         ).fetchone()["n"] == 2
 
-    assert (tuple(bank_accepted), tuple(incumbent_observed)) == continued_primary
+    # Shadow recovery and foreign-tenant denial must never mutate the
+    # independently committed primary/fictional incumbent records.
+    assert primary.execute("SELECT count(*) FROM bank_completions").fetchone()[0] == 2
+    assert primary.execute(
+        "SELECT count(*) FROM fictional_incumbent_receipts"
+    ).fetchone()[0] == 2
+    assert primary.execute(
+        "SELECT status FROM bank_completions ORDER BY event_id"
+    ).fetchall() == [("synthetic_accepted",)] * 2
+    assert primary.execute(
+        "SELECT status FROM fictional_incumbent_receipts ORDER BY event_id"
+    ).fetchall() == [("fixture_observed_only",)] * 2
+    print(
+        "SYNTHETIC_PRIMARY_ISOLATION "
+        f"primary_count=2 primary_errors=0 copy_backlog_peak=1 "
+        f"primary_max_ms={max(primary_latencies_ms):.3f} "
+        "alerts=2 cases=1 gasha_timeout=1 "
+        "bank_kpi_approved=false bank_execution=unknown enforcement_activated=false"
+    )
+    primary.close()
 
 
 @pytest.mark.parametrize(
