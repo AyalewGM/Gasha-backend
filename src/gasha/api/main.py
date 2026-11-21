@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timezone
 from hashlib import sha256
 from typing import Annotated, NoReturn, Protocol
@@ -21,6 +21,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette._utils import get_route_path
 
+from gasha.cases.postgres_feature_view import (
+    ExplicitPostgresCaseFeatureReader,
+    SyntheticCaseFeatureView,
+)
 from gasha.cases.queue import CaseQueueSnapshot, project_case_queue
 from gasha.cases.timeline import (
     AuthorizedAssignee,
@@ -48,6 +52,7 @@ from gasha.ingestion.outcome_ingestion import (
     OutcomeSubmission,
 )
 from gasha.poc.outcomes import OutcomeRecord
+from gasha.security.postgres_audit import PostgresSecurityAuditSink
 from gasha.security.access import (
     AuthorizationRejected,
     Capability,
@@ -311,6 +316,8 @@ app.state.decision_context_provider = None
 app.state.outcome_ingestion = None
 # No bank case reader is installed by default; the endpoint fails closed.
 app.state.case_history_reader = None
+# Optional verified synthetic founding-source read; never installed by request data.
+app.state.case_feature_reader = None
 # No ranked case reader or Bank-approved prioritization policy is installed.
 app.state.case_queue_reader = None
 # No case mutation can be enabled by request flags or a frontend role.
@@ -332,7 +339,20 @@ async def assign_attempt_ref(
     # Use the same trusted ASGI scope/root_path resolution as Starlette routing.
     # request.url.path includes deployment prefixes and can miss routed /v1/ endpoints.
     # Client-provided X-Forwarded-Prefix/role/tenant headers are not route authority.
-    if get_route_path(request.scope).startswith("/v1/"):
+    route_path = get_route_path(request.scope)
+    # The only new feature-evidence route requires the existing committed
+    # PostgreSQL security audit adapter, never a process-local test sink.
+    # This check precedes authentication and any database reader invocation.
+    if (
+        route_path.startswith("/v1/tenants/")
+        and route_path.endswith("/feature-evidence")
+        and type(getattr(request.app.state, "security_audit", None))
+        is not PostgresSecurityAuditSink
+    ):
+        return JSONResponse(
+            status_code=503, content={"detail": "security audit unavailable"},
+        )
+    if route_path.startswith("/v1/"):
         try:
             request.state.authenticated_principal = get_principal(
                 request, request.headers.get("authorization")
@@ -694,6 +714,145 @@ def get_case_history(
         "events": events,
         "enforcement_activated": False,
     }
+
+
+
+_FEATURE_MISSING_SIGNALS = frozenset({
+    "beneficiary_ref", "device_ref", "sender_beneficiary_history_coverage",
+    "beneficiary_unique_senders_1h",
+})
+
+
+def _safe_case_feature_projection(view: SyntheticCaseFeatureView) -> dict[str, object]:
+    """Validate the finite synthetic-only adapter projection before HTTP release.
+
+    Context fingerprints are internal checksums, not attested Bank lineage.
+    Typed, frozen dataclasses can be mutated in process; never blindly serialize
+    a reader object, especially a subclass carrying unconstrained fields.
+    """
+    if (
+        type(view) is not SyntheticCaseFeatureView
+        or view.schema != "gasha-synthetic-case-feature-view-v1"
+        or view.scope != "case_creation_source_only"
+        or type(view.context_ref) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", view.context_ref) is None
+    ):
+        raise ValueError("invalid case feature projection")
+    optional = (
+        view.assessment_version, view.feature_set_version, view.decision_as_of,
+        view.lineage_ref, view.source_fingerprint, view.computation_fingerprint,
+        view.eligible_observations, view.late_observations,
+        view.nonprior_observations, view.unavailable_signals,
+    )
+    if view.availability == "not_recorded":
+        if view.source_assurance != "not_established" or any(
+            value is not None for value in optional
+        ):
+            raise ValueError("invalid unavailable feature projection")
+    elif view.availability == "available":
+        if view.source_assurance != "synthetic_unattested":
+            raise ValueError("unattested feature source required")
+        if any(
+            type(version) is not str
+            or re.fullmatch(r"[A-Za-z0-9._-]{1,96}", version) is None
+            for version in (view.assessment_version, view.feature_set_version)
+        ):
+            raise ValueError("invalid feature versions")
+        if any(
+            type(digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for digest in (
+                view.lineage_ref, view.source_fingerprint,
+                view.computation_fingerprint,
+            )
+        ):
+            raise ValueError("invalid feature provenance")
+        if (
+            type(view.decision_as_of) is not str
+            or len(view.decision_as_of) > 48
+        ):
+            raise ValueError("invalid feature cutoff")
+        try:
+            cutoff = datetime.fromisoformat(view.decision_as_of)
+        except ValueError as exc:
+            raise ValueError("invalid feature cutoff") from exc
+        if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+            raise ValueError("invalid feature cutoff")
+        if any(
+            type(count) is not int or not (0 <= count <= 10**12)
+            for count in (
+                view.eligible_observations, view.late_observations,
+                view.nonprior_observations,
+            )
+        ):
+            raise ValueError("invalid feature counts")
+        codes = view.unavailable_signals
+        if (
+            type(codes) is not tuple
+            or any(type(code) is not str for code in codes)
+            or len(codes) != len(set(codes))
+            or not set(codes) <= _FEATURE_MISSING_SIGNALS
+        ):
+            raise ValueError("invalid feature signal codes")
+    else:
+        raise ValueError("invalid feature availability")
+    return asdict(view)
+
+
+@app.get("/v1/tenants/{tenant_id}/cases/{case_id}/feature-evidence")
+def get_case_feature_evidence(
+    tenant_id: str,
+    case_id: UUID,
+    request: Request,
+    principal: Annotated[TrustedPrincipal, Depends(get_principal)],
+) -> dict[str, object]:
+    """Opt-in protected synthetic founding-source read, not a browser session.
+
+    All authorization/terminal read events must commit through the installed
+    PostgreSQL audit sink before any evidence is returned. The default app has
+    neither a configured audit sink nor a case feature reader. This endpoint
+    neither creates new alerts/cases nor issues payment/intervention actions.
+    """
+    action = Capability.CASE_READ
+    _require_action(request, principal, tenant_id, action, event_id=case_id)
+    reader: ExplicitPostgresCaseFeatureReader | None = getattr(
+        request.app.state, "case_feature_reader", None
+    )
+    try:
+        if type(reader) is not ExplicitPostgresCaseFeatureReader:
+            raise RuntimeError("trusted case feature reader not configured")
+        reader_principal = replace(principal)
+        view = reader.read(
+            principal=reader_principal, tenant_id=tenant_id, case_id=case_id,
+            at=utcnow(),
+        )
+        if (
+            replace(reader_principal) != principal
+            or reader_principal.expires_at.astimezone(UTC)
+            != principal.expires_at.astimezone(UTC)
+        ):
+            raise ValueError("feature reader modified authenticated principal")
+        payload = _safe_case_feature_projection(view)
+    except Exception as exc:
+        _operation_audit(
+            request, principal, tenant_id, case_id, action,
+            "failed", "case_feature_unavailable",
+        )
+        raise HTTPException(
+            status_code=503, detail="case feature evidence unavailable",
+        ) from exc
+    _operation_audit(
+        request, principal, tenant_id, case_id, action,
+        "succeeded", "case_feature_read", context_ref=view.context_ref,
+    )
+    return {
+        "case_id": str(case_id),
+        "feature_evidence": payload,
+        "bank_source_attested": False,
+        "enforcement_activated": False,
+    }
+
+
 
 
 
