@@ -524,7 +524,7 @@ def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
             "SELECT count(*) AS n FROM shadow_evaluations"
         ).fetchone()["n"] == 2
         event_rows = db.execute(
-            "SELECT operation, bank_execution, revision FROM analyst_case_events "
+            "SELECT event_json->>\'operation\' AS operation, bank_execution, revision "
             "WHERE tenant_id=%s AND case_id=%s ORDER BY revision",
             (TENANT, case_id),
         ).fetchall()
