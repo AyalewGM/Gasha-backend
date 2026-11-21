@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import cast
 from uuid import UUID
 
 from gasha.cases.evaluation_alerts import (
@@ -268,7 +269,7 @@ def _verify_canonical_replay(
             or not persisted_evaluation_context_matches(
                 canonical,
                 raw_record_json=str(saved_evaluation["record_json"]),
-                stored_context_ref=saved_alert["context_ref"],
+                stored_context_ref=cast(str, saved_alert["context_ref"]),
             )
         ):
             raise ValueError("conflicting evaluation replay: alert policy/evidence changed")
