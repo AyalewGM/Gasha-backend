@@ -55,6 +55,34 @@ class ShadowEvaluationRecord(BaseModel):
         return self
 
 
+def canonical_evaluation_context_payload(record: ShadowEvaluationRecord) -> dict[str, object]:
+    """Version-stable #43 context content for legacy and feature-backed records.
+
+    Pre-#181 records had no feature_evidence field. A legacy missing field or
+    explicit null must NEVER enter the context digest, even under a Pydantic
+    version that ignores Field(exclude_if=...). Preserve every other historical
+    null field; do not use global exclude_none. New evidence is included in
+    full and revalidated before it can influence the immutable context ref.
+    """
+    if type(record) is not ShadowEvaluationRecord:
+        raise ValueError("typed shadow evaluation required")
+    payload: dict[str, object] = record.model_dump(
+        mode="json", exclude={"feature_evidence"},
+    )
+    evidence = record.feature_evidence
+    if evidence is not None:
+        if type(evidence) is not SyntheticFeatureEvidenceV1:
+            raise ValueError("invalid synthetic feature evidence")
+        evidence.assert_matches_event(record.event)
+        if (
+            record.evaluation.operating_mode is not OperatingMode.SHADOW
+            or record.evaluation.effective_action is not DecisionAction.NO_ACTION_SHADOW
+        ):
+            raise ValueError("feature evidence requires a non-enforcing shadow evaluation")
+        payload["feature_evidence"] = evidence.model_dump(mode="json")
+    return payload
+
+
 class ShadowEvaluationRepository(Protocol):
     """Tenant-scoped persistence for shadow/enforcing evaluations."""
 

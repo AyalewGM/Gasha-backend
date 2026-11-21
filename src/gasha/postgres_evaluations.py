@@ -11,7 +11,7 @@ from gasha.cases.evaluation_alerts import (
 )
 from gasha.decision.audit import DecisionAuditRecord
 from gasha.ingestion.lease import EvaluationLease, LeaseLostError, current_evaluation_lease
-from gasha.orchestration import ShadowEvaluationRecord
+from gasha.orchestration import ShadowEvaluationRecord, canonical_evaluation_context_payload
 from gasha.postgres import Connection, Cursor
 from gasha.tenant_scope import require_tenant
 
@@ -97,7 +97,7 @@ def _immutable_replay_identity(record: ShadowEvaluationRecord) -> dict[str, obje
     decision clock, evaluation latency and persistence time can differ on an
     otherwise identical retry and are not fraud-decision inputs.
     """
-    value = record.model_dump(mode="json")
+    value = canonical_evaluation_context_payload(record)
     value.pop("persisted_at", None)
     event = value["event"]
     if isinstance(event, dict):
