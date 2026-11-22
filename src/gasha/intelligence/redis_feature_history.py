@@ -129,6 +129,11 @@ class RedisFeatureHistory:
         identity = dumps([tenant_id, epoch], ensure_ascii=True, separators=(",", ":"))
         self._key = "gasha:feature-history:v1:" + sha256(identity.encode()).hexdigest()
 
+    @property
+    def epoch_fingerprint(self) -> str:
+        """Opaque binding to the process-configured tenant/epoch, not an attestation."""
+        return sha256(self._key.encode("ascii")).hexdigest()
+
     def _eval(self, script: str, *args: str) -> object:
         try:
             return self._client.eval(script, 1, self._key, *args)
@@ -183,8 +188,14 @@ class RedisFeatureHistory:
         """Make complete, explicitly sealed history available for decisions."""
         self._write("seal", _instant(available_through))
 
-    def compute(self, target: ObservedTransfer, *, decision_as_of: datetime) -> FeatureSetV1:
-        """Reuse offline feature math, with unavailable first-seen on bounded history."""
+    def observations_for(
+        self, target: ObservedTransfer, *, decision_as_of: datetime
+    ) -> tuple[ObservedTransfer, ...]:
+        """Read one validated, sealed Redis snapshot for the synthetic worker.
+
+        The caller must be the configured server-side producer/worker. A client
+        cannot assert epoch coverage or supply a completeness flag here.
+        """
         target = self._event(target)
         cutoff = _parse_instant(_instant(decision_as_of))
         raw = self._eval(_READ)
@@ -223,6 +234,12 @@ class RedisFeatureHistory:
             raise
         except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as exc:
             raise FeatureHistoryUnavailable("missing or malformed feature history snapshot") from exc
+        return tuple(history)
+
+    def compute(self, target: ObservedTransfer, *, decision_as_of: datetime) -> FeatureSetV1:
+        """Reuse offline feature math, with unavailable first-seen on bounded history."""
+        history = self.observations_for(target, decision_as_of=decision_as_of)
         return compute_feature_set(
-            target, tuple(history), decision_as_of=cutoff, relationship_history_complete=False,
+            target, history, decision_as_of=decision_as_of,
+            relationship_history_complete=False,
         )
