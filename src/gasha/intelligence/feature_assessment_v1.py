@@ -73,6 +73,7 @@ def assess_synthetic_shadow_features(
     policy: InternalGraphPolicy,
     relationship_history_complete: bool = True,
     beneficiary_window_complete: bool | None = None,
+    source_epoch_ref: str | None = None,
 ) -> FeatureAssessmentV1:
     """Assess a normalized synthetic copy using only receipt-available history.
 
@@ -98,6 +99,11 @@ def assess_synthetic_shadow_features(
         or (relationship_history_complete and not beneficiary_window_complete)
     ):
         raise ValueError("invalid synthetic feature coverage claims")
+    if source_epoch_ref is not None and (
+        type(source_epoch_ref) is not str
+        or fullmatch(r"[0-9a-f]{64}", source_epoch_ref) is None
+    ):
+        raise ValueError("invalid synthetic source epoch fingerprint")
     tx = normalized.canonical_transaction
     cutoff = normalized.received_at
     if (
@@ -189,6 +195,7 @@ def assess_synthetic_shadow_features(
         normalized.adapter.source_system,
         features.source_fingerprint,
         sorted(_observation_identity(item) for item in observations),
+        *(["sealed_redis_epoch", source_epoch_ref] if source_epoch_ref is not None else []),
     ])
     computation = _digest([
         ASSESSMENT_VERSION, source, features.computation_fingerprint,

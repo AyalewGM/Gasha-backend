@@ -188,3 +188,38 @@ def test_contradicted_seal_invalidates_entire_epoch_until_fresh_rebuild(redis_cl
     rebuilt.append(contradiction)
     rebuilt.seal(available_through=NOW)
     assert rebuilt.compute(target, decision_as_of=NOW).account_transfers_1h == 2
+
+def test_sealed_snapshot_matches_offline_computation_and_binds_epoch(redis_client):
+    store = RedisFeatureHistory(redis_client, tenant_id="synthetic-a", epoch=uuid4().hex)
+    store.open_epoch(covered_from=NOW - timedelta(hours=1), ttl_seconds=30)
+    prior = observation(
+        "prior", time=NOW - timedelta(minutes=2), account="other",
+    )
+    late = observation(
+        "late", time=NOW - timedelta(minutes=3),
+        availability=NOW + timedelta(seconds=1), account="late",
+    )
+    target = observation("target")
+    for item in (prior, late, target):
+        assert store.append(item)
+    store.seal(available_through=NOW)
+    observations = store.observations_for(target, decision_as_of=NOW)
+    assert observations == (late, prior)
+    offline = compute_feature_set(
+        target, observations, decision_as_of=NOW,
+        relationship_history_complete=False,
+    )
+    assert store.compute(target, decision_as_of=NOW) == offline
+    assert offline.beneficiary_unique_senders_1h == 1
+    assert offline.sender_beneficiary_seen_before is None
+    assert len(store.epoch_fingerprint) == 64
+    assert store.epoch_fingerprint != RedisFeatureHistory(
+        redis_client, tenant_id="synthetic-a", epoch=uuid4().hex,
+    ).epoch_fingerprint
+    with pytest.raises(FeatureHistoryUnavailable):
+        store.observations_for(
+            observation("foreign", tenant="synthetic-b"), decision_as_of=NOW,
+        )
+    redis_client.hset(store._key, "event:prior", "{not-json")
+    with pytest.raises(FeatureHistoryUnavailable, match="malformed"):
+        store.observations_for(target, decision_as_of=NOW)

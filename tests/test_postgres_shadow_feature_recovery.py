@@ -5,6 +5,7 @@ broker/Bank isolation or source authenticity. No Bank feed or payment actions.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from json import dumps
@@ -42,7 +43,9 @@ from gasha.ingestion.shadow_copy import SyntheticShadowCopyAdapter
 from gasha.ingestion.worker import IngestionWorker
 from gasha.intelligence.feature_set_v1 import ObservedTransfer
 from gasha.intelligence.internal_graph import InternalGraphPolicy
+from gasha.intelligence.redis_feature_history import RedisFeatureHistory
 from gasha.intelligence.synthetic_shadow_provider import (
+    RedisSyntheticHistorySource,
     SyntheticHistorySnapshotV1,
     SyntheticShadowWorkerEvaluator,
 )
@@ -89,8 +92,9 @@ def snapshot_for_copy(copy):
 
 
 @pytest.mark.skipif(not workflow.DSN, reason="GASHA_TEST_POSTGRES_DSN not set")
+@pytest.mark.parametrize("history_mode", ("fixture", "redis"))
 def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
-    installation, monkeypatch,
+    installation, monkeypatch, request: pytest.FixtureRequest, history_mode: str,
 ) -> None:
     """Durable pending survives failed evaluator/ACK and empty consumer recovery."""
     alerts.install_policy(installation, workflow.ALERT_POLICY)
@@ -109,6 +113,38 @@ def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
     bank_path = [str(first.payload["event_id"]), str(second.payload["event_id"])]
     netguardians_path = list(bank_path)
     fixtures = SyntheticFixtures(tuple(snapshot_for_copy(copy) for copy in copies))
+    worker_history = fixtures
+    if history_mode == "redis":
+        redis_url = os.environ.get("GASHA_TEST_REDIS_URL")
+        if not redis_url:
+            pytest.skip("synthetic Redis and PostgreSQL integration services required")
+        from redis import Redis
+
+        redis_client = Redis.from_url(
+            redis_url, socket_timeout=2, socket_connect_timeout=2,
+        )
+        request.addfinalizer(redis_client.close)
+        assert redis_client.ping()
+        store = RedisFeatureHistory(
+            redis_client, tenant_id=TENANT, epoch=uuid4().hex,
+        )
+        first_snapshot = snapshot_for_copy(first)
+        second_snapshot = snapshot_for_copy(second)
+        assert first_snapshot.observations == second_snapshot.observations
+        occurred = datetime.fromisoformat(str(first.payload["occurred_at"]))
+        store.open_epoch(
+            covered_from=occurred - timedelta(hours=1), ttl_seconds=120,
+        )
+        for prior in first_snapshot.observations:
+            assert store.append(prior)
+        # Intentionally leave the Redis window unsealed through the first
+        # PostgreSQL recovery attempt. No alert or case may be persisted.
+        worker_history = RedisSyntheticHistorySource(
+            store,
+            tenant_id=TENANT,
+            source_system=first.source_system,
+            graph_policy=first_snapshot.graph_policy,
+        )
     wire = tuple(dumps(x.model_dump(mode="json")).encode() for x in copies)
     consumer, batch, dead_letters = make_consumer([
         FakeRecord(wire[0], 1), FakeRecord(wire[1], 2),
@@ -164,7 +200,7 @@ def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
         class Evaluator:
             def __init__(self) -> None:
                 self.port = SyntheticShadowWorkerEvaluator(
-                    orchestrator, history_source=fixtures,
+                    orchestrator, history_source=worker_history,
                 )
 
             def __call__(self, event: FraudEventEnvelope, policy=None):
@@ -184,8 +220,23 @@ def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
                 db, tenant_ids=(TENANT,), worker_id="lineage-recovered",
             ),
             worker_id="lineage-recovered", tenant_ids=(TENANT,),
+            retry_backoff=timedelta(0), max_evaluation_attempts=4,
             dead_letters=recovery_dlq,
         )
+        if history_mode == "redis":
+            assert recovered.run_once(max_events=1) == 0
+            assert evaluated == []
+            assert db.execute(
+                "SELECT count(*) AS n FROM pending_evaluations"
+            ).fetchone()["n"] == 2
+            for table in (
+                "shadow_evaluations", "evaluation_alerts",
+                "analyst_case_events", "security_audit_events",
+            ):
+                assert db.execute(
+                    f"SELECT count(*) AS n FROM {table}"
+                ).fetchone()["n"] == 0
+            store.seal(available_through=max(copy.received_at for copy in copies))
         assert recovered.run_once(max_events=1) == 0
         assert empty_batch.commits == 0
         assert recovery_dlq.records == ()
@@ -219,6 +270,8 @@ def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
             assert evidence.event_id == snapshot.event_id
             assert evidence.decision_as_of == snapshot.receipt_cutoff
             assert evidence.eligible_observations == 5
+            if history_mode == "redis":
+                assert "sender_beneficiary_history_coverage" in evidence.unavailable_signals
             assert evidence.lineage_ref
             assert row["context_ref"] == evaluation_context_ref(saved)
             assert "sender-1" not in evidence.model_dump_json()

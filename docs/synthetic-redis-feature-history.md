@@ -59,3 +59,44 @@ equivalence remain separate required checks under #145.
 
 No Bank data, model activation, payment enforcement, installed IdP or
 NetGuardians action is introduced by this bounded source change.
+
+## Opt-in worker composition (synthetic-only)
+
+`RedisSyntheticHistorySource` is now an explicitly constructed
+`SyntheticShadowWorkerEvaluator` history source for the **existing**
+`IngestionWorker` pending-ledger, `ShadowOrchestrator`, PostgreSQL evaluation
+writer and protected analyst evidence path. The source receives a
+process-configured `RedisFeatureHistory` (tenant and fresh epoch), permitted
+synthetic `source_system` and versioned graph policy. The worker supplies
+only its trusted, normalized pending envelope. Redis is read as one validated,
+sealed snapshot at that envelope's **receipt cutoff**, with the full one-hour
+event-time window required. The computed features are prior-only; the
+one-hour fan-in is available, but historical first-ever relationship **absence**
+remains unavailable. Neither a copy payload nor the analyst browser can
+supply the seal, epoch, coverage assertion or a precomputed score.
+
+The Redis snapshot's opaque tenant/epoch fingerprint is included in the
+assessment's hashed source lineage. It is **not** producer authentication, a
+Bank watermark, or evidence that all upstream observations were delivered.
+The source uses the existing worker's retry/terminal-dead-letter handling
+for missing, expired, contradictory or unavailable coverage; no alert,
+case or evaluation is written from a partial snapshot. On crash recovery,
+the normalized event comes from the existing durable PostgreSQL pending
+ledger, not an in-memory per-event fixture map.
+
+The dedicated PostgreSQL+Redis CI job runs both stores and repeats the
+existing synthetic worker-outage → durable alert/deduped case → protected
+FastAPI analyst evidence and lifecycle regression in Redis mode. Test
+fixtures create and seal an invented epoch before allowing evaluation.
+This is **not installed Bank/NetGuardians integration**, a certified
+bank-origin clock/seal, a representative throughput test, approved
+Bank identity/CSRF or an authoritative #49 readiness assessment.
+The live worker's default configuration remains unchanged and this source is
+not registered as a Bank adapter or enabled by default.
+
+Additional release blockers: provision authenticated producer/watermark
+authority, reconstructible epoch lifecycle and durable producer checkpoints,
+Redis ACLs/credentials/expiry operations, immutable mapping to versioned
+policy and source identity, installed frontend repin/verification,
+Bank-approved workload and fault injection, and independent PO,
+Security/Architecture, Fraud ML and QA review. No enforcement is enabled.
