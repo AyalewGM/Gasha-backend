@@ -234,7 +234,7 @@ class RedisFeatureHistory:
             raise
         except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as exc:
             raise FeatureHistoryUnavailable("missing or malformed feature history snapshot") from exc
-        return tuple(history)
+        return tuple(sorted(history, key=lambda item: item.event_id))
 
     def compute(self, target: ObservedTransfer, *, decision_as_of: datetime) -> FeatureSetV1:
         """Reuse offline feature math, with unavailable first-seen on bounded history."""
