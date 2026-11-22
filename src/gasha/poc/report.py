@@ -26,8 +26,8 @@ from gasha.poc.historical import (
     HistoricalReplayMetrics,
     HistoricalReplayReport,
     MissingTenantPolicyError,
-    _metrics as _derive_replay_metrics,
     ReplayDecisionSource,
+    _metrics as _derive_replay_metrics,
 )
 from gasha.poc.incumbent import IncumbentComparison, compare_incumbent
 
