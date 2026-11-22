@@ -28,8 +28,9 @@ from gasha.poc.historical import (
     HistoricalReplayReport,
     MissingTenantPolicyError,
     ReplayDecisionSource,
+    _classify,
 )
-from gasha.poc.historical import _classify, _metrics as _derive_replay_metrics
+from gasha.poc.historical import _metrics as _derive_replay_metrics
 from gasha.poc.incumbent import IncumbentComparison, compare_incumbent
 
 # A schema identifier, not an evidence authenticity or approval indicator.
