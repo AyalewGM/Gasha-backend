@@ -2,6 +2,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
 
+import pytest
+
 from gasha.domain.models import (
     BeneficiaryType,
     CanonicalTransaction,
@@ -241,3 +243,63 @@ def test_attribution_uses_each_events_own_tenant_threshold() -> None:
     assert SignalFamily.BENEFICIARY in events["tenant-a"].influenced
     assert events["tenant-b"].influenced == frozenset()
     assert events["tenant-b"].alerted is False
+
+
+def test_same_uuid_across_tenants_preserves_family_labels_and_reason_codes() -> None:
+    first = replayed(
+        "fraud-a",
+        IntelligenceSnapshot(network_risk=0.94, beneficiary_risk=0.91),
+        True,
+        reason_codes=("SYNTHETIC_A_ONLY",),
+    )
+    second = replayed(
+        "legitimate-b",
+        IntelligenceSnapshot(relationship_risk=0.95, device_session_risk=0.92),
+        False,
+        tenant_id="tenant-b",
+        reason_codes=("SYNTHETIC_B_ONLY",),
+    )
+    second = second.model_copy(update={
+        "transaction": second.transaction.model_copy(
+            update={"event_id": first.transaction.event_id}
+        ),
+    })
+    report = replay_historical((first, second), {
+        "tenant-a": policy(), "tenant-b": policy(),
+    })
+    attributed = attribute_signals(report.results, {
+        "tenant-a": policy(), "tenant-b": policy(),
+    })
+    assert attributed.families[SignalFamily.NETWORK].true_positives_influenced == 1
+    assert attributed.families[SignalFamily.NETWORK].false_positives_influenced == 0
+    assert attributed.families[SignalFamily.RELATIONSHIP].false_positives_influenced == 1
+    assert attributed.families[SignalFamily.RELATIONSHIP].true_positives_influenced == 0
+    by_tenant = {
+        detection.tenant_id: detection
+        for detection in attributed.multi_signal.detections
+    }
+    assert set(by_tenant) == {"tenant-a", "tenant-b"}
+    assert "SYNTHETIC_A_ONLY" in by_tenant["tenant-a"].reason_codes
+    assert "SYNTHETIC_B_ONLY" not in by_tenant["tenant-a"].reason_codes
+    assert "SYNTHETIC_B_ONLY" in by_tenant["tenant-b"].reason_codes
+    assert "SYNTHETIC_A_ONLY" not in by_tenant["tenant-b"].reason_codes
+
+
+def test_duplicate_composite_attribution_identity_is_rejected() -> None:
+    report = run(replayed(
+        "fraud-a", IntelligenceSnapshot(network_risk=0.94), True,
+    ))
+    with pytest.raises(ValueError, match="duplicate tenant/event attribution"):
+        attribute_signals(report.results + report.results, {"tenant-a": policy()})
+
+
+def test_mismatched_decision_and_source_event_identity_is_rejected() -> None:
+    report = run(
+        replayed("a", IntelligenceSnapshot(network_risk=0.94), True),
+        replayed("b", IntelligenceSnapshot(beneficiary_risk=0.94), False),
+    )
+    corrupted = report.results[0].model_copy(update={
+        "event": report.results[1].event,
+    })
+    with pytest.raises(ValueError, match="identity mismatch"):
+        attribute_signals((corrupted,), {"tenant-a": policy()})
