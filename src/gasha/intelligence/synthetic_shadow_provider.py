@@ -8,8 +8,8 @@ a policy override, or a payment action. These records are NOT bank attestations.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from re import fullmatch
 from datetime import datetime, timezone
+from re import fullmatch
 from typing import Protocol
 from uuid import UUID
 
