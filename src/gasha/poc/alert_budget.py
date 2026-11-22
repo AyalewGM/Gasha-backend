@@ -49,7 +49,8 @@ def measure_same_budget(
     }
     tp = fp = tn = fn = unlabeled = alerted_unlabeled = 0
     for event, _ in results:
-        alerted = (event.transaction.tenant_id, event.transaction.event_id) in alerted_ids
+        identity = (event.transaction.tenant_id, event.transaction.event_id)
+        alerted = identity in alerted_ids
         label = event.label
         if label is None:
             unlabeled += 1
