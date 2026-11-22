@@ -152,6 +152,7 @@ class SyntheticShadowWorkerEvaluator:
             or self._history_source is None
         ):
             raise ValueError("trusted synthetic history provider unavailable")
+        snapshot: SyntheticHistorySnapshotV1 | None
         if isinstance(self._history_source, RedisSyntheticHistorySource):
             snapshot = self._history_source.snapshot_for_envelope(normalized)
         else:
