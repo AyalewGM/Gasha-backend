@@ -128,8 +128,10 @@ def test_incomplete_history_is_unavailable_never_measured_as_zero():
 )
 def test_redis_worker_port_computes_bounded_fan_in_and_fails_closed_on_seal_loss():
     from redis import Redis
+
     from gasha.intelligence.redis_feature_history import (
-        FeatureHistoryUnavailable, RedisFeatureHistory,
+        FeatureHistoryUnavailable,
+        RedisFeatureHistory,
     )
     from gasha.intelligence.synthetic_shadow_provider import RedisSyntheticHistorySource
 
