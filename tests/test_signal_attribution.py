@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
@@ -272,7 +273,9 @@ def test_same_uuid_across_tenants_preserves_family_labels_and_reason_codes() -> 
     })
     assert attributed.families[SignalFamily.NETWORK].true_positives_influenced == 1
     assert attributed.families[SignalFamily.NETWORK].false_positives_influenced == 0
-    assert attributed.families[SignalFamily.RELATIONSHIP].false_positives_influenced == 1
+    assert (
+        attributed.families[SignalFamily.RELATIONSHIP].false_positives_influenced == 1
+    )
     assert attributed.families[SignalFamily.RELATIONSHIP].true_positives_influenced == 0
     by_tenant = {
         detection.tenant_id: detection
@@ -298,8 +301,6 @@ def test_mismatched_decision_and_source_event_identity_is_rejected() -> None:
         replayed("a", IntelligenceSnapshot(network_risk=0.94), True),
         replayed("b", IntelligenceSnapshot(beneficiary_risk=0.94), False),
     )
-    corrupted = report.results[0].model_copy(update={
-        "event": report.results[1].event,
-    })
+    corrupted = replace(report.results[0], event=report.results[1].event)
     with pytest.raises(ValueError, match="identity mismatch"):
         attribute_signals((corrupted,), {"tenant-a": policy()})
