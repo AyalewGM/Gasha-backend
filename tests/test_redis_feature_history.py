@@ -204,7 +204,7 @@ def test_sealed_snapshot_matches_offline_computation_and_binds_epoch(redis_clien
         assert store.append(item)
     store.seal(available_through=NOW)
     observations = store.observations_for(target, decision_as_of=NOW)
-    assert observations == (prior, late)
+    assert observations == (late, prior)
     offline = compute_feature_set(
         target, observations, decision_as_of=NOW,
         relationship_history_complete=False,
