@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from math import isfinite
 
 from gasha.poc.historical import HistoricalTransactionEvent
 
@@ -36,6 +37,15 @@ def measure_same_budget(
     ]
     if len(set(identities)) != len(identities):
         raise ValueError("duplicate tenant/event identity in alert-budget cohort")
+    # Scores are normalized risk in [0,1]. Unordered NaN makes equal-K
+    # selection depend on incoming row order, including with K=0.
+    for _, score in results:
+        if (
+            type(score) not in (int, float)
+            or not 0 <= score <= 1
+            or not isfinite(score)
+        ):
+            raise ValueError("invalid score: finite normalized [0,1] required")
 
     # Each selected event consumes one slot even if its label is unavailable.
     # The tenant is part of both the stable tie-break and the membership key.

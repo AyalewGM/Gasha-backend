@@ -122,6 +122,8 @@ class MultiSignalAnalysis:
 
 @dataclass(frozen=True)
 class SignalAttributionReport:
+    # Aggregate family counts have exactly one tenant scope, never pooled banks.
+    tenant_id: str | None
     events: tuple[EventAttribution, ...]
     families: Mapping[SignalFamily, SignalFamilyAttribution]
     multi_signal: MultiSignalAnalysis
@@ -143,6 +145,9 @@ def attribute_signals(
     co-influenced family sets are counted for every multi-signal alert.
     """
 
+    tenants = {result.decision.tenant_id for result in results}
+    if len(tenants) > 1:
+        raise ValueError("mixed-tenant signal attribution is not permitted")
     named_combinations = (
         combinations
         if combinations is not None
@@ -198,6 +203,7 @@ def attribute_signals(
         )
 
     return SignalAttributionReport(
+        tenant_id=next(iter(tenants), None),
         events=tuple(attributed),
         families=_family_metrics(attributed, results),
         multi_signal=_multi_signal(attributed, results, named_combinations),

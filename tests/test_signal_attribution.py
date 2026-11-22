@@ -227,26 +227,30 @@ def test_attribution_uses_each_events_own_tenant_threshold() -> None:
                 "a-1", IntelligenceSnapshot(beneficiary_risk=0.91), True
             ),
             replayed(
-                "b-1",
-                IntelligenceSnapshot(beneficiary_risk=0.91),
-                True,
-                tenant_id="tenant-b",
+                "b-1", IntelligenceSnapshot(beneficiary_risk=0.91),
+                True, tenant_id="tenant-b",
             ),
         ),
         policies,
     )
-    attribution = attribute_signals(
-        report.results,
-        {"tenant-a": policy(), "tenant-b": strict_b},
-    )
+    with pytest.raises(ValueError, match="mixed-tenant signal attribution"):
+        attribute_signals(report.results, policies)
 
-    events = {event.tenant_id: event for event in attribution.events}
-    assert SignalFamily.BENEFICIARY in events["tenant-a"].influenced
-    assert events["tenant-b"].influenced == frozenset()
-    assert events["tenant-b"].alerted is False
+    scoped = {
+        tenant: attribute_signals(
+            tuple(r for r in report.results if r.decision.tenant_id == tenant),
+            policies,
+        )
+        for tenant in policies
+    }
+    assert scoped["tenant-a"].tenant_id == "tenant-a"
+    assert scoped["tenant-b"].tenant_id == "tenant-b"
+    assert SignalFamily.BENEFICIARY in scoped["tenant-a"].events[0].influenced
+    assert scoped["tenant-b"].events[0].influenced == frozenset()
+    assert scoped["tenant-b"].events[0].alerted is False
 
 
-def test_same_uuid_across_tenants_preserves_family_labels_and_reason_codes() -> None:
+def test_same_uuid_across_tenants_requires_separate_attribution() -> None:
     first = replayed(
         "fraud-a",
         IntelligenceSnapshot(network_risk=0.94, beneficiary_risk=0.91),
@@ -265,27 +269,26 @@ def test_same_uuid_across_tenants_preserves_family_labels_and_reason_codes() -> 
             update={"event_id": first.transaction.event_id}
         ),
     })
-    report = replay_historical((first, second), {
-        "tenant-a": policy(), "tenant-b": policy(),
-    })
-    attributed = attribute_signals(report.results, {
-        "tenant-a": policy(), "tenant-b": policy(),
-    })
-    assert attributed.families[SignalFamily.NETWORK].true_positives_influenced == 1
-    assert attributed.families[SignalFamily.NETWORK].false_positives_influenced == 0
-    assert (
-        attributed.families[SignalFamily.RELATIONSHIP].false_positives_influenced == 1
-    )
-    assert attributed.families[SignalFamily.RELATIONSHIP].true_positives_influenced == 0
+    policies = {"tenant-a": policy(), "tenant-b": policy()}
+    report = replay_historical((first, second), policies)
+    with pytest.raises(ValueError, match="mixed-tenant signal attribution"):
+        attribute_signals(report.results, policies)
+
     by_tenant = {
-        detection.tenant_id: detection
-        for detection in attributed.multi_signal.detections
+        r.decision.tenant_id: attribute_signals((r,), policies)
+        for r in report.results
     }
-    assert set(by_tenant) == {"tenant-a", "tenant-b"}
-    assert "SYNTHETIC_A_ONLY" in by_tenant["tenant-a"].reason_codes
-    assert "SYNTHETIC_B_ONLY" not in by_tenant["tenant-a"].reason_codes
-    assert "SYNTHETIC_B_ONLY" in by_tenant["tenant-b"].reason_codes
-    assert "SYNTHETIC_A_ONLY" not in by_tenant["tenant-b"].reason_codes
+    a, b = by_tenant["tenant-a"], by_tenant["tenant-b"]
+    assert a.families[SignalFamily.NETWORK].true_positives_influenced == 1
+    assert a.families[SignalFamily.RELATIONSHIP].false_positives_influenced == 0
+    assert b.families[SignalFamily.RELATIONSHIP].false_positives_influenced == 1
+    assert b.families[SignalFamily.NETWORK].true_positives_influenced == 0
+    assert a.multi_signal.detections[0].tenant_id == "tenant-a"
+    assert b.multi_signal.detections[0].tenant_id == "tenant-b"
+    assert "SYNTHETIC_A_ONLY" in a.multi_signal.detections[0].reason_codes
+    assert "SYNTHETIC_B_ONLY" not in a.multi_signal.detections[0].reason_codes
+    assert "SYNTHETIC_B_ONLY" in b.multi_signal.detections[0].reason_codes
+    assert "SYNTHETIC_A_ONLY" not in b.multi_signal.detections[0].reason_codes
 
 
 def test_duplicate_composite_attribution_identity_is_rejected() -> None:
@@ -308,6 +311,7 @@ def test_mismatched_decision_and_source_event_identity_is_rejected() -> None:
 
 def test_missing_detected_fraud_population_is_undefined_not_measured_zero() -> None:
     empty = attribute_signals((), {})
+    assert empty.tenant_id is None
     assert all(
         family.share_of_detected_fraud is None
         for family in empty.families.values()

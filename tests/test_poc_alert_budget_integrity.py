@@ -140,3 +140,32 @@ def test_empty_cohort_accepts_only_zero_budget_and_rates_are_undefined() -> None
         assert isinstance(rate["undefined_reason"], str)
     with pytest.raises(ValueError, match="alert budget"):
         measure_same_budget([], alert_budget=1)
+
+@pytest.mark.parametrize(
+    "invalid_score",
+    [float("nan"), float("inf"), float("-inf"), -0.01, 1.01,
+     True, "0.9", None, 10 ** 400],
+)
+@pytest.mark.parametrize("budget", [0, 1])
+def test_invalid_score_fails_closed_before_top_k_even_when_k_is_zero(
+    invalid_score: object, budget: int,
+) -> None:
+    event = _event("tenant-a", 12, True)
+    with pytest.raises(ValueError, match="invalid score"):
+        measure_same_budget(
+            [(event, invalid_score)],  # type: ignore[list-item]
+            alert_budget=budget,
+        )
+
+
+def test_finite_normalized_score_selection_is_permutation_invariant() -> None:
+    fraud = _event("tenant-a", 11, True)
+    legitimate = _event("tenant-a", 12, False)
+    rows = [(fraud, 1.0), (legitimate, 0.0)]
+    for cohort in (rows, list(reversed(rows))):
+        metrics = measure_same_budget(cohort, alert_budget=1)
+        assert metrics["alert_count"] == metrics["selected_row_count"] == 1
+        assert metrics["confusion_counts"] == {
+            "true_positive": 1, "false_positive": 0,
+            "true_negative": 1, "false_negative": 0, "unlabeled": 0,
+        }

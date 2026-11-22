@@ -1,5 +1,6 @@
 """Machine-readable POC rates must not turn absent populations into zero scores."""
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
@@ -13,6 +14,7 @@ from gasha.domain.models import (
     IntelligenceSnapshot,
 )
 from gasha.poc.ablation import AblationComparison
+from gasha.poc.attribution import attribute_signals
 from gasha.poc.historical import (
     HistoricalReplayMetrics,
     HistoricalReplayReport,
@@ -226,3 +228,17 @@ def test_empty_observed_incumbent_comparison_cannot_claim_zero_percent_rates() -
         assert summary[key] is None
         assert summary["rate_evidence"][key]["denominator"] == 0
         assert summary["rate_evidence"][key]["undefined_reason"]
+
+
+def test_supplied_unscoped_or_foreign_attribution_cannot_enter_tenant_report() -> None:
+    replay = HistoricalReplayReport(results=(), metrics=empty_metrics())
+    unscoped = attribute_signals((), {})
+    for attribution in (unscoped, replace(unscoped, tenant_id="tenant-other")):
+        with pytest.raises(ValueError, match="attribution tenant mismatch"):
+            build_poc_report(
+                tenant_id="tenant-synthetic",
+                dataset_id="synthetic-empty",
+                report=replay,
+                policies={},
+                attribution=attribution,
+            )

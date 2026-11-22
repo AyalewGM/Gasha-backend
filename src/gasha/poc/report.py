@@ -471,6 +471,8 @@ def build_poc_report(
     )
     if attribution is None:
         attribution = attribute_signals(report.results, policies)
+    elif attribution.tenant_id != tenant_id:
+        raise ValueError("POC report attribution tenant mismatch")
     if incumbent is None and any(
         result.event.incumbent_outcome is not None
         for result in report.results
