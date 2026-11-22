@@ -3,7 +3,7 @@
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -14,8 +14,9 @@ from gasha.domain.models import (
     IntelligenceSnapshot,
 )
 from gasha.poc.ablation import AblationComparison
-from gasha.poc.attribution import attribute_signals
+from gasha.poc.attribution import SignalFamily, attribute_signals
 from gasha.poc.historical import (
+    ConfirmedOutcomeLabel,
     HistoricalReplayMetrics,
     HistoricalReplayReport,
     HistoricalTransactionEvent,
@@ -242,3 +243,184 @@ def test_supplied_unscoped_or_foreign_attribution_cannot_enter_tenant_report() -
                 policies={},
                 attribution=attribution,
             )
+
+
+def _attribution_event(
+    tenant_id: str,
+    *,
+    event_id: UUID | None = None,
+    is_fraud: bool = True,
+    network_risk: float = 0.97,
+    beneficiary_risk: float = 0.94,
+) -> HistoricalTransactionEvent:
+    """Invented labeled events; no bank data, customer IDs or observed outcomes."""
+    identity = event_id or uuid4()
+    return HistoricalTransactionEvent(
+        transaction=CanonicalTransaction(
+            tenant_id=tenant_id,
+            event_id=identity,
+            occurred_at=datetime(2026, 2, 10, tzinfo=UTC),
+            channel="mobile",
+            transaction_type="transfer",
+            amount=Decimal("100.00"),
+            currency="ETB",
+            sender_customer_id=f"fictional-{tenant_id}-{identity}",
+            sender_account_id=f"fictional-account-{tenant_id}-{identity}",
+            beneficiary_id="fictional-beneficiary",
+            beneficiary_type=BeneficiaryType.EXTERNAL,
+            destination_institution_id="fictional-destination",
+            correlation_id=f"fictional-correlation-{tenant_id}-{identity}",
+        ),
+        intelligence=IntelligenceSnapshot(
+            network_risk=network_risk,
+            beneficiary_risk=beneficiary_risk,
+        ),
+        label=ConfirmedOutcomeLabel(
+            is_fraud=is_fraud,
+            label_source="synthetic",
+        ),
+    )
+
+
+def _attribution_policy() -> DecisionPolicy:
+    return DecisionPolicy(
+        configuration_version="config-synthetic",
+        policy_version="policy-synthetic",
+        rule_version="rules-synthetic",
+    )
+
+
+def test_relabeling_foreign_attribution_cannot_contaminate_empty_or_nonempty_replay() -> None:
+    """QA/Security regression: replacing only top-level tenant must not launder evidence."""
+    tenant_a, tenant_b = "tenant-a", "tenant-b"
+    shared_id = uuid4()  # Even colliding UUIDs must remain tenant scoped.
+    policies_a, policies_b = (
+        {tenant_a: _attribution_policy()},
+        {tenant_b: _attribution_policy()},
+    )
+    b_replay = replay_historical(
+        (_attribution_event(tenant_b, event_id=shared_id, is_fraud=False),),
+        policies_b,
+    )
+    foreign = attribute_signals(b_replay.results, policies_b)
+    assert foreign.families[SignalFamily.NETWORK].false_positives_influenced == 1
+    relabeled = replace(foreign, tenant_id=tenant_a)
+    a_replay = replay_historical(
+        (_attribution_event(tenant_a, event_id=shared_id),), policies_a
+    )
+    for replay in (HistoricalReplayReport(results=(), metrics=empty_metrics()), a_replay):
+        with pytest.raises(ValueError, match="attribution does not match replay cohort"):
+            build_poc_report(
+                tenant_id=tenant_a,
+                dataset_id="fictional-cohort",
+                report=replay,
+                policies=policies_a,
+                attribution=relabeled,
+            )
+
+
+def test_supplied_attribution_requires_exact_event_set_and_current_decisions() -> None:
+    tenant_id = "tenant-a"
+    policies = {tenant_id: _attribution_policy()}
+    first = _attribution_event(tenant_id)
+    second = _attribution_event(tenant_id, is_fraud=False)
+    replay = replay_historical((first, second), policies)
+    original = attribute_signals(replay.results, policies)
+    assert len(original.events) == 2
+
+    wrong_cohort = replay_historical((_attribution_event(tenant_id),), policies)
+    stale_same_identity = replay_historical(
+        (first.model_copy(update={
+            "intelligence": IntelligenceSnapshot(
+                network_risk=0.02, beneficiary_risk=0.01
+            )
+        }), second),
+        policies,
+    )
+    for replay_for_report, provided in (
+        (replay, replace(original, events=original.events[:1])),
+        (replay, replace(original, events=original.events + original.events[:1])),
+        (wrong_cohort, original),
+        (stale_same_identity, original),
+    ):
+        with pytest.raises(ValueError, match="attribution does not match replay cohort"):
+            build_poc_report(
+                tenant_id=tenant_id,
+                dataset_id="fictional-cohort",
+                report=replay_for_report,
+                policies=policies,
+                attribution=provided,
+            )
+
+
+def test_supplied_attribution_cannot_forge_family_counts_or_reason_codes() -> None:
+    tenant_id = "tenant-a"
+    policies = {tenant_id: _attribution_policy()}
+    replay = replay_historical((_attribution_event(tenant_id),), policies)
+    original = attribute_signals(replay.results, policies)
+    network = original.families[SignalFamily.NETWORK]
+    forged_counts = replace(
+        original,
+        families={
+            **original.families,
+            SignalFamily.NETWORK: replace(network, alerts_influenced=0),
+        },
+    )
+    assert original.multi_signal.detections
+    first_detection = original.multi_signal.detections[0]
+    forged_reasons = replace(
+        original,
+        multi_signal=replace(
+            original.multi_signal,
+            detections=(
+                replace(first_detection, reason_codes=("FICTIONAL_FORGED_REASON",)),
+                *original.multi_signal.detections[1:],
+            ),
+        ),
+    )
+    forged_named_combo = replace(
+        original,
+        multi_signal=replace(
+            original.multi_signal,
+            named_combination_detections={"forged_combination": 1},
+        ),
+    )
+    for supplied in (forged_counts, forged_reasons, forged_named_combo):
+        with pytest.raises(ValueError, match="attribution does not match replay cohort"):
+            build_poc_report(
+                tenant_id=tenant_id,
+                dataset_id="fictional-cohort",
+                report=replay,
+                policies=policies,
+                attribution=supplied,
+            )
+
+
+def test_matching_supplied_attribution_accepts_unordered_events_and_is_identical() -> None:
+    tenant_id = "tenant-a"
+    policies = {tenant_id: _attribution_policy()}
+    replay = replay_historical(
+        (_attribution_event(tenant_id), _attribution_event(tenant_id, is_fraud=False)),
+        policies,
+    )
+    original = attribute_signals(replay.results, policies)
+    reordered = replace(
+        original,
+        events=tuple(reversed(original.events)),
+        multi_signal=replace(
+            original.multi_signal,
+            detections=tuple(reversed(original.multi_signal.detections)),
+        ),
+    )
+    args = {
+        "tenant_id": tenant_id,
+        "dataset_id": "fictional-cohort",
+        "report": replay,
+        "policies": policies,
+    }
+    computed = build_poc_report(**args)
+    supplied = build_poc_report(**args, attribution=reordered)
+    assert supplied.model_dump(mode="json") == computed.model_dump(mode="json")
+    assert supplied.signal_attribution
+    assert computed.confusion.true_positives == 1
+    assert computed.confusion.false_positives == 1
