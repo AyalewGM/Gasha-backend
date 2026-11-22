@@ -97,7 +97,7 @@ class SignalFamilyAttribution:
     driving_alerts: int
     true_positives_influenced: int
     false_positives_influenced: int
-    share_of_detected_fraud: float
+    share_of_detected_fraud: float | None
     mean_risk_contribution: float | None
     max_risk_contribution: float | None
     reason_codes: frozenset[str]
@@ -122,6 +122,8 @@ class MultiSignalAnalysis:
 
 @dataclass(frozen=True)
 class SignalAttributionReport:
+    # Aggregate family counts have exactly one tenant scope, never pooled banks.
+    tenant_id: str | None
     events: tuple[EventAttribution, ...]
     families: Mapping[SignalFamily, SignalFamilyAttribution]
     multi_signal: MultiSignalAnalysis
@@ -143,15 +145,28 @@ def attribute_signals(
     co-influenced family sets are counted for every multi-signal alert.
     """
 
+    tenants = {result.decision.tenant_id for result in results}
+    if len(tenants) > 1:
+        raise ValueError("mixed-tenant signal attribution is not permitted")
     named_combinations = (
         combinations
         if combinations is not None
         else DEFAULT_SIGNAL_COMBINATIONS
     )
     attributed: list[EventAttribution] = []
+    seen: set[tuple[str, UUID]] = set()
 
     for result in results:
         tenant_id = result.decision.tenant_id
+        identity = (tenant_id, result.decision.event_id)
+        event_identity = (
+            result.event.transaction.tenant_id, result.event.transaction.event_id,
+        )
+        if event_identity != identity:
+            raise ValueError("replayed decision and event identity mismatch")
+        if identity in seen:
+            raise ValueError("duplicate tenant/event attribution identity")
+        seen.add(identity)
         policy = policies.get(tenant_id)
         if policy is None:
             raise MissingTenantPolicyError(
@@ -188,6 +203,7 @@ def attribute_signals(
         )
 
     return SignalAttributionReport(
+        tenant_id=next(iter(tenants), None),
         events=tuple(attributed),
         families=_family_metrics(attributed, results),
         multi_signal=_multi_signal(attributed, results, named_combinations),
@@ -203,12 +219,15 @@ def _family_metrics(
         for result in results
         if result.classification == ReplayClassification.TRUE_POSITIVE
     )
-    by_event = {result.decision.event_id: result for result in results}
+    by_event = {
+        (result.decision.tenant_id, result.decision.event_id): result
+        for result in results
+    }
     metrics: dict[SignalFamily, SignalFamilyAttribution] = {}
 
     for family in SignalFamily:
         influenced_results = [
-            by_event[event.event_id]
+            by_event[(event.tenant_id, event.event_id)]
             for event in attributed
             if event.alerted and family in event.influenced
         ]
@@ -243,7 +262,7 @@ def _family_metrics(
             ),
             true_positives_influenced=tp_influenced,
             false_positives_influenced=fp_influenced,
-            share_of_detected_fraud=tp_influenced / total_tp if total_tp else 0.0,
+            share_of_detected_fraud=tp_influenced / total_tp if total_tp else None,
             mean_risk_contribution=(
                 fmean(contributions) if contributions else None
             ),
@@ -261,7 +280,10 @@ def _multi_signal(
     results: Sequence[ReplayedEventResult],
     combinations: Mapping[str, AbstractSet[SignalFamily]],
 ) -> MultiSignalAnalysis:
-    by_event = {result.decision.event_id: result for result in results}
+    by_event = {
+        (result.decision.tenant_id, result.decision.event_id): result
+        for result in results
+    }
     detections: list[MultiSignalDetection] = []
     family_combination_counts: dict[tuple[SignalFamily, ...], int] = {}
     named_counts = {name: 0 for name in combinations}
@@ -286,7 +308,7 @@ def _multi_signal(
                 tenant_id=event.tenant_id,
                 families=families,
                 reason_codes=tuple(
-                    by_event[event.event_id].decision.reason_codes
+                    by_event[(event.tenant_id, event.event_id)].decision.reason_codes
                 ),
             )
         )

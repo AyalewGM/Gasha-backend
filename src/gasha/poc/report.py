@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import pairwise
 from math import isclose, isfinite
 from typing import Annotated, Literal, Self
+from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
 from gasha.domain.models import DecisionPolicy
-from gasha.poc.ablation import AblationComparison, AblationReport
+from gasha.poc.ablation import (
+    AblationComparison,
+    AblationConfiguration,
+    AblationReport,
+    run_ablation,
+)
 from gasha.poc.attribution import (
     SignalAttributionReport,
     SignalFamily,
@@ -21,7 +28,9 @@ from gasha.poc.historical import (
     HistoricalReplayReport,
     MissingTenantPolicyError,
     ReplayDecisionSource,
+    _classify,
 )
+from gasha.poc.historical import _metrics as _derive_replay_metrics
 from gasha.poc.incumbent import IncumbentComparison, compare_incumbent
 
 # A schema identifier, not an evidence authenticity or approval indicator.
@@ -403,6 +412,119 @@ class POCReport(BaseModel):
         return self
 
 
+
+def _stable_replay_rows(replay: HistoricalReplayReport) -> tuple[tuple[str, ...], ...]:
+    """Compare input, decisions and classification, not ephemeral replay clocks.
+
+    This is an offline same-cohort consistency check, never a trusted Bank
+    dataset fingerprint, producer attestation or label-maturity guarantee.
+    """
+    return tuple(sorted(
+        (
+            result.decision.tenant_id,
+            str(result.decision.event_id),
+            result.event.model_dump_json(),
+            result.decision.model_dump_json(exclude={"decided_at"}),
+            result.classification.value,
+            result.decision_source.value,
+        )
+        for result in replay.results
+    ))
+
+
+
+def _validate_replay_row_lineage(report: HistoricalReplayReport) -> None:
+    """Verify each synthetic replay classification before aggregating evidence.
+
+    Aggregate metrics can be internally consistent with forged per-row TP/FN
+    classifications. Bind every row to its canonical event, decision and
+    effective confirmed label before calculating or attributing any results.
+    This does not attest the upstream dataset or the maturity of Bank labels.
+    """
+    seen: set[tuple[str, UUID]] = set()
+    for result in report.results:
+        event = result.event
+        event._check_recorded_timestamps()
+        transaction = event.transaction
+        key = (transaction.tenant_id, transaction.event_id)
+        if key in seen:
+            raise ValueError("POC report has duplicate replay event identity")
+        seen.add(key)
+        if (
+            (result.decision.tenant_id, result.decision.event_id) != key
+            or result.decision.correlation_id != transaction.correlation_id
+        ):
+            raise ValueError("POC report decision does not match replay event")
+
+        # Offline history contains no original Bank decision or alert clocks.
+        # Caller-constructed per-row durations must not invent historical
+        # decision latency or detection lead time, even with matching metrics.
+        if result.decision_latency is not None or result.detection_lead_time is not None:
+            raise ValueError("POC report historical decision/lead clocks unavailable")
+
+        # Processing time is replay-only evidence: it must be explained by
+        # the actual recorded evaluation bracket, not an asserted row value.
+        started = result.evaluation_started_at
+        ended = result.evaluation_ended_at
+        duration = result.processing_latency
+        if (started is None) != (ended is None):
+            raise ValueError("POC report has incomplete replay evaluation clocks")
+        if started is None:
+            if duration is not None:
+                raise ValueError("POC report processing latency requires replay clocks")
+        else:
+            if (
+                not isinstance(started, datetime)
+                or not isinstance(ended, datetime)
+                or started.utcoffset() is None
+                or ended.utcoffset() is None
+                or ended < started
+            ):
+                raise ValueError("POC report has invalid replay evaluation clocks")
+            if (
+                not isinstance(duration, timedelta)
+                or duration != ended - started
+                or duration < timedelta(0)
+                or not isfinite(duration.total_seconds())
+            ):
+                raise ValueError("POC report processing latency disagrees with evaluation clocks")
+
+        outcome = result.reconciled_outcome
+        original_label = event.label
+        if outcome is not None:
+            if (outcome.tenant_id, outcome.event_id) != key:
+                raise ValueError("POC report reconciled outcome identity mismatch")
+            confirmed_at = outcome.confirmed_at
+            if confirmed_at is not None and (
+                confirmed_at.utcoffset() is None
+                or confirmed_at < transaction.occurred_at
+            ):
+                raise ValueError("POC report reconciled outcome has invalid clock")
+            if (
+                original_label is not None
+                and original_label.confirmed_at is not None
+                and (
+                    confirmed_at is None
+                    or confirmed_at < original_label.confirmed_at
+                )
+            ):
+                raise ValueError("POC report reconciled outcome predates label")
+        effective_label = (
+            outcome.is_fraud
+            if outcome is not None
+            else original_label.is_fraud
+            if original_label is not None
+            else None
+        )
+        expected = _classify(
+            result.decision.action in ALERT_ACTIONS, effective_label
+        )
+        if result.classification is not expected:
+            raise ValueError(
+                "POC report classification does not match label and action"
+            )
+
+
 def build_poc_report(
     *,
     tenant_id: str,
@@ -454,7 +576,17 @@ def build_poc_report(
             f"no decision policy registered for tenant {tenant_id!r}"
         )
 
-    metrics = report.metrics
+    _validate_replay_row_lineage(report)
+
+    # HistoricalReplayReport is caller-constructible. Arithmetic consistency
+    # within its aggregate is not proof that its counts, explanations or
+    # timing came from the actual replay. Reject the *entire* supplied metric
+    # object when it differs from the shared historical replay derivation,
+    # before any POC evidence model is assembled. No missing result may be
+    # silently counted as a false negative or as observed control evidence.
+    metrics = _derive_replay_metrics(list(report.results))
+    if report.metrics != metrics:
+        raise ValueError("POC report historical metrics do not match replay results")
     confusion = _confusion_summary(
         metrics.true_positives,
         metrics.false_positives,
@@ -469,13 +601,78 @@ def build_poc_report(
         all_alerts,
         "no_alerts",
     )
-    if attribution is None:
-        attribution = attribute_signals(report.results, policies)
-    if incumbent is None and any(
+    # Precomputed reports are caller-constructible, not proof of the event
+    # cohort or aggregates. Recompute against this exact replay/policies before
+    # accepting their contents. Always serialize recomputed evidence.
+    verified_attribution = attribute_signals(report.results, policies)
+    if attribution is not None:
+        if attribution.tenant_id != tenant_id:
+            raise ValueError("POC report attribution tenant mismatch")
+        if (
+            attribution.tenant_id != verified_attribution.tenant_id
+            or Counter(attribution.events) != Counter(verified_attribution.events)
+            or attribution.families != verified_attribution.families
+            or Counter(attribution.multi_signal.detections)
+            != Counter(verified_attribution.multi_signal.detections)
+            or attribution.multi_signal.family_combination_counts
+            != verified_attribution.multi_signal.family_combination_counts
+            or attribution.multi_signal.named_combination_detections
+            != verified_attribution.multi_signal.named_combination_detections
+        ):
+            raise ValueError("POC report attribution does not match replay cohort")
+    attribution = verified_attribution
+    # Never trust caller-constructed incumbent counts simply because their
+    # arithmetic is feasible: an absent control decision is not an observed
+    # non-alert and cannot earn incremental Gasha detection credit.
+    recorded_incumbent = any(
         result.event.incumbent_outcome is not None
         for result in report.results
+    )
+    verified_incumbent = compare_incumbent(report.results)
+    if incumbent is not None and (
+        not recorded_incumbent or incumbent != verified_incumbent
     ):
-        incumbent = compare_incumbent(report.results)
+        raise ValueError("POC report incumbent does not match recorded replay outcomes")
+    incumbent = verified_incumbent if recorded_incumbent else None
+
+    # Ablation results are also caller-constructible. Re-run only the named
+    # configurations on this exact synthetic replay and compare each derived
+    # aggregate/unique detection. A late-reconciled cohort needs a separately
+    # provenance-pinned ablation contract; never silently re-label old runs.
+    if ablation is not None:
+        if any(result.reconciled_outcome is not None for result in report.results):
+            raise ValueError("POC report ablation cannot verify reconciled outcomes")
+        names = [item.configuration_name for item in ablation.comparisons]
+        if (
+            not names or len(names) != len(set(names))
+            or any(not item.removed_families for item in ablation.comparisons)
+        ):
+            raise ValueError("POC report ablation has invalid configurations")
+        configs = tuple(
+            AblationConfiguration(
+                name=item.configuration_name,
+                removed_families=frozenset(item.removed_families),
+            )
+            for item in sorted(
+                ablation.comparisons, key=lambda comparison: comparison.configuration_name
+            )
+        )
+        verified_ablation = run_ablation(
+            tuple(result.event for result in report.results),
+            policies,
+            configurations=configs,
+        )
+        if (
+            _stable_replay_rows(ablation.full) != _stable_replay_rows(report)
+            or _stable_replay_rows(verified_ablation.full)
+            != _stable_replay_rows(report)
+            or Counter(ablation.comparisons)
+            != Counter(verified_ablation.comparisons)
+            or Counter(ablation.unique_detections)
+            != Counter(verified_ablation.unique_detections)
+        ):
+            raise ValueError("POC report ablation does not match replay cohort")
+        ablation = verified_ablation
 
     occurred = sorted(
         result.event.transaction.occurred_at for result in report.results

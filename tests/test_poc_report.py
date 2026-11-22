@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
@@ -15,9 +16,11 @@ from gasha.poc.historical import (
     ConfirmedOutcomeLabel,
     HistoricalTransactionEvent,
     MissingTenantPolicyError,
+    ReplayClassification,
     reconcile_outcomes,
     replay_historical,
 )
+from gasha.poc.historical import _metrics as _derive_replay_metrics
 from gasha.poc.incumbent import compare_incumbent
 from gasha.poc.outcomes import (
     IncumbentControlOutcome,
@@ -465,3 +468,387 @@ def test_combined_historical_reconciliation_and_report_v2() -> None:
     assert payload["incumbent_comparison"]["evaluated_cases"] == 1
     assert payload["incumbent_comparison"]["incremental_confirmed_detection"] == 1
     assert any("historical decision latency" in note for note in payload["limitations"])
+
+
+def test_replay_metrics_cannot_fabricate_empty_cohort() -> None:
+    """Primary population must be derived from rows, not a plausible aggregate."""
+    from dataclasses import replace
+
+    empty = replay_historical((), {})
+    fabricated = replace(
+        empty,
+        metrics=replace(
+            empty.metrics,
+            cases=1,
+            labeled_cases=1,
+            false_negatives=1,
+        ),
+    )
+    # This forged metric object is internally coherent: 1 case = 1 labeled FN.
+    # It must never turn zero replayed decisions into measured detection evidence.
+    with pytest.raises(
+        ValueError, match="historical metrics do not match replay results"
+    ):
+        build_poc_report(
+            tenant_id="tenant-a",
+            dataset_id="synthetic-empty",
+            report=fabricated,
+            policies={},
+        )
+
+    verified = build_poc_report(
+        tenant_id="tenant-a",
+        dataset_id="synthetic-empty",
+        report=empty,
+        policies={},
+    )
+    assert verified.total_events == 0
+    assert verified.labeled_events == 0
+    assert verified.confusion.false_negatives == 0
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"true_positives": 1, "false_negatives": 2},  # Same case totals, false recall.
+        {"explained_alerts": 0},  # Forged reason-code coverage.
+        {"mean_decision_latency_seconds": 10.0},  # No observed historical clock.
+        {"max_decision_latency_seconds": 10.0},
+        {"mean_detection_lead_time_seconds": 10.0},
+        {"mean_processing_latency_ms": 1000000.0},
+        {"p95_processing_latency_ms": 1000000.0},
+        {"cases": 7, "unlabeled_cases": 2},  # Internally additive fake row.
+    ],
+)
+def test_report_rejects_forged_aggregate_even_when_rows_unchanged(
+    changes: dict[str, int | float],
+) -> None:
+    from dataclasses import replace
+
+    policies = {"tenant-a": policy()}
+    exact = replay_historical(dataset(), policies)
+    fabricated = replace(exact, metrics=replace(exact.metrics, **changes))
+    with pytest.raises(
+        ValueError, match="historical metrics do not match replay results"
+    ):
+        build_poc_report(
+            tenant_id="tenant-a",
+            dataset_id="synthetic-metrics-integrity",
+            report=fabricated,
+            policies=policies,
+        )
+
+    accepted = build_poc_report(
+        tenant_id="tenant-a",
+        dataset_id="synthetic-metrics-integrity",
+        report=exact,
+        policies=policies,
+    )
+    assert accepted.total_events == len(exact.results)
+    assert accepted.confusion.true_positives == exact.metrics.true_positives
+
+
+@pytest.mark.parametrize(
+    ("risk", "is_fraud", "expected", "forged"),
+    [
+        (
+            0.96,
+            False,
+            ReplayClassification.FALSE_POSITIVE,
+            ReplayClassification.TRUE_POSITIVE,
+        ),
+        (
+            0.10,
+            True,
+            ReplayClassification.FALSE_NEGATIVE,
+            ReplayClassification.TRUE_NEGATIVE,
+        ),
+    ],
+)
+def test_report_rejects_forged_row_classification_with_matching_aggregates(
+    risk: float,
+    is_fraud: bool,
+    expected: ReplayClassification,
+    forged: ReplayClassification,
+) -> None:
+    """Recomputed aggregate consistency cannot launder a forged row label."""
+    policies = {"tenant-a": policy()}
+    source = replay_historical(
+        (event("classification", IntelligenceSnapshot(network_risk=risk), is_fraud),),
+        policies,
+    )
+    row = source.results[0]
+    assert row.classification is expected
+    forged_row = replace(row, classification=forged)
+    # The aggregate agrees perfectly with the *forged* row, not its event.
+    adulterated = replace(
+        source,
+        results=(forged_row,),
+        metrics=_derive_replay_metrics([forged_row]),
+    )
+    with pytest.raises(ValueError, match="classification does not match"):
+        build_poc_report(
+            tenant_id="tenant-a",
+            dataset_id="synthetic-forged-classification",
+            report=adulterated,
+            policies=policies,
+        )
+    assert build_poc_report(
+        tenant_id="tenant-a",
+        dataset_id="synthetic-original-classification",
+        report=source,
+        policies=policies,
+    ).confusion.true_positives == source.metrics.true_positives
+
+
+def test_report_rejects_reconciled_outcome_identity_or_clock_forgery() -> None:
+    policies = {"tenant-a": policy()}
+    original_event = event("outcome", IntelligenceSnapshot(network_risk=0.96), None)
+    original = replay_historical((original_event,), policies)
+    reconciled = reconcile_outcomes(
+        original,
+        (
+            OutcomeRecord(
+                tenant_id="tenant-a",
+                event_id=original_event.transaction.event_id,
+                outcome=OutcomeType.CONFIRMED_FRAUD,
+                outcome_source="synthetic-review",
+                outcome_version="1",
+                confirmed_at=T0 + timedelta(days=2),
+            ),
+        ),
+    )
+    assert build_poc_report(
+        tenant_id="tenant-a",
+        dataset_id="synthetic-valid-reconciliation",
+        report=reconciled,
+        policies=policies,
+    ).confusion.true_positives == 1
+    row = reconciled.results[0]
+    assert row.reconciled_outcome is not None
+    for changes in (
+        {"tenant_id": "tenant-b"},
+        {"event_id": uuid4()},
+        {"confirmed_at": T0 - timedelta(seconds=1)},
+    ):
+        forged_row = replace(
+            row,
+            reconciled_outcome=row.reconciled_outcome.model_copy(update=changes),
+        )
+        forged_report = replace(
+            reconciled,
+            results=(forged_row,),
+            metrics=_derive_replay_metrics([forged_row]),
+        )
+        with pytest.raises(ValueError, match="reconciled outcome"):
+            build_poc_report(
+                tenant_id="tenant-a",
+                dataset_id="synthetic-outcome-forgery",
+                report=forged_report,
+                policies=policies,
+            )
+    # A row cannot retain post-reconciliation fraud credit without the outcome.
+    missing_outcome = replace(row, reconciled_outcome=None)
+    with pytest.raises(ValueError, match="classification does not match"):
+        build_poc_report(
+            tenant_id="tenant-a",
+            dataset_id="synthetic-outcome-removed",
+            report=replace(
+                reconciled,
+                results=(missing_outcome,),
+                metrics=_derive_replay_metrics([missing_outcome]),
+            ),
+            policies=policies,
+        )
+
+
+def test_report_rejects_duplicate_or_cross_identity_replay_rows() -> None:
+    policies = {"tenant-a": policy()}
+    original = replay_historical(
+        (event("identity", IntelligenceSnapshot(network_risk=0.96), False),),
+        policies,
+    )
+    row = original.results[0]
+    duplicate = replace(
+        original,
+        results=(row, row),
+        metrics=_derive_replay_metrics([row, row]),
+    )
+    with pytest.raises(ValueError, match="duplicate replay event identity"):
+        build_poc_report(
+            tenant_id="tenant-a",
+            dataset_id="synthetic-duplicate",
+            report=duplicate,
+            policies=policies,
+        )
+
+    altered_transaction = row.event.transaction.model_copy(
+        update={"tenant_id": "tenant-b"}
+    )
+    altered_event = row.event.model_copy(
+        update={"transaction": altered_transaction}
+    )
+    forged_row = replace(row, event=altered_event)
+    with pytest.raises(ValueError, match="decision does not match replay event"):
+        build_poc_report(
+            tenant_id="tenant-a",
+            dataset_id="synthetic-identity",
+            report=replace(
+                original,
+                results=(forged_row,),
+                metrics=_derive_replay_metrics([forged_row]),
+            ),
+            policies=policies,
+        )
+    changed_correlation = replace(
+        row,
+        decision=row.decision.model_copy(update={"correlation_id": "wrong"}),
+    )
+    with pytest.raises(ValueError, match="decision does not match replay event"):
+        build_poc_report(
+            tenant_id="tenant-a",
+            dataset_id="synthetic-correlation",
+            report=replace(original, results=(changed_correlation,)),
+            policies=policies,
+        )
+
+
+def test_report_rejects_outcome_older_than_confirmed_event_label() -> None:
+    policies = {"tenant-a": policy()}
+    labeled = event("mature-label", IntelligenceSnapshot(network_risk=0.96), False)
+    labeled = labeled.model_copy(
+        update={
+            "label": ConfirmedOutcomeLabel(
+                is_fraud=False,
+                label_source="synthetic",
+                confirmed_at=T0 + timedelta(days=3),
+            )
+        }
+    )
+    original = replay_historical((labeled,), policies)
+    stale = reconcile_outcomes(
+        original,
+        (
+            OutcomeRecord(
+                tenant_id="tenant-a",
+                event_id=labeled.transaction.event_id,
+                outcome=OutcomeType.CONFIRMED_FRAUD,
+                outcome_source="synthetic-review",
+                outcome_version="1",
+                confirmed_at=T0 + timedelta(days=2),
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="reconciled outcome predates label"):
+        build_poc_report(
+            tenant_id="tenant-a",
+            dataset_id="synthetic-stale-label",
+            report=stale,
+            policies=policies,
+        )
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    [
+        ({"decision_latency": timedelta(seconds=7)}, "historical decision/lead"),
+        ({"detection_lead_time": timedelta(seconds=5)}, "historical decision/lead"),
+        ({"decision_latency": timedelta(seconds=-1)}, "historical decision/lead"),
+        ({"detection_lead_time": timedelta(seconds=-1)}, "historical decision/lead"),
+        ({"processing_latency": timedelta(seconds=7)}, "processing latency disagrees"),
+        ({"processing_latency": timedelta(seconds=-1)}, "processing latency disagrees"),
+        (
+            {"evaluation_started_at": (T0 + timedelta(seconds=10)).replace(tzinfo=None)},
+            "invalid replay evaluation clocks",
+        ),
+        (
+            {
+                "evaluation_ended_at": (
+                    T0 + timedelta(seconds=10, milliseconds=125)
+                ).replace(tzinfo=None)
+            },
+            "invalid replay evaluation clocks",
+        ),
+        ({"evaluation_ended_at": T0}, "invalid replay evaluation clocks"),
+        ({"evaluation_started_at": None}, "incomplete replay evaluation clocks"),
+        ({"evaluation_ended_at": None}, "incomplete replay evaluation clocks"),
+        ({"processing_latency": None}, "processing latency disagrees"),
+        (
+            {"evaluation_started_at": None, "evaluation_ended_at": None},
+            "processing latency requires replay clocks",
+        ),
+    ],
+)
+def test_report_rejects_forged_row_timing_with_matching_aggregates(
+    changes: dict[str, object], error: str,
+) -> None:
+    """Forging both the row clock and derived summary cannot invent evidence."""
+    policies = {"tenant-a": policy()}
+    replay_clock = iter((
+        T0 + timedelta(seconds=10),
+        T0 + timedelta(seconds=10, milliseconds=125),
+    ))
+    original = replay_historical(
+        (event("clock", IntelligenceSnapshot(network_risk=0.96), True),),
+        policies,
+        clock=lambda: next(replay_clock),
+    )
+    row = original.results[0]
+    assert row.decision_latency is None
+    assert row.detection_lead_time is None
+    assert row.processing_latency == timedelta(milliseconds=125)
+
+    forged_row = replace(row, **changes)
+    forged = replace(
+        original,
+        results=(forged_row,),
+        metrics=_derive_replay_metrics([forged_row]),
+    )
+    with pytest.raises(ValueError, match=error):
+        build_poc_report(
+            tenant_id="tenant-a",
+            dataset_id="synthetic-row-clock-forgery",
+            report=forged,
+            policies=policies,
+        )
+
+    # The unchanged replay measures only *replay processing* latency.
+    accepted = build_poc_report(
+        tenant_id="tenant-a",
+        dataset_id="synthetic-row-clock-original",
+        report=original,
+        policies=policies,
+    )
+    assert accepted.latency.mean_decision_latency_seconds is None
+    assert accepted.latency.mean_detection_lead_time_seconds is None
+    assert accepted.latency.mean_processing_latency_ms == pytest.approx(125.0)
+
+
+def test_report_allows_unknown_processing_clock_only_with_null_duration() -> None:
+    """Absent execution clock must not be transformed into measured zero."""
+    policies = {"tenant-a": policy()}
+    replay = replay_historical(
+        (event("unknown-replay-clock", IntelligenceSnapshot(), None),),
+        policies,
+    )
+    unknown = replace(
+        replay.results[0],
+        evaluation_started_at=None,
+        evaluation_ended_at=None,
+        processing_latency=None,
+    )
+    without_clock = replace(
+        replay,
+        results=(unknown,),
+        metrics=_derive_replay_metrics([unknown]),
+    )
+    poc = build_poc_report(
+        tenant_id="tenant-a",
+        dataset_id="synthetic-unknown-clock",
+        report=without_clock,
+        policies=policies,
+    )
+    assert poc.latency.mean_processing_latency_ms is None
+    assert poc.latency.p95_processing_latency_ms is None
+    assert poc.latency.mean_decision_latency_seconds is None
+    assert poc.latency.mean_detection_lead_time_seconds is None

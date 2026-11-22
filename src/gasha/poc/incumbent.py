@@ -31,19 +31,19 @@ class ConfusionCounts:
     false_negatives: int
 
     @property
-    def recall(self) -> float:
+    def recall(self) -> float | None:
         denominator = self.true_positives + self.false_negatives
-        return self.true_positives / denominator if denominator else 0.0
+        return self.true_positives / denominator if denominator else None
 
     @property
-    def precision(self) -> float:
+    def precision(self) -> float | None:
         denominator = self.true_positives + self.false_positives
-        return self.true_positives / denominator if denominator else 0.0
+        return self.true_positives / denominator if denominator else None
 
     @property
-    def false_positive_rate(self) -> float:
+    def false_positive_rate(self) -> float | None:
         denominator = self.false_positives + self.true_negatives
-        return self.false_positives / denominator if denominator else 0.0
+        return self.false_positives / denominator if denominator else None
 
 
 @dataclass(frozen=True)
