@@ -137,7 +137,8 @@ def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
         )
         for prior in first_snapshot.observations:
             assert store.append(prior)
-        store.seal(available_through=max(copy.received_at for copy in copies))
+        # Intentionally leave the Redis window unsealed through the first
+        # PostgreSQL recovery attempt. No alert or case may be persisted.
         worker_history = RedisSyntheticHistorySource(
             store,
             tenant_id=TENANT,
@@ -219,8 +220,23 @@ def test_post_ack_fresh_worker_derives_atomic_lineage_alerts_case_and_audits(
                 db, tenant_ids=(TENANT,), worker_id="lineage-recovered",
             ),
             worker_id="lineage-recovered", tenant_ids=(TENANT,),
+            retry_backoff=timedelta(0), max_evaluation_attempts=4,
             dead_letters=recovery_dlq,
         )
+        if history_mode == "redis":
+            assert recovered.run_once(max_events=1) == 0
+            assert evaluated == []
+            assert db.execute(
+                "SELECT count(*) AS n FROM pending_evaluations"
+            ).fetchone()["n"] == 2
+            for table in (
+                "shadow_evaluations", "evaluation_alerts",
+                "analyst_case_events", "security_audit_events",
+            ):
+                assert db.execute(
+                    f"SELECT count(*) AS n FROM {table}"
+                ).fetchone()["n"] == 0
+            store.seal(available_through=max(copy.received_at for copy in copies))
         assert recovered.run_once(max_events=1) == 0
         assert empty_batch.commits == 0
         assert recovery_dlq.records == ()
