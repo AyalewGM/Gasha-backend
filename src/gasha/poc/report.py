@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from itertools import pairwise
@@ -469,10 +470,26 @@ def build_poc_report(
         all_alerts,
         "no_alerts",
     )
-    if attribution is None:
-        attribution = attribute_signals(report.results, policies)
-    elif attribution.tenant_id != tenant_id:
-        raise ValueError("POC report attribution tenant mismatch")
+    # Precomputed reports are caller-constructible, not proof of the event
+    # cohort or aggregates. Recompute against this exact replay/policies before
+    # accepting their contents. Always serialize recomputed evidence.
+    verified_attribution = attribute_signals(report.results, policies)
+    if attribution is not None:
+        if attribution.tenant_id != tenant_id:
+            raise ValueError("POC report attribution tenant mismatch")
+        if (
+            attribution.tenant_id != verified_attribution.tenant_id
+            or Counter(attribution.events) != Counter(verified_attribution.events)
+            or attribution.families != verified_attribution.families
+            or Counter(attribution.multi_signal.detections)
+            != Counter(verified_attribution.multi_signal.detections)
+            or attribution.multi_signal.family_combination_counts
+            != verified_attribution.multi_signal.family_combination_counts
+            or attribution.multi_signal.named_combination_detections
+            != verified_attribution.multi_signal.named_combination_detections
+        ):
+            raise ValueError("POC report attribution does not match replay cohort")
+    attribution = verified_attribution
     if incumbent is None and any(
         result.event.incumbent_outcome is not None
         for result in report.results
