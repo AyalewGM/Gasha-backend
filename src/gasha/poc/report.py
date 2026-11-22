@@ -6,6 +6,7 @@ from datetime import datetime
 from itertools import pairwise
 from math import isclose, isfinite
 from typing import Annotated, Literal, Self
+from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -28,7 +29,7 @@ from gasha.poc.historical import (
     MissingTenantPolicyError,
     ReplayDecisionSource,
 )
-from gasha.poc.historical import _metrics as _derive_replay_metrics
+from gasha.poc.historical import _classify, _metrics as _derive_replay_metrics
 from gasha.poc.incumbent import IncumbentComparison, compare_incumbent
 
 # A schema identifier, not an evidence authenticity or approval indicator.
@@ -430,6 +431,66 @@ def _stable_replay_rows(replay: HistoricalReplayReport) -> tuple[tuple[str, ...]
     ))
 
 
+
+def _validate_replay_row_lineage(report: HistoricalReplayReport) -> None:
+    """Verify each synthetic replay classification before aggregating evidence.
+
+    Aggregate metrics can be internally consistent with forged per-row TP/FN
+    classifications. Bind every row to its canonical event, decision and
+    effective confirmed label before calculating or attributing any results.
+    This does not attest the upstream dataset or the maturity of Bank labels.
+    """
+    seen: set[tuple[str, UUID]] = set()
+    for result in report.results:
+        event = result.event
+        event._check_recorded_timestamps()
+        transaction = event.transaction
+        key = (transaction.tenant_id, transaction.event_id)
+        if key in seen:
+            raise ValueError("POC report has duplicate replay event identity")
+        seen.add(key)
+        if (
+            (result.decision.tenant_id, result.decision.event_id) != key
+            or result.decision.correlation_id != transaction.correlation_id
+        ):
+            raise ValueError("POC report decision does not match replay event")
+
+        outcome = result.reconciled_outcome
+        original_label = event.label
+        if outcome is not None:
+            if (outcome.tenant_id, outcome.event_id) != key:
+                raise ValueError("POC report reconciled outcome identity mismatch")
+            confirmed_at = outcome.confirmed_at
+            if confirmed_at is not None and (
+                confirmed_at.utcoffset() is None
+                or confirmed_at < transaction.occurred_at
+            ):
+                raise ValueError("POC report reconciled outcome has invalid clock")
+            if (
+                original_label is not None
+                and original_label.confirmed_at is not None
+                and (
+                    confirmed_at is None
+                    or confirmed_at < original_label.confirmed_at
+                )
+            ):
+                raise ValueError("POC report reconciled outcome predates label")
+        effective_label = (
+            outcome.is_fraud
+            if outcome is not None
+            else original_label.is_fraud
+            if original_label is not None
+            else None
+        )
+        expected = _classify(
+            result.decision.action in ALERT_ACTIONS, effective_label
+        )
+        if result.classification is not expected:
+            raise ValueError(
+                "POC report classification does not match label and action"
+            )
+
+
 def build_poc_report(
     *,
     tenant_id: str,
@@ -480,6 +541,8 @@ def build_poc_report(
         raise MissingTenantPolicyError(
             f"no decision policy registered for tenant {tenant_id!r}"
         )
+
+    _validate_replay_row_lineage(report)
 
     # HistoricalReplayReport is caller-constructible. Arithmetic consistency
     # within its aggregate is not proof that its counts, explanations or
