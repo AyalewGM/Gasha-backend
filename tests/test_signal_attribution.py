@@ -304,3 +304,20 @@ def test_mismatched_decision_and_source_event_identity_is_rejected() -> None:
     corrupted = replace(report.results[0], event=report.results[1].event)
     with pytest.raises(ValueError, match="identity mismatch"):
         attribute_signals((corrupted,), {"tenant-a": policy()})
+
+
+def test_missing_detected_fraud_population_is_undefined_not_measured_zero() -> None:
+    empty = attribute_signals((), {})
+    assert all(
+        family.share_of_detected_fraud is None
+        for family in empty.families.values()
+    )
+    legitimate = run(
+        replayed("legitimate-only", IntelligenceSnapshot(network_risk=0.94), False)
+    )
+    result = attribute_signals(legitimate.results, {"tenant-a": policy()})
+    network = result.families[SignalFamily.NETWORK]
+    assert network.alerts_influenced == 1
+    assert network.true_positives_influenced == 0
+    assert network.false_positives_influenced == 1
+    assert network.share_of_detected_fraud is None

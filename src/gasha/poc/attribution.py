@@ -97,7 +97,7 @@ class SignalFamilyAttribution:
     driving_alerts: int
     true_positives_influenced: int
     false_positives_influenced: int
-    share_of_detected_fraud: float
+    share_of_detected_fraud: float | None
     mean_risk_contribution: float | None
     max_risk_contribution: float | None
     reason_codes: frozenset[str]
@@ -256,7 +256,7 @@ def _family_metrics(
             ),
             true_positives_influenced=tp_influenced,
             false_positives_influenced=fp_influenced,
-            share_of_detected_fraud=tp_influenced / total_tp if total_tp else 0.0,
+            share_of_detected_fraud=tp_influenced / total_tp if total_tp else None,
             mean_risk_contribution=(
                 fmean(contributions) if contributions else None
             ),

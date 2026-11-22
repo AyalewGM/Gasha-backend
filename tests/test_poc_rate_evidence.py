@@ -13,6 +13,7 @@ from gasha.domain.models import (
     IntelligenceSnapshot,
 )
 from gasha.poc.ablation import AblationComparison
+from gasha.poc.incumbent import ConfusionCounts, compare_incumbent
 from gasha.poc.historical import (
     HistoricalReplayMetrics,
     HistoricalReplayReport,
@@ -65,6 +66,12 @@ def test_confusion_rates_use_actual_denominators(
         summary.false_negative_rate,
     )
     assert actual == pytest.approx(expected)
+    raw_incumbent = ConfusionCounts(*counts)
+    assert (
+        raw_incumbent.recall,
+        raw_incumbent.precision,
+        raw_incumbent.false_positive_rate,
+    ) == pytest.approx(expected[:3])
     tp, fp, tn, fn = counts
     evidence = summary.rate_evidence
     assert (evidence["recall"].numerator, evidence["recall"].denominator) == (
@@ -204,3 +211,18 @@ def test_unlabeled_alert_counts_in_explainability_denominator() -> None:
     assert poc.explainability_coverage_evidence.numerator == 1
     assert poc.explainability_coverage_evidence.denominator == 1
     assert poc.explainability_coverage_evidence.undefined_reason is None
+
+
+def test_empty_observed_incumbent_comparison_cannot_claim_zero_percent_rates() -> None:
+    comparison = compare_incumbent(())
+    assert comparison.evaluated_cases == 0
+    assert comparison.missing_incumbent_outcomes == 0
+    for counts in (comparison.gasha, comparison.incumbent):
+        assert counts.recall is None
+        assert counts.precision is None
+        assert counts.false_positive_rate is None
+    summary = _confusion_summary(0, 0, 0, 0).model_dump(mode="json")
+    for key in ("recall", "precision", "false_positive_rate"):
+        assert summary[key] is None
+        assert summary["rate_evidence"][key]["denominator"] == 0
+        assert summary["rate_evidence"][key]["undefined_reason"]
