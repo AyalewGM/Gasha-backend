@@ -465,3 +465,77 @@ def test_combined_historical_reconciliation_and_report_v2() -> None:
     assert payload["incumbent_comparison"]["evaluated_cases"] == 1
     assert payload["incumbent_comparison"]["incremental_confirmed_detection"] == 1
     assert any("historical decision latency" in note for note in payload["limitations"])
+
+
+def test_replay_metrics_cannot_fabricate_empty_cohort() -> None:
+    """Primary population must be derived from rows, not a plausible aggregate."""
+    from dataclasses import replace
+
+    empty = replay_historical((), {})
+    fabricated = replace(
+        empty,
+        metrics=replace(
+            empty.metrics,
+            cases=1,
+            labeled_cases=1,
+            false_negatives=1,
+        ),
+    )
+    # This forged metric object is internally coherent: 1 case = 1 labeled FN.
+    # It must never turn zero replayed decisions into measured detection evidence.
+    with pytest.raises(ValueError, match="historical metrics do not match replay results"):
+        build_poc_report(
+            tenant_id="tenant-a",
+            dataset_id="synthetic-empty",
+            report=fabricated,
+            policies={},
+        )
+
+    verified = build_poc_report(
+        tenant_id="tenant-a",
+        dataset_id="synthetic-empty",
+        report=empty,
+        policies={},
+    )
+    assert verified.total_events == 0
+    assert verified.labeled_events == 0
+    assert verified.confusion.false_negatives == 0
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"true_positives": 1, "false_negatives": 2},  # Same case totals, false recall.
+        {"explained_alerts": 0},  # Forged reason-code coverage.
+        {"mean_decision_latency_seconds": 10.0},  # No observed historical clock.
+        {"max_decision_latency_seconds": 10.0},
+        {"mean_detection_lead_time_seconds": 10.0},
+        {"mean_processing_latency_ms": 1000000.0},
+        {"p95_processing_latency_ms": 1000000.0},
+        {"cases": 7, "unlabeled_cases": 2},  # Internally additive fake row.
+    ],
+)
+def test_report_rejects_forged_aggregate_even_when_rows_unchanged(
+    changes: dict[str, int | float],
+) -> None:
+    from dataclasses import replace
+
+    policies = {"tenant-a": policy()}
+    exact = replay_historical(dataset(), policies)
+    fabricated = replace(exact, metrics=replace(exact.metrics, **changes))
+    with pytest.raises(ValueError, match="historical metrics do not match replay results"):
+        build_poc_report(
+            tenant_id="tenant-a",
+            dataset_id="synthetic-metrics-integrity",
+            report=fabricated,
+            policies=policies,
+        )
+
+    accepted = build_poc_report(
+        tenant_id="tenant-a",
+        dataset_id="synthetic-metrics-integrity",
+        report=exact,
+        policies=policies,
+    )
+    assert accepted.total_events == len(exact.results)
+    assert accepted.confusion.true_positives == exact.metrics.true_positives
