@@ -154,7 +154,10 @@ def attribute_signals(
     for result in results:
         tenant_id = result.decision.tenant_id
         identity = (tenant_id, result.decision.event_id)
-        if (result.event.transaction.tenant_id, result.event.transaction.event_id) != identity:
+        event_identity = (
+            result.event.transaction.tenant_id, result.event.transaction.event_id,
+        )
+        if event_identity != identity:
             raise ValueError("replayed decision and event identity mismatch")
         if identity in seen:
             raise ValueError("duplicate tenant/event attribution identity")
@@ -210,7 +213,10 @@ def _family_metrics(
         for result in results
         if result.classification == ReplayClassification.TRUE_POSITIVE
     )
-    by_event = {(result.decision.tenant_id, result.decision.event_id): result for result in results}
+    by_event = {
+        (result.decision.tenant_id, result.decision.event_id): result
+        for result in results
+    }
     metrics: dict[SignalFamily, SignalFamilyAttribution] = {}
 
     for family in SignalFamily:
@@ -268,7 +274,10 @@ def _multi_signal(
     results: Sequence[ReplayedEventResult],
     combinations: Mapping[str, AbstractSet[SignalFamily]],
 ) -> MultiSignalAnalysis:
-    by_event = {(result.decision.tenant_id, result.decision.event_id): result for result in results}
+    by_event = {
+        (result.decision.tenant_id, result.decision.event_id): result
+        for result in results
+    }
     detections: list[MultiSignalDetection] = []
     family_combination_counts: dict[tuple[SignalFamily, ...], int] = {}
     named_counts = {name: 0 for name in combinations}
