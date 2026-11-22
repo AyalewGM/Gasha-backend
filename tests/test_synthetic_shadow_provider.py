@@ -121,3 +121,68 @@ def test_incomplete_history_is_unavailable_never_measured_as_zero():
     assert persisted.feature_evidence is not None
     assert "beneficiary_unique_senders_1h" in persisted.feature_evidence.unavailable_signals
     assert persisted.feature_evidence.eligible_observations == 5
+
+@pytest.mark.skipif(
+    not __import__("os").environ.get("GASHA_TEST_REDIS_URL"),
+    reason="synthetic Redis integration service not configured",
+)
+def test_redis_worker_port_computes_bounded_fan_in_and_fails_closed_on_seal_loss():
+    from redis import Redis
+    from gasha.intelligence.redis_feature_history import (
+        FeatureHistoryUnavailable, RedisFeatureHistory,
+    )
+    from gasha.intelligence.synthetic_shadow_provider import RedisSyntheticHistorySource
+
+    event = normalized()
+    redis_url = __import__("os").environ["GASHA_TEST_REDIS_URL"]
+    with Redis.from_url(redis_url, socket_timeout=2, socket_connect_timeout=2) as client:
+        store = RedisFeatureHistory(
+            client, tenant_id=event.tenant_id, epoch=uuid4().hex,
+        )
+        store.open_epoch(
+            covered_from=event.canonical_transaction.occurred_at - timedelta(hours=1),
+            ttl_seconds=30,
+        )
+        for previous in history(tenant=event.tenant_id):
+            assert store.append(previous)
+        source = RedisSyntheticHistorySource(
+            store, tenant_id=event.tenant_id,
+            source_system=event.adapter.source_system, graph_policy=POLICY,
+        )
+        orchestrator = ShadowOrchestrator({event.tenant_id: DECISION_POLICY})
+        evaluator = SyntheticShadowWorkerEvaluator(orchestrator, history_source=source)
+        # No completeness assertion from a transport event can bypass the
+        # still-unsealed, process-owned Redis epoch.
+        with pytest.raises(FeatureHistoryUnavailable):
+            evaluator(event, DECISION_POLICY)
+        assert orchestrator.evaluations.get(event.tenant_id, event.event_id) is None
+
+        store.seal(available_through=event.received_at)
+        outcome = evaluator(event, DECISION_POLICY)
+        assert outcome.effective_action is DecisionAction.NO_ACTION_SHADOW
+        saved = orchestrator.evaluations.get(event.tenant_id, event.event_id)
+        assert saved is not None and saved.feature_evidence is not None
+        assert saved.feature_evidence.eligible_observations == 5
+        assert "sender_beneficiary_history_coverage" in (
+            saved.feature_evidence.unavailable_signals
+        )
+        assert "beneficiary_unique_senders_1h" not in (
+            saved.feature_evidence.unavailable_signals
+        )
+        assert len(saved.feature_evidence.lineage_ref) == 64
+
+        # A different event on the now-poisoned epoch must not emit a new
+        # evaluation or a favorable zero; previous evidence remains immutable.
+        store.append(
+            history(tenant=event.tenant_id)[0],
+        )  # exact immutable replay remains permitted
+        conflicting = replace(
+            history(tenant=event.tenant_id)[0],
+            event_id="after-seal-contradiction",
+        )
+        with pytest.raises(FeatureHistoryUnavailable, match="contradicts sealed"):
+            store.append(conflicting)
+        later = normalized()
+        with pytest.raises(FeatureHistoryUnavailable, match="coverage loss"):
+            evaluator(later, DECISION_POLICY)
+        assert orchestrator.evaluations.get(later.tenant_id, later.event_id) is None
