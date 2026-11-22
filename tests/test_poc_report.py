@@ -483,7 +483,9 @@ def test_replay_metrics_cannot_fabricate_empty_cohort() -> None:
     )
     # This forged metric object is internally coherent: 1 case = 1 labeled FN.
     # It must never turn zero replayed decisions into measured detection evidence.
-    with pytest.raises(ValueError, match="historical metrics do not match replay results"):
+    with pytest.raises(
+        ValueError, match="historical metrics do not match replay results"
+    ):
         build_poc_report(
             tenant_id="tenant-a",
             dataset_id="synthetic-empty",
@@ -523,7 +525,9 @@ def test_report_rejects_forged_aggregate_even_when_rows_unchanged(
     policies = {"tenant-a": policy()}
     exact = replay_historical(dataset(), policies)
     fabricated = replace(exact, metrics=replace(exact.metrics, **changes))
-    with pytest.raises(ValueError, match="historical metrics do not match replay results"):
+    with pytest.raises(
+        ValueError, match="historical metrics do not match replay results"
+    ):
         build_poc_report(
             tenant_id="tenant-a",
             dataset_id="synthetic-metrics-integrity",
