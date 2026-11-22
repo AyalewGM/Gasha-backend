@@ -746,3 +746,109 @@ def test_report_rejects_outcome_older_than_confirmed_event_label() -> None:
             report=stale,
             policies=policies,
         )
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    [
+        ({"decision_latency": timedelta(seconds=7)}, "historical decision/lead"),
+        ({"detection_lead_time": timedelta(seconds=5)}, "historical decision/lead"),
+        ({"decision_latency": timedelta(seconds=-1)}, "historical decision/lead"),
+        ({"detection_lead_time": timedelta(seconds=-1)}, "historical decision/lead"),
+        ({"processing_latency": timedelta(seconds=7)}, "processing latency disagrees"),
+        ({"processing_latency": timedelta(seconds=-1)}, "processing latency disagrees"),
+        (
+            {"evaluation_started_at": (T0 + timedelta(seconds=10)).replace(tzinfo=None)},
+            "invalid replay evaluation clocks",
+        ),
+        (
+            {
+                "evaluation_ended_at": (
+                    T0 + timedelta(seconds=10, milliseconds=125)
+                ).replace(tzinfo=None)
+            },
+            "invalid replay evaluation clocks",
+        ),
+        ({"evaluation_ended_at": T0}, "invalid replay evaluation clocks"),
+        ({"evaluation_started_at": None}, "incomplete replay evaluation clocks"),
+        ({"evaluation_ended_at": None}, "incomplete replay evaluation clocks"),
+        ({"processing_latency": None}, "processing latency disagrees"),
+        (
+            {"evaluation_started_at": None, "evaluation_ended_at": None},
+            "processing latency requires replay clocks",
+        ),
+    ],
+)
+def test_report_rejects_forged_row_timing_with_matching_aggregates(
+    changes: dict[str, object], error: str,
+) -> None:
+    """Forging both the row clock and derived summary cannot invent evidence."""
+    policies = {"tenant-a": policy()}
+    replay_clock = iter((
+        T0 + timedelta(seconds=10),
+        T0 + timedelta(seconds=10, milliseconds=125),
+    ))
+    original = replay_historical(
+        (event("clock", IntelligenceSnapshot(network_risk=0.96), True),),
+        policies,
+        clock=lambda: next(replay_clock),
+    )
+    row = original.results[0]
+    assert row.decision_latency is None
+    assert row.detection_lead_time is None
+    assert row.processing_latency == timedelta(milliseconds=125)
+
+    forged_row = replace(row, **changes)
+    forged = replace(
+        original,
+        results=(forged_row,),
+        metrics=_derive_replay_metrics([forged_row]),
+    )
+    with pytest.raises(ValueError, match=error):
+        build_poc_report(
+            tenant_id="tenant-a",
+            dataset_id="synthetic-row-clock-forgery",
+            report=forged,
+            policies=policies,
+        )
+
+    # The unchanged replay measures only *replay processing* latency.
+    accepted = build_poc_report(
+        tenant_id="tenant-a",
+        dataset_id="synthetic-row-clock-original",
+        report=original,
+        policies=policies,
+    )
+    assert accepted.latency.mean_decision_latency_seconds is None
+    assert accepted.latency.mean_detection_lead_time_seconds is None
+    assert accepted.latency.mean_processing_latency_ms == pytest.approx(125.0)
+
+
+def test_report_allows_unknown_processing_clock_only_with_null_duration() -> None:
+    """Absent execution clock must not be transformed into measured zero."""
+    policies = {"tenant-a": policy()}
+    replay = replay_historical(
+        (event("unknown-replay-clock", IntelligenceSnapshot(), None),),
+        policies,
+    )
+    unknown = replace(
+        replay.results[0],
+        evaluation_started_at=None,
+        evaluation_ended_at=None,
+        processing_latency=None,
+    )
+    without_clock = replace(
+        replay,
+        results=(unknown,),
+        metrics=_derive_replay_metrics([unknown]),
+    )
+    poc = build_poc_report(
+        tenant_id="tenant-a",
+        dataset_id="synthetic-unknown-clock",
+        report=without_clock,
+        policies=policies,
+    )
+    assert poc.latency.mean_processing_latency_ms is None
+    assert poc.latency.p95_processing_latency_ms is None
+    assert poc.latency.mean_decision_latency_seconds is None
+    assert poc.latency.mean_detection_lead_time_seconds is None
