@@ -26,6 +26,7 @@ from gasha.poc.historical import (
     HistoricalReplayMetrics,
     HistoricalReplayReport,
     MissingTenantPolicyError,
+    _metrics as _derive_replay_metrics,
     ReplayDecisionSource,
 )
 from gasha.poc.incumbent import IncumbentComparison, compare_incumbent
@@ -480,7 +481,15 @@ def build_poc_report(
             f"no decision policy registered for tenant {tenant_id!r}"
         )
 
-    metrics = report.metrics
+    # HistoricalReplayReport is caller-constructible. Arithmetic consistency
+    # within its aggregate is not proof that its counts, explanations or
+    # timing came from the actual replay. Reject the *entire* supplied metric
+    # object when it differs from the shared historical replay derivation,
+    # before any POC evidence model is assembled. No missing result may be
+    # silently counted as a false negative or as observed control evidence.
+    metrics = _derive_replay_metrics(list(report.results))
+    if report.metrics != metrics:
+        raise ValueError("POC report historical metrics do not match replay results")
     confusion = _confusion_summary(
         metrics.true_positives,
         metrics.false_positives,
