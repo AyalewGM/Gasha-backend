@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import pairwise
 from math import isclose, isfinite
 from typing import Annotated, Literal, Self
@@ -455,6 +455,39 @@ def _validate_replay_row_lineage(report: HistoricalReplayReport) -> None:
             or result.decision.correlation_id != transaction.correlation_id
         ):
             raise ValueError("POC report decision does not match replay event")
+
+        # Offline history contains no original Bank decision or alert clocks.
+        # Caller-constructed per-row durations must not invent historical
+        # decision latency or detection lead time, even with matching metrics.
+        if result.decision_latency is not None or result.detection_lead_time is not None:
+            raise ValueError("POC report historical decision/lead clocks unavailable")
+
+        # Processing time is replay-only evidence: it must be explained by
+        # the actual recorded evaluation bracket, not an asserted row value.
+        started = result.evaluation_started_at
+        ended = result.evaluation_ended_at
+        duration = result.processing_latency
+        if (started is None) != (ended is None):
+            raise ValueError("POC report has incomplete replay evaluation clocks")
+        if started is None:
+            if duration is not None:
+                raise ValueError("POC report processing latency requires replay clocks")
+        else:
+            if (
+                not isinstance(started, datetime)
+                or not isinstance(ended, datetime)
+                or started.utcoffset() is None
+                or ended.utcoffset() is None
+                or ended < started
+            ):
+                raise ValueError("POC report has invalid replay evaluation clocks")
+            if (
+                not isinstance(duration, timedelta)
+                or duration != ended - started
+                or duration < timedelta(0)
+                or not isfinite(duration.total_seconds())
+            ):
+                raise ValueError("POC report processing latency disagrees with evaluation clocks")
 
         outcome = result.reconciled_outcome
         original_label = event.label
