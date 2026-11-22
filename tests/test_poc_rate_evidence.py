@@ -13,7 +13,11 @@ from gasha.domain.models import (
     DecisionPolicy,
     IntelligenceSnapshot,
 )
-from gasha.poc.ablation import AblationComparison
+from gasha.poc.ablation import (
+    AblationComparison,
+    AblationConfiguration,
+    run_ablation,
+)
 from gasha.poc.attribution import SignalFamily, attribute_signals
 from gasha.poc.historical import (
     ConfirmedOutcomeLabel,
@@ -22,7 +26,12 @@ from gasha.poc.historical import (
     HistoricalTransactionEvent,
     replay_historical,
 )
-from gasha.poc.incumbent import ConfusionCounts, compare_incumbent
+from gasha.poc.incumbent import (
+    ConfusionCounts,
+    IncumbentComparison,
+    compare_incumbent,
+)
+from gasha.poc.outcomes import IncumbentControlOutcome
 from gasha.poc.report import (
     _ablation_summary,
     _confusion_summary,
@@ -424,3 +433,130 @@ def test_matching_supplied_attribution_accepts_unordered_events_and_is_identical
     assert supplied.signal_attribution
     assert computed.confusion.true_positives == 1
     assert computed.confusion.false_positives == 1
+
+
+
+def test_unrecorded_incumbent_cannot_claim_arithmetic_consistent_incremental_fraud() -> None:
+    """Security P1: missing incumbent outcome is never an observed non-alert."""
+    tenant = "tenant-a"
+    policies = {tenant: _attribution_policy()}
+    replay = replay_historical((_attribution_event(tenant),), policies)
+    fabricated = IncumbentComparison(
+        evaluated_cases=1,
+        missing_incumbent_outcomes=0,
+        gasha=ConfusionCounts(1, 0, 0, 0),
+        incumbent=ConfusionCounts(0, 0, 0, 1),
+        both_detected=0,
+        gasha_only_detected=1,
+        incumbent_only_detected=0,
+        neither_detected=0,
+        incremental_confirmed_detection=1,
+    )
+    assert build_poc_report(
+        tenant_id=tenant, dataset_id="no-control-observed",
+        report=replay, policies=policies,
+    ).incumbent_comparison is None
+    with pytest.raises(ValueError, match="incumbent does not match recorded"):
+        build_poc_report(
+            tenant_id=tenant, dataset_id="forged-control",
+            report=replay, policies=policies, incumbent=fabricated,
+        )
+
+
+def test_provided_incumbent_requires_exact_recorded_replay_comparison() -> None:
+    tenant = "tenant-a"
+    policies = {tenant: _attribution_policy()}
+    event = _attribution_event(tenant).model_copy(
+        update={"incumbent_outcome": IncumbentControlOutcome.NO_ALERT}
+    )
+    replay = replay_historical((event,), policies)
+    recorded = compare_incumbent(replay.results)
+    assert recorded.incremental_confirmed_detection == 1
+    baseline = build_poc_report(
+        tenant_id=tenant, dataset_id="observed-synthetic",
+        report=replay, policies=policies,
+    ).model_dump(mode="json")
+    accepted = build_poc_report(
+        tenant_id=tenant, dataset_id="observed-synthetic",
+        report=replay, policies=policies, incumbent=recorded,
+    ).model_dump(mode="json")
+    assert accepted == baseline
+    with pytest.raises(ValueError, match="incumbent does not match recorded"):
+        build_poc_report(
+            tenant_id=tenant, dataset_id="forged-control",
+            report=replay, policies=policies,
+            incumbent=replace(recorded, missing_incumbent_outcomes=1),
+        )
+
+
+def test_report_binds_ablation_to_same_tenant_replay_and_derived_counts() -> None:
+    tenant = "tenant-a"
+    policies = {tenant: _attribution_policy()}
+    event = _attribution_event(tenant)
+    events = (event,)
+    replay = replay_historical(events, policies)
+    configs = (
+        AblationConfiguration(
+            name="without_network",
+            removed_families=frozenset({SignalFamily.NETWORK}),
+        ),
+        AblationConfiguration(
+            name="without_beneficiary",
+            removed_families=frozenset({SignalFamily.BENEFICIARY}),
+        ),
+    )
+    ablation = run_ablation(events, policies, configurations=configs)
+    baseline = build_poc_report(
+        tenant_id=tenant, dataset_id="matched-ablation",
+        report=replay, policies=policies, ablation=ablation,
+    ).model_dump(mode="json")
+    reordered = replace(
+        ablation,
+        comparisons=tuple(reversed(ablation.comparisons)),
+        unique_detections=tuple(reversed(ablation.unique_detections)),
+    )
+    assert build_poc_report(
+        tenant_id=tenant, dataset_id="matched-ablation",
+        report=replay, policies=policies, ablation=reordered,
+    ).model_dump(mode="json") == baseline
+
+    stale = run_ablation((_attribution_event(tenant),), policies, configurations=configs)
+    foreign = run_ablation(
+        (_attribution_event("tenant-b", event_id=event.transaction.event_id),),
+        {"tenant-b": _attribution_policy()},
+        configurations=configs,
+    )
+    altered_counts = replace(
+        ablation,
+        comparisons=(
+            replace(ablation.comparisons[0], detections_lost=999),
+            *ablation.comparisons[1:],
+        ),
+    )
+    altered_unique = replace(ablation, unique_detections=())
+    for bad in (stale, foreign, altered_counts, altered_unique):
+        with pytest.raises(ValueError, match="ablation does not match replay cohort"):
+            build_poc_report(
+                tenant_id=tenant, dataset_id="untrusted-ablation",
+                report=replay, policies=policies, ablation=bad,
+            )
+
+
+def test_ablation_rejects_duplicate_configuration_names_before_reporting() -> None:
+    tenant = "tenant-a"
+    policies = {tenant: _attribution_policy()}
+    events = (_attribution_event(tenant),)
+    replay = replay_historical(events, policies)
+    ablation = run_ablation(
+        events, policies,
+        configurations=(AblationConfiguration(
+            name="without_network",
+            removed_families=frozenset({SignalFamily.NETWORK}),
+        ),),
+    )
+    duplicated = replace(ablation, comparisons=ablation.comparisons * 2)
+    with pytest.raises(ValueError, match="invalid configurations"):
+        build_poc_report(
+            tenant_id=tenant, dataset_id="duplicate-ablation",
+            report=replay, policies=policies, ablation=duplicated,
+        )

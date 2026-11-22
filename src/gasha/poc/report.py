@@ -10,7 +10,12 @@ from typing import Annotated, Literal, Self
 from pydantic import BaseModel, Field, model_validator
 
 from gasha.domain.models import DecisionPolicy
-from gasha.poc.ablation import AblationComparison, AblationReport
+from gasha.poc.ablation import (
+    AblationComparison,
+    AblationConfiguration,
+    AblationReport,
+    run_ablation,
+)
 from gasha.poc.attribution import (
     SignalAttributionReport,
     SignalFamily,
@@ -404,6 +409,26 @@ class POCReport(BaseModel):
         return self
 
 
+
+def _stable_replay_rows(replay: HistoricalReplayReport) -> tuple[tuple[str, ...], ...]:
+    """Compare input, decisions and classification, not ephemeral replay clocks.
+
+    This is an offline same-cohort consistency check, never a trusted Bank
+    dataset fingerprint, producer attestation or label-maturity guarantee.
+    """
+    return tuple(sorted(
+        (
+            result.decision.tenant_id,
+            str(result.decision.event_id),
+            result.event.model_dump_json(),
+            result.decision.model_dump_json(exclude={"decided_at"}),
+            result.classification.value,
+            result.decision_source.value,
+        )
+        for result in replay.results
+    ))
+
+
 def build_poc_report(
     *,
     tenant_id: str,
@@ -490,11 +515,56 @@ def build_poc_report(
         ):
             raise ValueError("POC report attribution does not match replay cohort")
     attribution = verified_attribution
-    if incumbent is None and any(
+    # Never trust caller-constructed incumbent counts simply because their
+    # arithmetic is feasible: an absent control decision is not an observed
+    # non-alert and cannot earn incremental Gasha detection credit.
+    recorded_incumbent = any(
         result.event.incumbent_outcome is not None
         for result in report.results
+    )
+    verified_incumbent = compare_incumbent(report.results)
+    if incumbent is not None and (
+        not recorded_incumbent or incumbent != verified_incumbent
     ):
-        incumbent = compare_incumbent(report.results)
+        raise ValueError("POC report incumbent does not match recorded replay outcomes")
+    incumbent = verified_incumbent if recorded_incumbent else None
+
+    # Ablation results are also caller-constructible. Re-run only the named
+    # configurations on this exact synthetic replay and compare each derived
+    # aggregate/unique detection. A late-reconciled cohort needs a separately
+    # provenance-pinned ablation contract; never silently re-label old runs.
+    if ablation is not None:
+        if any(result.reconciled_outcome is not None for result in report.results):
+            raise ValueError("POC report ablation cannot verify reconciled outcomes")
+        names = [item.configuration_name for item in ablation.comparisons]
+        if (
+            not names or len(names) != len(set(names))
+            or any(not item.removed_families for item in ablation.comparisons)
+        ):
+            raise ValueError("POC report ablation has invalid configurations")
+        configs = tuple(
+            AblationConfiguration(
+                name=item.configuration_name,
+                removed_families=frozenset(item.removed_families),
+            )
+            for item in ablation.comparisons
+        )
+        verified_ablation = run_ablation(
+            tuple(result.event for result in report.results),
+            policies,
+            configurations=configs,
+        )
+        if (
+            _stable_replay_rows(ablation.full) != _stable_replay_rows(report)
+            or _stable_replay_rows(verified_ablation.full)
+            != _stable_replay_rows(report)
+            or Counter(ablation.comparisons)
+            != Counter(verified_ablation.comparisons)
+            or Counter(ablation.unique_detections)
+            != Counter(verified_ablation.unique_detections)
+        ):
+            raise ValueError("POC report ablation does not match replay cohort")
+        ablation = verified_ablation
 
     occurred = sorted(
         result.event.transaction.occurred_at for result in report.results
