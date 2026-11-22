@@ -149,9 +149,16 @@ def attribute_signals(
         else DEFAULT_SIGNAL_COMBINATIONS
     )
     attributed: list[EventAttribution] = []
+    seen: set[tuple[str, UUID]] = set()
 
     for result in results:
         tenant_id = result.decision.tenant_id
+        identity = (tenant_id, result.decision.event_id)
+        if (result.event.transaction.tenant_id, result.event.transaction.event_id) != identity:
+            raise ValueError("replayed decision and event identity mismatch")
+        if identity in seen:
+            raise ValueError("duplicate tenant/event attribution identity")
+        seen.add(identity)
         policy = policies.get(tenant_id)
         if policy is None:
             raise MissingTenantPolicyError(
@@ -203,12 +210,12 @@ def _family_metrics(
         for result in results
         if result.classification == ReplayClassification.TRUE_POSITIVE
     )
-    by_event = {result.decision.event_id: result for result in results}
+    by_event = {(result.decision.tenant_id, result.decision.event_id): result for result in results}
     metrics: dict[SignalFamily, SignalFamilyAttribution] = {}
 
     for family in SignalFamily:
         influenced_results = [
-            by_event[event.event_id]
+            by_event[(event.tenant_id, event.event_id)]
             for event in attributed
             if event.alerted and family in event.influenced
         ]
@@ -261,7 +268,7 @@ def _multi_signal(
     results: Sequence[ReplayedEventResult],
     combinations: Mapping[str, AbstractSet[SignalFamily]],
 ) -> MultiSignalAnalysis:
-    by_event = {result.decision.event_id: result for result in results}
+    by_event = {(result.decision.tenant_id, result.decision.event_id): result for result in results}
     detections: list[MultiSignalDetection] = []
     family_combination_counts: dict[tuple[SignalFamily, ...], int] = {}
     named_counts = {name: 0 for name in combinations}
@@ -286,7 +293,7 @@ def _multi_signal(
                 tenant_id=event.tenant_id,
                 families=families,
                 reason_codes=tuple(
-                    by_event[event.event_id].decision.reason_codes
+                    by_event[(event.tenant_id, event.event_id)].decision.reason_codes
                 ),
             )
         )
