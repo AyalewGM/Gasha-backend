@@ -547,7 +547,9 @@ def build_poc_report(
                 name=item.configuration_name,
                 removed_families=frozenset(item.removed_families),
             )
-            for item in ablation.comparisons
+            for item in sorted(
+                ablation.comparisons, key=lambda comparison: comparison.configuration_name
+            )
         )
         verified_ablation = run_ablation(
             tuple(result.event for result in report.results),

@@ -492,7 +492,7 @@ def test_provided_incumbent_requires_exact_recorded_replay_comparison() -> None:
 def test_report_binds_ablation_to_same_tenant_replay_and_derived_counts() -> None:
     tenant = "tenant-a"
     policies = {tenant: _attribution_policy()}
-    event = _attribution_event(tenant)
+    event = _attribution_event(tenant, beneficiary_risk=0.20)
     events = (event,)
     replay = replay_historical(events, policies)
     configs = (
