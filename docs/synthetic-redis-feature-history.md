@@ -34,3 +34,28 @@ GASHA_TEST_REDIS_URL=redis://127.0.0.1:6379/0 pytest -q \
 The API and worker still need an authorized source adapter, broker progress and
 rebuild semantics, Redis credentials and scoped permissions, operational sizing,
 and a reviewed mapping from features to decision inputs before deployment.
+
+## Coverage semantics for the next synthetic MVE wiring
+
+The historical *first-ever sender/beneficiary relationship* and a sealed,
+complete *one-hour beneficiary fan-in window* are different claims. The
+opt-in synthetic assessor now accepts `beneficiary_window_complete=True`
+independently of `relationship_history_complete=False`; this allows a
+window-local sender count while preserving an unavailable relationship
+absence. A missing or unverified one-hour coverage assertion still yields
+unavailable fan-in, not zero. The separate coverage claim changes the
+computation fingerprint, even if its numeric count matches the fully
+covered fixture. Existing callers retain their previous defaults.
+
+This is **contract preparation only**. An in-process boolean is **not**
+evidence of a real source's completeness. The runtime has not yet been
+wired to authenticate a Redis producer, bind the epoch/receipt cutoff to
+the pending event, prove the Redis seal, or pass this coverage scope to
+the pending-worker evaluator. Do not set this flag from a Bank payload,
+browser input, arbitrary precomputed number, or an unverified Redis
+watermark. The existing single-command MVE still uses in-process
+synthetic observations; Redis-to-worker composition and offline/Redis
+equivalence remain separate required checks under #145.
+
+No Bank data, model activation, payment enforcement, installed IdP or
+NetGuardians action is introduced by this bounded source change.
