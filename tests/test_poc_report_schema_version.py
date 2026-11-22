@@ -367,16 +367,27 @@ def test_v2_report_rejects_nonadjacent_percentile_inversion() -> None:
         POCReport.model_validate_json(json.dumps(payload))
 
 
-def test_v2_report_builder_keeps_negative_replay_lead_unknown() -> None:
+def test_v2_report_builder_rejects_forged_negative_replay_lead() -> None:
     empty = _empty_replay()
     replay = HistoricalReplayReport(
         results=empty.results,
         metrics=replace(empty.metrics, mean_detection_lead_time_seconds=-3.0),
     )
+    # A caller cannot inject a negative timing metric absent from the replay.
+    # Unknown remains null for the genuine empty replay, not a fabricated one.
+    with pytest.raises(
+        ValueError, match="historical metrics do not match replay results"
+    ):
+        build_poc_report(
+            tenant_id="synthetic-tenant",
+            dataset_id="synthetic-negative-replay-clock",
+            report=replay,
+            policies={},
+        )
     payload = build_poc_report(
         tenant_id="synthetic-tenant",
         dataset_id="synthetic-negative-replay-clock",
-        report=replay,
+        report=empty,
         policies={},
     ).model_dump(mode="json")
     assert payload["latency"]["mean_detection_lead_time_seconds"] is None
